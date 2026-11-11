@@ -632,6 +632,28 @@ export async function proxiedIp(port: number): Promise<IpInfo | null> {
   return null
 }
 
+/** Fast single-endpoint exit check used by the free-node finder. */
+export async function quickProxiedIp(port: number, timeoutMs = 6000): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'curl.exe',
+      [
+        '-s',
+        '--max-time',
+        String(Math.ceil(timeoutMs / 1000)),
+        '--proxy',
+        `http://127.0.0.1:${port}`,
+        'http://ip-api.com/json/?fields=status,query'
+      ],
+      { timeout: timeoutMs + 2000, windowsHide: true }
+    )
+    const payload = JSON.parse(stdout) as { status?: string; query?: string }
+    return payload.status === 'success' && payload.query ? payload.query : null
+  } catch {
+    return null
+  }
+}
+
 export async function measurePing(port: number): Promise<number> {
   const devNull = process.platform === 'win32' ? 'NUL' : '/dev/null'
   const started = Date.now()

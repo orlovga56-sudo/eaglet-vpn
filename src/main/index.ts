@@ -1,9 +1,11 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron'
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { Store } from './store'
 import { VpnEngine } from './vpn/engine'
-import { isHttpUrl, parseProfilesPayload, subscriptionName } from './vpn/profiles'
+import { isHttpUrl, parseProfileUri, parseProfilesPayload, subscriptionName } from './vpn/profiles'
+import { discoverFreeProfiles } from './vpn/free-sources'
 import type { ImportResult, Profile, Settings, Snapshot, Subscription } from '@shared/types'
 
 const isDev = !app.isPackaged
@@ -173,6 +175,35 @@ async function importAnything(input: string): Promise<ImportResult> {
   return importFromText(text)
 }
 
+const FREE_SOURCE_ID = 'free-public-nodes'
+
+/**
+ * Stores nodes picked in the free-server finder as a removable pseudo
+ * subscription, so "Free public nodes" can be cleaned up in one click.
+ */
+function addFreeProfiles(links: string[]): ImportResult {
+  const parsed = links
+    .map((link) => parseProfileUri(link))
+    .filter((profile): profile is Profile => Boolean(profile))
+  if (parsed.length === 0) throw new Error('No valid share links were selected')
+
+  const incoming = parsed.map((profile) => ({ ...profile, sourceId: FREE_SOURCE_ID }))
+  const { added, updated } = store.addProfiles(incoming)
+  const count = store.getProfiles().filter((profile) => profile.sourceId === FREE_SOURCE_ID).length
+  const subscription: Subscription = {
+    id: FREE_SOURCE_ID,
+    name: 'Free public nodes',
+    url: 'eaglet://free-public',
+    updatedAt: Date.now(),
+    count
+  }
+  store.upsertSubscription(subscription)
+  engine.reconcileProfiles()
+  engine.pushExternalLog('success', `Added ${added} free node(s) from public catalogs`)
+  broadcast()
+  return { imported: added, updated, subscription, profiles: store.getProfiles() }
+}
+
 /* ------------------------------------------------------------------ */
 /*  IPC                                                               */
 /* ------------------------------------------------------------------ */
@@ -198,6 +229,46 @@ function registerIpc(): void {
   ipcMain.handle('profiles:import', async (_event, text: string) => {
     try {
       return await importAnything(text)
+    } catch (error) {
+      engine.pushExternalLog('error', (error as Error).message)
+      broadcast()
+      throw error
+    }
+  })
+
+  ipcMain.handle('free:discover', async () => {
+    engine.pushExternalLog('info', 'Searching public free-node catalogs…')
+    try {
+      let corePath: string | null = null
+      try {
+        corePath = await engine.ensureCore()
+      } catch {
+        corePath = null
+      }
+      const result = await discoverFreeProfiles({
+        settings: store.getSettings(),
+        corePath,
+        onProgress: (message) => {
+          engine.pushExternalLog('info', message)
+          broadcast()
+        }
+      })
+      engine.pushExternalLog(
+        result.profiles.length > 0 ? 'success' : 'warn',
+        `Free search · ${result.found} found · ${result.reachable} reachable · ${result.profiles.length} working`
+      )
+      broadcast()
+      return result
+    } catch (error) {
+      engine.pushExternalLog('error', `Free search failed: ${(error as Error).message}`)
+      broadcast()
+      throw error
+    }
+  })
+
+  ipcMain.handle('free:add', (_event, links: string[]) => {
+    try {
+      return addFreeProfiles(links)
     } catch (error) {
       engine.pushExternalLog('error', (error as Error).message)
       broadcast()
@@ -315,6 +386,110 @@ app.whenReady().then(async () => {
     broadcast()
   })
 
+  if (process.argv.includes('--eaglet-free-connect-test')) {
+    // Dev harness: proves the whole finder → connect → exit-IP → teardown
+    // path against real public nodes. Writes JSON because stdout is invisible.
+    const outFile = process.env.EAGLET_FREE_CONNECT_OUT ?? join(process.cwd(), 'free-connect-test.json')
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+    const report: Record<string, unknown> = { attempts: [] }
+    try {
+      await engine.init()
+      const corePath = await engine.ensureCore().catch(() => null)
+      // Each run starts from a clean free-node set so repeated tests don't pile up.
+      store.removeProfilesBySource(FREE_SOURCE_ID)
+      store.removeSubscription(FREE_SOURCE_ID)
+      const found = await discoverFreeProfiles({ settings: store.getSettings(), corePath })
+      report.found = found.found
+      report.reachable = found.reachable
+      report.tested = found.tested
+      report.verified = found.verified
+      const picks = found.profiles.slice(0, 10)
+      if (picks.length === 0) throw new Error('No working public nodes found')
+      const imported = addFreeProfiles(picks.map((profile) => profile.raw))
+      report.added = imported.imported
+      report.subscription = imported.subscription
+      engine.reconcileProfiles()
+
+      const ids = picks.map((profile) => profile.id).filter((id) => Boolean(store.getProfile(id)))
+      for (const id of ids) {
+        const profile = store.getProfile(id)
+        if (!profile) continue
+        engine.setProfile(id)
+        await engine.connect()
+        const deadline = Date.now() + 60000
+        while (engine.getState().status === 'connecting' && Date.now() < deadline) await sleep(250)
+        const state = engine.getState()
+        const attempt = {
+          name: profile.name,
+          protocol: profile.protocol,
+          host: profile.host,
+          port: profile.port,
+          status: state.status,
+          directIp: state.ip.direct?.ip ?? null,
+          exitIp: state.ip.exit?.ip ?? null,
+          changed: state.ip.changed,
+          error: state.error,
+          logs: state.logs.slice(0, 14).map((entry) => `${entry.level}: ${entry.message}`)
+        }
+        ;(report.attempts as unknown[]).push(attempt)
+        if (state.status === 'connected') {
+          await sleep(2500)
+          report.connected = attempt
+          report.metrics = engine.getState().metrics
+          break
+        }
+      }
+
+      if (engine.getState().status === 'connected') {
+        await engine.disconnect()
+        const deadline = Date.now() + 30000
+        while (engine.getState().status !== 'disconnected' && Date.now() < deadline) await sleep(250)
+      }
+      report.afterDisconnect = engine.getState().status
+      report.storedFreeProfiles = store.getProfiles().filter((p) => p.sourceId === FREE_SOURCE_ID).length
+    } catch (error) {
+      report.error = (error as Error).message
+    }
+    writeFileSync(outFile, JSON.stringify(report, null, 2), 'utf8')
+    await engine.shutdown()
+    app.exit(0)
+    return
+  }
+
+  if (process.argv.includes('--eaglet-free-test')) {
+    // Electron is a GUI binary on Windows, so stdout is invisible here: the
+    // harness writes a JSON report instead.
+    const outFile = process.env.EAGLET_FREE_TEST_OUT ?? join(process.cwd(), 'free-test.json')
+    try {
+      await engine.init()
+      const corePath = await engine.ensureCore().catch(() => null)
+      const result = await discoverFreeProfiles({ settings: store.getSettings(), corePath })
+      const report = {
+        sources: result.sources,
+        found: result.found,
+        tested: result.tested,
+        reachable: result.reachable,
+        verified: result.verified,
+        working: result.profiles.length,
+        sample: result.profiles.slice(0, 8).map((profile) => ({
+          name: profile.name,
+          host: profile.host,
+          port: profile.port,
+          protocol: profile.protocol,
+          ping: profile.ping
+        })),
+        raw: result.profiles.slice(0, 12).map((profile) => profile.raw)
+      }
+      writeFileSync(outFile, JSON.stringify(report, null, 2), 'utf8')
+      console.log(JSON.stringify(report, null, 2))
+    } catch (error) {
+      writeFileSync(outFile, JSON.stringify({ error: (error as Error).message }, null, 2), 'utf8')
+    }
+    await engine.shutdown()
+    app.exit(0)
+    return
+  }
+
   registerIpc()
   applyLoginItem(settings.launchAtStartup)
   createWindow()
@@ -385,31 +560,64 @@ async function scheduleShots(win: BrowserWindow): Promise<void> {
     const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
     await wait(1200)
     await seedShotProfiles()
+    const freeOnly = process.env['EAGLET_SHOT_ONLY'] === 'free'
 
-    const themes = ['cyber', 'glass', 'minimal', 'hud', 'neon', 'aurora']
-    for (const theme of themes) {
-      await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('${theme}')`)
-      await wait(900)
-      const image = await win.webContents.capturePage()
-      writeFileSync(join(dir, `theme-${theme}.png`), image.toPNG())
+    if (!freeOnly) {
+      const themes = ['cyber', 'glass', 'minimal', 'hud', 'neon', 'aurora']
+      for (const theme of themes) {
+        await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('${theme}')`)
+        await wait(900)
+        const image = await win.webContents.capturePage()
+        writeFileSync(join(dir, `theme-${theme}.png`), image.toPNG())
+      }
+
+      await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('cyber')`)
+      await win.webContents.executeJavaScript(`window.eaglet.connect()`)
+      await wait(22000)
+      for (const page of ['home', 'servers', 'routing', 'stats', 'settings']) {
+        await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('${page}')`)
+        await wait(900)
+        const image = await win.webContents.capturePage()
+        writeFileSync(join(dir, page === 'home' ? 'connected.png' : `page-${page}.png`), image.toPNG())
+      }
     }
 
-    await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('cyber')`)
-    await win.webContents.executeJavaScript(`window.eaglet.connect()`)
-    await wait(22000)
-    for (const page of ['home', 'servers', 'routing', 'stats', 'settings']) {
-      await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('${page}')`)
-      await wait(900)
-      const image = await win.webContents.capturePage()
-      writeFileSync(join(dir, page === 'home' ? 'connected.png' : `page-${page}.png`), image.toPNG())
+    if (process.env['EAGLET_SHOT_FREE'] === '1' || freeOnly) {
+      await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('servers')`)
+      await wait(700)
+      const clicked = await win.webContents.executeJavaScript(`
+        (() => {
+          const button = [...document.querySelectorAll('button')].find((item) =>
+            /Find free servers/i.test(item.textContent || '')
+          )
+          if (!button) return false
+          button.click()
+          return true
+        })()
+      `)
+      if (clicked) {
+        const started = Date.now()
+        for (;;) {
+          const ready = await win.webContents.executeJavaScript(
+            `Boolean(document.querySelector('.free-list, .free-empty'))`
+          )
+          if (ready || Date.now() - started > 150000) break
+          await wait(1000)
+        }
+        await wait(800)
+        const freeShot = await win.webContents.capturePage()
+        writeFileSync(join(dir, 'servers-free.png'), freeShot.toPNG())
+      }
     }
 
-    await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('home')`)
-    await win.webContents.executeJavaScript(`window.eaglet.updateSettings({ mini: true })`)
-    await wait(1400)
-    const mini = await win.webContents.capturePage()
-    writeFileSync(join(dir, 'mini.png'), mini.toPNG())
-    await win.webContents.executeJavaScript(`window.eaglet.updateSettings({ mini: false })`)
+    if (!freeOnly) {
+      await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('home')`)
+      await win.webContents.executeJavaScript(`window.eaglet.updateSettings({ mini: true })`)
+      await wait(1400)
+      const mini = await win.webContents.capturePage()
+      writeFileSync(join(dir, 'mini.png'), mini.toPNG())
+      await win.webContents.executeJavaScript(`window.eaglet.updateSettings({ mini: false })`)
+    }
 
     console.log('[shots] done')
     await engine.shutdown()

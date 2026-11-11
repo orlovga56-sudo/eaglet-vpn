@@ -134,6 +134,29 @@ export interface ImportResult {
   profiles: Profile[]
 }
 
+export interface FreeSourceStatus {
+  name: string
+  url: string
+  count: number
+  error: string | null
+}
+
+export interface FreeDiscoveryResult {
+  /** Working, latency-sorted nodes. Nothing is persisted until the user adds them. */
+  profiles: Profile[]
+  sources: FreeSourceStatus[]
+  /** Total unique nodes found across all catalogs. */
+  found: number
+  /** How many nodes were actually probed. */
+  tested: number
+  /** How many of the probed nodes accepted a TCP connection. */
+  reachable: number
+  /** True when every listed node was confirmed to carry real HTTP traffic. */
+  verified: boolean
+  fetchedAt: number
+  defaultSelection: number
+}
+
 export interface Snapshot {
   state: VpnState
   settings: Settings
@@ -149,6 +172,8 @@ export interface EagletApi {
   disconnect: () => Promise<void>
   selectProfile: (profileId: string) => Promise<void>
   importProfiles: (text: string) => Promise<ImportResult>
+  discoverFree: () => Promise<FreeDiscoveryResult>
+  addFreeProfiles: (links: string[]) => Promise<ImportResult>
   updateSubscription: (subscriptionId: string) => Promise<ImportResult>
   removeSubscription: (subscriptionId: string) => Promise<void>
   removeProfile: (profileId: string) => Promise<void>

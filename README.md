@@ -29,12 +29,21 @@ core (1.14.x) and drives it end to end:
 - **Happ-style conveniences** — subscription refresh/removal, latency tests,
   search, per-node connect, auto-connect on launch, launch at startup, compact
   always-on-top mode, DNS selection, kill-switch policy and six themes.
+- **Free-server finder** — *Servers → Find free servers* pulls open community
+  catalogs from GitHub, deduplicates thousands of links, TCP-probes a sample and
+  boots a throwaway sing-box instance for the fastest candidates. Only nodes
+  that really return traffic are listed; the ones you pick are stored as a
+  removable **Free public nodes** subscription.
 
 > **Bring your own server.** The repository contains no VPN subscription. To
 > exercise the mechanics without one, import `direct://Test` — the tunnel,
 > proxy, telemetry and IP probes are real, but the exit address cannot change
 > because traffic leaves from your own machine. Add a real node (or any
 > subscription) and the IP-change badge will verify it.
+
+> **Public nodes are untrusted.** The finder proves that a node carries HTTP
+> traffic — not that its operator is honest. Never sign in to banking, work or
+> other sensitive accounts through a free public node.
 
 ## Interface styles
 

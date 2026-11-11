@@ -62,6 +62,7 @@ src/
       engine.ts        state machine, connect/teardown, IP probes, telemetry
       singbox.ts       core discovery/install, config builder, process, Clash API
       profiles.ts      share-link + base64 subscription parser
+      free-sources.ts  public catalogs, TCP probe, live node verification
       system-proxy.ts  WinINET proxy enable/disable and crash recovery
   preload/index.ts     contextBridge → window.eaglet
   renderer/
@@ -133,6 +134,29 @@ Design rules that keep the six styles coherent:
   second and converted to Mbps. Latency is a `curl` request through the local
   proxy every 5 s.
 
+### Free-server finder (`free-sources.ts`)
+
+`discoverFreeProfiles({ settings, corePath })` never trusts a catalog:
+
+1. Downloads seven community lists (V2RayAggregator, NoMoreWalls, ermaozi,
+   ts-sf/fly, Pawdroid, freefq, ripaojiedian) in parallel, parses them with the
+   same `parseProfilesPayload` used by subscriptions, and dedupes by `profile.id`.
+2. TCP-probes 140 random candidates (24 concurrent, 2.2 s timeout).
+3. Boots up to 40 of the fastest in throwaway sing-box instances (4 concurrent,
+   distinct loopback ports, TUN forced off) and keeps only nodes where `curl`
+   through the local inbound gets a real IP from `ip-api.com`.
+4. Returns working nodes sorted by handshake latency plus per-source statuses.
+
+`free:add` stores the picked links with `sourceId = 'free-public-nodes'` and a
+`eaglet://free-public` pseudo-subscription, so the whole set can be removed at
+once. If the core is missing, discovery falls back to TCP-only results and sets
+`verified: false` — the UI warns about it.
+
+Dev harnesses (both write JSON because Electron's stdout is invisible on
+Windows): `electron . --eaglet-free-test` reports catalogs and working nodes,
+`electron . --eaglet-free-connect-test` adds found nodes, connects to the first
+one that works, compares direct/exit IP and tears the tunnel down.
+
 ### Windows routing
 
 `system-proxy.ts` writes `HKCU\…\Internet Settings`, notifies WinINET and keeps
@@ -148,6 +172,8 @@ defines `EagletApi`):
 - `snapshot()` → `Snapshot` (state + settings + profiles + subscriptions)
 - `connect(profileId?)`, `disconnect()`, `selectProfile(id)`
 - `importProfiles(text)` — URL, share link or base64 list
+- `discoverFree()` → reachable/verified public nodes; `addFreeProfiles(links)` —
+  stores picked finder nodes as the `free-public-nodes` subscription
 - `updateSubscription(id)`, `removeSubscription(id)`, `removeProfile(id)`
 - `testProfiles(ids?)`, `checkIp()`, `refreshCore()`
 - `updateSettings(patch)` → persisted `Settings`
@@ -166,8 +192,12 @@ Do not add `nodeIntegration`; the renderer must stay sandboxed behind preload.
    - speed/connection counters move on Stats;
    - Home shows direct and exit addresses.
 3. `Get-Process sing-box` should be empty after disconnect.
-4. `npm run shots` exercises the whole flow (it seeds demo profiles, connects
-   through the direct profile, captures screenshots and cleans up).
+4. *Find free servers* in Servers must return at least one working node on a
+   normal connection (catalogs are volatile, retry if the first pass is empty),
+   and adding a node must create the *Free public nodes* subscription.
+5. `npm run shots` exercises the whole flow (it seeds demo profiles, connects
+   through the direct profile, captures screenshots and cleans up). Set
+   `EAGLET_SHOT_FREE=1` to also capture the free-server panel.
 
 ## Conventions
 

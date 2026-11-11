@@ -1,5 +1,13 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { CoreState, EagletApi, ImportResult, Profile, Settings, Snapshot } from '@shared/types'
+import type {
+  CoreState,
+  EagletApi,
+  FreeDiscoveryResult,
+  ImportResult,
+  Profile,
+  Settings,
+  Snapshot
+} from '@shared/types'
 
 const api: EagletApi = {
   snapshot: () => ipcRenderer.invoke('app:snapshot'),
@@ -7,6 +15,8 @@ const api: EagletApi = {
   disconnect: () => ipcRenderer.invoke('vpn:disconnect'),
   selectProfile: (profileId: string) => ipcRenderer.invoke('vpn:select-profile', profileId),
   importProfiles: (text: string): Promise<ImportResult> => ipcRenderer.invoke('profiles:import', text),
+  discoverFree: (): Promise<FreeDiscoveryResult> => ipcRenderer.invoke('free:discover'),
+  addFreeProfiles: (links: string[]): Promise<ImportResult> => ipcRenderer.invoke('free:add', links),
   updateSubscription: (id: string): Promise<ImportResult> => ipcRenderer.invoke('subscriptions:update', id),
   removeSubscription: (id: string) => ipcRenderer.invoke('subscriptions:remove', id),
   removeProfile: (id: string) => ipcRenderer.invoke('profiles:remove', id),

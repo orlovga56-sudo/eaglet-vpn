@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
-import type { Profile, ProtocolId, Snapshot } from '@shared/types'
-import { SearchIcon } from '../components/Icons'
+import type { FreeDiscoveryResult, Profile, ProtocolId, Snapshot } from '@shared/types'
+import { GlobeIcon, SearchIcon } from '../components/Icons'
 
 interface Props {
   snap: Snapshot
@@ -41,6 +41,9 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
   const [testing, setTesting] = useState(false)
   const [refreshing, setRefreshing] = useState<string | null>(null)
   const [message, setMessage] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
+  const [free, setFree] = useState<FreeDiscoveryResult | null>(null)
+  const [discovering, setDiscovering] = useState(false)
+  const [selectedFree, setSelectedFree] = useState<Set<string>>(new Set())
 
   const { state, profiles, subscriptions } = snap
   const selectedId = state.profile?.id ?? null
@@ -116,6 +119,47 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
     }
   }
 
+  const findFree = async (): Promise<void> => {
+    if (discovering) return
+    setDiscovering(true)
+    setFree(null)
+    setMessage(null)
+    try {
+      const result = await window.eaglet.discoverFree()
+      setFree(result)
+      setSelectedFree(new Set(result.profiles.slice(0, result.defaultSelection).map((profile) => profile.id)))
+    } catch (error) {
+      setMessage({ tone: 'err', text: cleanError(error) })
+    } finally {
+      setDiscovering(false)
+    }
+  }
+
+  const toggleFree = (id: string): void => {
+    setSelectedFree((previous) => {
+      const next = new Set(previous)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const addSelectedFree = async (): Promise<void> => {
+    if (!free || selectedFree.size === 0) return
+    const links = free.profiles.filter((profile) => selectedFree.has(profile.id)).map((profile) => profile.raw)
+    try {
+      const result = await window.eaglet.addFreeProfiles(links)
+      setFree(null)
+      setSelectedFree(new Set())
+      setMessage({
+        tone: 'ok',
+        text: `Added ${result.imported} free ${result.imported === 1 ? 'node' : 'nodes'}. Use Test all, then Connect — public nodes are often slow.`
+      })
+    } catch (error) {
+      setMessage({ tone: 'err', text: cleanError(error) })
+    }
+  }
+
   return (
     <div className="page">
       <header className="page-head">
@@ -127,9 +171,15 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
             Trojan, Shadowsocks, Hysteria2 and TUIC.
           </p>
         </div>
-        <button className="btn primary" onClick={() => void testAll()} disabled={testing || profiles.length === 0}>
-          {testing ? 'Testing…' : 'Test all'}
-        </button>
+        <div className="head-actions">
+          <button className="btn" onClick={() => void findFree()} disabled={discovering}>
+            <GlobeIcon />
+            {discovering ? 'Searching…' : 'Find free servers'}
+          </button>
+          <button className="btn primary" onClick={() => void testAll()} disabled={testing || profiles.length === 0}>
+            {testing ? 'Testing…' : 'Test all'}
+          </button>
+        </div>
       </header>
 
       <div className="import panel">
@@ -160,6 +210,121 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
         )}
       </div>
 
+      {(discovering || free) && (
+        <section className="free panel">
+          <div className="free-head">
+            <div className="free-title">
+              <strong>Free public servers</strong>
+              <span>
+                {discovering
+                  ? 'Fetching community catalogs and testing latency…'
+                  : `${free?.profiles.length ?? 0} working · ${free?.reachable ?? 0} reachable · ${free?.found ?? 0} found in catalogs`}
+              </span>
+            </div>
+            {!discovering && (
+              <button className="icon-ghost" onClick={() => setFree(null)} title="Close">
+                ×
+              </button>
+            )}
+          </div>
+
+          {discovering ? (
+            <div className="free-loading">
+              <span className="boot-ring" />
+              <p>
+                This can take up to two minutes. Each candidate is started in a throwaway sing-box instance to confirm
+                real traffic, so only working nodes are listed.
+              </p>
+            </div>
+          ) : free ? (
+            <>
+              <div className="free-sources">
+                {free.sources.map((source) => (
+                  <span
+                    key={source.name}
+                    className={`free-chip ${source.error ? 'is-bad' : ''}`}
+                    title={source.error ? `${source.name}: ${source.error}` : source.url}
+                  >
+                    {source.name} · {source.error ? 'offline' : source.count}
+                  </span>
+                ))}
+              </div>
+
+              <div className="free-warning">
+                Public nodes are run by unknown people. Don't sign in to banking, work or other sensitive accounts while
+                using them — treat this as a quick way to test the tunnel, not as a trustworthy provider.
+              </div>
+
+              {!free.verified && (
+                <div className="free-warning">
+                  The sing-box core was unavailable, so these nodes were only port-checked and may not actually carry
+                  traffic.
+                </div>
+              )}
+
+              {free.profiles.length === 0 ? (
+                <div className="free-empty">
+                  <strong>No working nodes right now</strong>
+                  <span>
+                    The catalogs responded, but none of the sampled nodes carried real traffic. Try again in a minute —
+                    these lists change constantly.
+                  </span>
+                  <button className="btn small" onClick={() => void findFree()}>
+                    Retry
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="free-list">
+                    {free.profiles.map((profile) => (
+                      <label
+                        key={profile.id}
+                        className={`free-row ${selectedFree.has(profile.id) ? 'is-picked' : ''}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedFree.has(profile.id)}
+                          onChange={() => toggleFree(profile.id)}
+                        />
+                        <span className="proto-badge">{PROTOCOL_LABEL[profile.protocol]}</span>
+                        <span className="free-name">
+                          <strong>{profile.name || profile.host}</strong>
+                          <span>
+                            {profile.host}:{profile.port}
+                          </span>
+                        </span>
+                        <span className="ping">
+                          <strong>{profile.ping}</strong> ms
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                  <div className="free-actions">
+                    <span className="free-count">{selectedFree.size} selected</span>
+                    <button
+                      className="btn small"
+                      onClick={() => setSelectedFree(new Set(free.profiles.map((profile) => profile.id)))}
+                    >
+                      Select all
+                    </button>
+                    <button className="btn small" onClick={() => setSelectedFree(new Set())}>
+                      Clear
+                    </button>
+                    <button
+                      className="btn small primary"
+                      onClick={() => void addSelectedFree()}
+                      disabled={selectedFree.size === 0}
+                    >
+                      Add selected
+                    </button>
+                  </div>
+                </>
+              )}
+            </>
+          ) : null}
+        </section>
+      )}
+
       {subscriptions.length > 0 && (
         <>
           <div className="section-title">Subscriptions</div>
@@ -170,15 +335,21 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                   <strong>{subscription.name}</strong>
                   <span className="sub-url">{subscription.url}</span>
                 </div>
-                <span className="sub-count">{subscription.count} nodes</span>
+                <span className="sub-count">
+                  {subscription.count} {subscription.count === 1 ? 'node' : 'nodes'}
+                </span>
                 <span className="sub-age">{formatAgo(subscription.updatedAt)}</span>
-                <button
-                  className="btn small"
-                  onClick={() => void refresh(subscription.id)}
-                  disabled={refreshing === subscription.id}
-                >
-                  {refreshing === subscription.id ? 'Updating…' : 'Update'}
-                </button>
+                {subscription.url.startsWith('eaglet://') ? (
+                  <span className="status-pill">Finder</span>
+                ) : (
+                  <button
+                    className="btn small"
+                    onClick={() => void refresh(subscription.id)}
+                    disabled={refreshing === subscription.id}
+                  >
+                    {refreshing === subscription.id ? 'Updating…' : 'Update'}
+                  </button>
+                )}
                 <button
                   className="btn small danger"
                   onClick={() => {
