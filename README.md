@@ -3,7 +3,38 @@
 **Fast. Private. Electric.** A desktop VPN client with six swappable interface
 styles.
 
-![Electric Cyber](screenshots/theme-cyber.png)
+![Electric Cyber](screenshots/connected.png)
+
+## Interface styles
+
+Six complete themes ship in the box and switch live from Settings.
+
+<table>
+  <tr>
+    <td width="50%"><img src="screenshots/theme-cyber.png" alt="Electric Cyber" /></td>
+    <td width="50%"><img src="screenshots/theme-glass.png" alt="Glassmorphism" /></td>
+  </tr>
+  <tr>
+    <td><b>Electric Cyber</b> — electric blue on deep space</td>
+    <td><b>Glassmorphism</b> — frosted layers, violet light</td>
+  </tr>
+  <tr>
+    <td><img src="screenshots/theme-minimal.png" alt="Minimal Dark" /></td>
+    <td><img src="screenshots/theme-hud.png" alt="HUD / Scifi" /></td>
+  </tr>
+  <tr>
+    <td><b>Minimal Dark</b> — quiet, typographic, precise</td>
+    <td><b>HUD / Scifi</b> — telemetry green on black</td>
+  </tr>
+  <tr>
+    <td><img src="screenshots/theme-neon.png" alt="Neon Purple" /></td>
+    <td><img src="screenshots/theme-aurora.png" alt="Nature Aurora" /></td>
+  </tr>
+  <tr>
+    <td><b>Neon Purple</b> — violet bloom after dark</td>
+    <td><b>Nature Aurora</b> — northern lights over teal</td>
+  </tr>
+</table>
 
 ## Highlights
 

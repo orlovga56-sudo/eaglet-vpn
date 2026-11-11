@@ -23,7 +23,7 @@ const THEMES: ThemeMeta[] = [
     name: 'Electric Cyber',
     sub: 'Electric blue on deep space',
     background:
-      'radial-gradient(120% 90% at 50% -20%, rgba(34,211,238,.34), transparent 60%), radial-gradient(80% 60% at 85% 110%, rgba(59,130,246,.36), transparent 62%), #03060e',
+      'radial-gradient(120% 95% at 50% -20%, rgba(34,211,238,.55), transparent 62%), radial-gradient(80% 60% at 88% 110%, rgba(59,130,246,.5), transparent 62%), #04101f',
     window: 'rgba(9,22,40,.72)',
     accent: '#22d3ee'
   },
@@ -49,7 +49,7 @@ const THEMES: ThemeMeta[] = [
     name: 'HUD / Scifi',
     sub: 'Telemetry green on black',
     background:
-      'linear-gradient(rgba(45,212,191,.08) 1px, transparent 1px) 0 0/22px 22px, linear-gradient(90deg, rgba(45,212,191,.08) 1px, transparent 1px) 0 0/22px 22px, #03100f',
+      'linear-gradient(rgba(45,212,191,.16) 1px, transparent 1px) 0 0/16px 16px, linear-gradient(90deg, rgba(45,212,191,.16) 1px, transparent 1px) 0 0/16px 16px, radial-gradient(80% 60% at 50% 0%, rgba(45,212,191,.28), transparent 65%), #041716',
     window: 'rgba(4,30,30,.72)',
     accent: '#2dd4bf'
   },
@@ -153,7 +153,7 @@ export function SettingsPage({ settings, version, onUpdate }: Props): React.JSX.
           <div className="row">
             <span className="row-main">
               <strong>Launch at startup</strong>
-              <span>Start Eaglet with Windows, minimised to the tray.</span>
+              <span>Start Eaglet automatically when the computer boots.</span>
             </span>
             <Toggle
               checked={settings.launchAtStartup}

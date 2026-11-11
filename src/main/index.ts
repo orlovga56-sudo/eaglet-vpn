@@ -44,12 +44,16 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      backgroundThrottling: false
     }
   })
 
+  if (isShotMode) scheduleShots(mainWindow)
+
   mainWindow.on('ready-to-show', () => {
-    if (!isShotMode) mainWindow?.show()
+    if (isShotMode) mainWindow?.showInactive()
+    else mainWindow?.show()
   })
 
   mainWindow.on('closed', () => {
@@ -61,8 +65,6 @@ function createWindow(): void {
   } else {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
-
-  if (isShotMode) scheduleShots(mainWindow)
 }
 
 function setMini(win: BrowserWindow, mini: boolean): void {
@@ -148,7 +150,7 @@ app.whenReady().then(() => {
   engine = new VpnEngine(serverId)
 
   engine.on('state', () => {
-    if (!isShotMode) broadcast()
+    broadcast()
   })
 
   registerIpc()
@@ -179,19 +181,39 @@ async function scheduleShots(win: BrowserWindow): Promise<void> {
 
   win.webContents.once('did-finish-load', async () => {
     const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
-    await wait(1200)
+    await wait(1400)
     const themes = ['cyber', 'glass', 'minimal', 'hud', 'neon', 'aurora']
     for (const theme of themes) {
       await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('${theme}')`)
-      await wait(650)
+      await wait(1100)
+      const applied = await win.webContents.executeJavaScript(
+        `[document.documentElement.dataset.theme, getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()].join(' | ')`
+      )
+      console.log(`[shots] ${theme} → ${applied}`)
       const image = await win.webContents.capturePage()
       writeFileSync(join(dir, `theme-${theme}.png`), image.toPNG())
     }
     await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('cyber')`)
     await win.webContents.executeJavaScript(`window.__eagletConnect && window.__eagletConnect()`)
-    await wait(2600)
+    await wait(9000)
     const connected = await win.webContents.capturePage()
     writeFileSync(join(dir, 'connected.png'), connected.toPNG())
-    app.quit()
+
+    for (const page of ['servers', 'routing', 'stats', 'settings']) {
+      await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('${page}')`)
+      await wait(900)
+      const image = await win.webContents.capturePage()
+      writeFileSync(join(dir, `page-${page}.png`), image.toPNG())
+    }
+
+    await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('home')`)
+    await win.webContents.executeJavaScript(`window.eaglet.updateSettings({ mini: true })`)
+    await wait(1400)
+    const mini = await win.webContents.capturePage()
+    writeFileSync(join(dir, 'mini.png'), mini.toPNG())
+    await win.webContents.executeJavaScript(`window.eaglet.updateSettings({ mini: false })`)
+
+    console.log('[shots] done')
+    app.exit(0)
   })
 }

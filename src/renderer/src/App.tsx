@@ -38,11 +38,13 @@ export default function App(): React.JSX.Element {
   // Hooks used by the offscreen screenshot harness (npm run shots).
   useEffect(() => {
     window.__eagletSetTheme = (next: string) => setThemeOverride(next as ThemeId)
+    window.__eagletSetPage = (next: string) => setPage(next as PageId)
     window.__eagletConnect = () => {
       window.eaglet.connect()
     }
     return () => {
       delete window.__eagletSetTheme
+      delete window.__eagletSetPage
       delete window.__eagletConnect
     }
   }, [])

@@ -205,9 +205,10 @@
 /* Cyber: deep space + electric glow + stars */
 [data-theme='cyber'] .backdrop {
   background:
-    radial-gradient(120% 85% at 50% -18%, rgba(34, 211, 238, 0.13), transparent 58%),
-    radial-gradient(85% 60% at 82% 112%, rgba(59, 130, 246, 0.16), transparent 62%),
-    radial-gradient(70% 50% at 8% 90%, rgba(14, 165, 233, 0.1), transparent 60%),
+    radial-gradient(120% 85% at 50% -18%, rgba(34, 211, 238, 0.2), transparent 58%),
+    radial-gradient(85% 60% at 82% 112%, rgba(59, 130, 246, 0.24), transparent 62%),
+    radial-gradient(70% 50% at 8% 90%, rgba(14, 165, 233, 0.16), transparent 60%),
+    radial-gradient(60% 40% at 50% 100%, rgba(34, 211, 238, 0.14), transparent 70%),
     linear-gradient(180deg, #03060e 0%, #050b18 58%, #03060e 100%);
 }
 
@@ -233,23 +234,23 @@
 
 .bolt {
   position: absolute;
-  top: -4%;
-  height: 108%;
-  opacity: 0.5;
-  filter: drop-shadow(0 0 14px rgba(56, 189, 248, 0.65)) drop-shadow(0 0 40px rgba(34, 211, 238, 0.3));
+  top: -2%;
+  height: 104%;
+  opacity: 0.3;
+  filter: drop-shadow(0 0 16px rgba(56, 189, 248, 0.7)) drop-shadow(0 0 48px rgba(34, 211, 238, 0.3));
   animation: bolt-flicker 9s ease-in-out infinite;
 }
 
 .bolt--left {
-  left: -2%;
-  transform: rotate(4deg);
+  left: -4%;
+  transform: rotate(3deg);
 }
 
 .bolt--right {
-  right: -3%;
-  transform: scaleX(-1) rotate(6deg);
+  right: -4%;
+  transform: scaleX(-1) rotate(5deg);
   animation-delay: -4s;
-  opacity: 0.38;
+  opacity: 0.22;
 }
 
 /* Glass: soft colour blobs behind frosted glass */
@@ -260,8 +261,8 @@
 .blob {
   position: absolute;
   border-radius: 50%;
-  filter: blur(70px);
-  opacity: 0.6;
+  filter: blur(64px);
+  opacity: 0.75;
   animation: drift 22s ease-in-out infinite alternate;
 }
 
@@ -307,10 +308,10 @@
 
 [data-theme='hud'] .backdrop::before {
   background-image:
-    linear-gradient(rgba(45, 212, 191, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(45, 212, 191, 0.055) 1px, transparent 1px);
-  background-size: 44px 44px;
-  mask-image: radial-gradient(85% 75% at 50% 40%, #000 30%, transparent 100%);
+    linear-gradient(rgba(45, 212, 191, 0.09) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(45, 212, 191, 0.09) 1px, transparent 1px);
+  background-size: 46px 46px;
+  mask-image: radial-gradient(95% 85% at 50% 40%, #000 30%, transparent 100%);
 }
 
 [data-theme='hud'] .backdrop::after {
@@ -354,8 +355,8 @@
 .ribbon {
   position: absolute;
   border-radius: 50%;
-  filter: blur(60px);
-  opacity: 0.55;
+  filter: blur(64px);
+  opacity: 0.58;
   mix-blend-mode: screen;
   animation: aurora 18s ease-in-out infinite alternate;
 }

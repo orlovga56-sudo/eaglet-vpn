@@ -140,5 +140,8 @@ Do not add `nodeIntegration`; the renderer must stay sandboxed behind preload.
 `npm run shots` builds the app and launches the main process with
 `--eaglet-shots`. `scheduleShots()` in `src/main/index.ts` then walks the six
 themes, calls `window.__eagletSetTheme(id)` inside the renderer and writes
-`screenshots/theme-*.png`, finishing with `connected.png`. Use it to verify
-visual changes without a human looking at the screen.
+`screenshots/theme-*.png`. It also captures the connected state
+(`connected.png`), every page (`page-*.png`) and compact mode (`mini.png`).
+Use it to verify visual changes without a human looking at the screen. The
+window is shown during capture (`showInactive`) and `backgroundThrottling` is
+off, otherwise Chromium may return stale frames.

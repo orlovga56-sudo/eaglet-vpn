@@ -10,3 +10,4 @@ Thumbs.db
 screenshots/tmp/
 
 *.tsbuildinfo
+/electron.exe

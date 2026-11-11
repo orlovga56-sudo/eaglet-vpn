@@ -48,9 +48,6 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
   return (
     <div className="home">
       <section className="hero">
-        <div className="hero-brand">
-          Eag<span>let</span>
-        </div>
         <PowerDial status={status} onToggle={onToggle} />
 
         <div className="status-block">
@@ -80,12 +77,14 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
               <span className="unit">ms</span>
             </div>
           </div>
-          <Sparkline
-            className="stat-spark"
-            values={history.map((point) => point.ping)}
-            width={56}
-            height={24}
-          />
+          {connected && (
+            <Sparkline
+              className="stat-spark"
+              values={history.map((point) => point.ping)}
+              width={56}
+              height={24}
+            />
+          )}
         </div>
 
         <div className="stat panel">
@@ -99,7 +98,7 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
               <span className="unit">Mbps</span>
             </div>
           </div>
-          <Sparkline className="stat-spark" values={downSeries} width={56} height={24} />
+          {connected && <Sparkline className="stat-spark" values={downSeries} width={56} height={24} />}
         </div>
 
         <div className="stat panel">
@@ -113,7 +112,7 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
               <span className="unit">Mbps</span>
             </div>
           </div>
-          <Sparkline className="stat-spark" values={upSeries} width={56} height={24} />
+          {connected && <Sparkline className="stat-spark" values={upSeries} width={56} height={24} />}
         </div>
       </section>
 

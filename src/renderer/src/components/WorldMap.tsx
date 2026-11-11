@@ -104,7 +104,7 @@ export function WorldMap({ server, status, onManage }: Props): React.JSX.Element
           x={sx + 12}
           y={sy + 4}
           fill="var(--muted)"
-          style={{ font: '600 9px var(--mono)', letterSpacing: '0.14em' }}
+          style={{ fontSize: 9, fontFamily: 'var(--mono)', fontWeight: 600, letterSpacing: '0.14em' }}
         >
           {server.code}
         </text>
