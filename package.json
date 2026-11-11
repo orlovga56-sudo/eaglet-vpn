@@ -57,7 +57,7 @@
     "dist": "npm run build && electron-builder",
     "map": "node scripts/gen-map.mjs",
     "core": "node scripts/fetch-core.mjs",
-    "shots": "electron-vite build && electron scripts/screenshots.cjs"
+    "shots": "electron-vite build && node scripts/screenshots.cjs"
   },
   "dependencies": {
     "react": "^19.3.1",
