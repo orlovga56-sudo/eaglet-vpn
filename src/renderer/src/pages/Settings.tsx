@@ -157,6 +157,17 @@ export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
               onChange={(value) => onUpdate({ killSwitch: value })}
             />
           </div>
+          <div className="row">
+            <span className="row-main">
+              <strong>Auto-reconnect</strong>
+              <span>If the core drops, retry up to three times with a growing delay.</span>
+            </span>
+            <Toggle
+              checked={settings.autoReconnect}
+              label="Auto-reconnect"
+              onChange={(value) => onUpdate({ autoReconnect: value })}
+            />
+          </div>
         </div>
 
         <div className="rows panel">
@@ -188,6 +199,17 @@ export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
               <span>Shrink Eaglet to an always-on-top mini window.</span>
             </span>
             <Toggle checked={settings.mini} label="Compact mode" onChange={(value) => onUpdate({ mini: value })} />
+          </div>
+          <div className="row">
+            <span className="row-main">
+              <strong>Desktop notifications</strong>
+              <span>Notify on connect, disconnect, drops and exit-IP changes.</span>
+            </span>
+            <Toggle
+              checked={settings.notifications}
+              label="Notifications"
+              onChange={(value) => onUpdate({ notifications: value })}
+            />
           </div>
         </div>
       </div>

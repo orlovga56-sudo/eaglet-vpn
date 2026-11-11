@@ -200,3 +200,51 @@ export function SparkIcon(props: IconProps): React.JSX.Element {
     </svg>
   )
 }
+
+export function StarIcon({ filled = false, ...props }: IconProps & { filled?: boolean }): React.JSX.Element {
+  return (
+    <svg {...base} width={15} height={15} {...props}>
+      <path
+        d="m12 3.6 2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.8l5.9-.9L12 3.6Z"
+        fill={filled ? 'currentColor' : 'none'}
+      />
+    </svg>
+  )
+}
+
+export function BoltIcon(props: IconProps): React.JSX.Element {
+  return (
+    <svg {...base} width={15} height={15} {...props}>
+      <path d="M13 2 5 13.5h5.5L10 22l8-11.5h-5.5L13 2Z" fill="currentColor" stroke="none" />
+    </svg>
+  )
+}
+
+export function CopyIcon(props: IconProps): React.JSX.Element {
+  return (
+    <svg {...base} width={14} height={14} {...props}>
+      <rect x="8.5" y="8.5" width="11" height="11" rx="2" />
+      <path d="M5.5 15.5h-1a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" />
+    </svg>
+  )
+}
+
+export function ClipboardIcon(props: IconProps): React.JSX.Element {
+  return (
+    <svg {...base} width={14} height={14} {...props}>
+      <rect x="6" y="4.5" width="12" height="16" rx="2" />
+      <path d="M9 4.5V3.5a1.5 1.5 0 0 1 1.5-1.5h3A1.5 1.5 0 0 1 15 3.5v1" />
+      <path d="M9.5 10h5M9.5 14h5" />
+    </svg>
+  )
+}
+
+export function HistoryIcon(props: IconProps): React.JSX.Element {
+  return (
+    <svg {...base} width={16} height={16} {...props}>
+      <path d="M3.5 12a8.5 8.5 0 1 0 2.5-6" />
+      <path d="M3.5 4.5V9H8" />
+      <path d="M12 7.5V12l3 2" />
+    </svg>
+  )
+}

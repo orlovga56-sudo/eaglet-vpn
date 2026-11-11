@@ -10,6 +10,8 @@ import type {
   LogEntry,
   Metrics,
   Profile,
+  SessionRecord,
+  SpeedTestResult,
   VpnState,
   VpnStatus
 } from '@shared/types'
@@ -19,6 +21,7 @@ import {
   clashStats,
   coreVersion,
   directIp,
+  downloadThroughput,
   findCore,
   freePort,
   installCore,
@@ -59,8 +62,13 @@ interface Runtime {
   proxyApplied: boolean
   tickTimer: NodeJS.Timeout | null
   pingTimer: NodeJS.Timeout | null
+  reconnectTimer: NodeJS.Timeout | null
   transition: boolean
   tickBusy: boolean
+  /** Incremented on every unexpected drop; reset by a manual connect. */
+  reconnectAttempts: number
+  /** True after the user explicitly disconnects, so we don't fight them. */
+  userStop: boolean
 }
 
 function now(): number {
@@ -90,6 +98,7 @@ export class VpnEngine extends EventEmitter {
   private logId = 1
   private ip: IpState = EMPTY_IP()
   private core: CoreState = { available: false, running: false, version: null, path: null }
+  private sessionSaved = true
   private runtime: Runtime
 
   constructor(store: Store) {
@@ -106,8 +115,11 @@ export class VpnEngine extends EventEmitter {
       proxyApplied: false,
       tickTimer: null,
       pingTimer: null,
+      reconnectTimer: null,
       transition: false,
-      tickBusy: false
+      tickBusy: false,
+      reconnectAttempts: 0,
+      userStop: false
     }
     this.pushLog('info', 'Eaglet engine ready · sing-box backend')
   }
@@ -231,8 +243,13 @@ export class VpnEngine extends EventEmitter {
   /*  Connect / disconnect                                              */
   /* ------------------------------------------------------------------ */
 
-  async connect(id?: string): Promise<void> {
+  async connect(id?: string, automatic = false): Promise<void> {
     if (this.runtime.transition) return
+    if (!automatic) {
+      this.runtime.reconnectAttempts = 0
+      this.runtime.userStop = false
+      this.clearReconnectTimer()
+    }
     if (this.status === 'connected' || this.status === 'connecting') {
       if (id && id !== this.profileId) this.pushLog('warn', 'Disconnect before switching to another node')
       return
@@ -333,6 +350,7 @@ export class VpnEngine extends EventEmitter {
 
       this.status = 'connected'
       this.connectedSince = now()
+      this.sessionSaved = false
       this.stage = null
       this.progress = 1
       this.pushLog('success', `Tunnel established · ${profile.name}`)
@@ -354,6 +372,8 @@ export class VpnEngine extends EventEmitter {
   async disconnect(): Promise<void> {
     if (this.runtime.transition) return
     if (this.status === 'disconnected' || this.status === 'disconnecting') return
+    this.runtime.userStop = true
+    this.clearReconnectTimer()
     this.runtime.transition = true
     this.status = 'disconnecting'
     this.stage = 'Closing tunnel'
@@ -362,6 +382,7 @@ export class VpnEngine extends EventEmitter {
     this.emitUpdate()
 
     await this.teardown()
+    this.finishSession()
 
     this.status = 'disconnected'
     this.stage = null
@@ -376,6 +397,8 @@ export class VpnEngine extends EventEmitter {
   }
 
   private async teardown(): Promise<void> {
+    // One last sample so short sessions record their real traffic instead of zero.
+    await this.finalSample()
     this.stopTelemetry()
 
     if (this.runtime.process) {
@@ -421,7 +444,83 @@ export class VpnEngine extends EventEmitter {
     this.error = message
     this.stage = null
     this.progress = 0
+    this.finishSession()
     this.emitUpdate()
+    this.scheduleReconnect()
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Sessions + resilience                                             */
+  /* ------------------------------------------------------------------ */
+
+  /** Persists the finished session exactly once, including crash paths. */
+  private finishSession(): void {
+    if (this.sessionSaved || !this.connectedSince) return
+    const profile = this.activeProfile()
+    const elapsed = Math.max(
+      this.metrics.sessionSeconds,
+      Math.floor((Date.now() - this.connectedSince) / 1000)
+    )
+    this.store.addSession({
+      id: `${this.connectedSince}-${this.profileId ?? 'none'}`,
+      profileName: profile?.name ?? 'Unknown node',
+      protocol: profile?.protocol ?? 'direct',
+      startedAt: this.connectedSince,
+      durationSeconds: elapsed,
+      downTotal: this.metrics.downTotal,
+      upTotal: this.metrics.upTotal,
+      exitIp: this.ip.exit?.ip ?? null,
+      exitCountry: this.ip.exit?.countryCode ?? null
+    })
+    this.sessionSaved = true
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.runtime.reconnectTimer) clearTimeout(this.runtime.reconnectTimer)
+    this.runtime.reconnectTimer = null
+  }
+
+  /** Retries an unexpected drop when the user enabled auto-reconnect. */
+  private scheduleReconnect(): void {
+    if (this.runtime.userStop) return
+    if (!this.store.getSettings().autoReconnect) return
+    if (this.runtime.reconnectAttempts >= 3) {
+      this.pushLog('error', 'Auto-reconnect gave up after 3 attempts')
+      this.emitUpdate()
+      return
+    }
+
+    this.runtime.reconnectAttempts += 1
+    const attempt = this.runtime.reconnectAttempts
+    const delay = attempt * 2500
+    this.pushLog('warn', `Auto-reconnect ${attempt}/3 in ${Math.round(delay / 1000)}s`)
+    this.emitUpdate()
+
+    this.clearReconnectTimer()
+    this.runtime.reconnectTimer = setTimeout(() => {
+      this.runtime.reconnectTimer = null
+      void (async () => {
+        if (this.runtime.userStop) return
+        // The kill switch may have kept a proxy that points at the dead core;
+        // restore the user's settings before spawning a new process.
+        if (this.runtime.proxyApplied) {
+          try {
+            await disableSystemProxy()
+          } catch {
+            // Ignore — a missing backup simply disables the proxy.
+          }
+          this.runtime.proxyApplied = false
+        }
+        await this.connect(this.profileId ?? undefined, true)
+        if (this.status === 'connected') {
+          this.runtime.reconnectAttempts = 0
+          this.pushLog('success', 'Auto-reconnect restored the tunnel')
+          this.emitUpdate()
+        } else if (this.runtime.reconnectAttempts < 3) {
+          this.scheduleReconnect()
+        }
+      })()
+    }, delay)
   }
 
   private setStage(stage: string, progress: number): void {
@@ -522,6 +621,15 @@ export class VpnEngine extends EventEmitter {
     this.runtime.pingTimer = null
   }
 
+  /** Final Clash sample taken before the core is stopped. */
+  private async finalSample(): Promise<void> {
+    if (!this.runtime.apiPort) return
+    const stats = await clashStats(this.runtime.apiPort, API_SECRET).catch(() => null)
+    if (!stats) return
+    this.metrics.downTotal = Math.max(0, stats.downTotal - this.runtime.baseline.downTotal)
+    this.metrics.upTotal = Math.max(0, stats.upTotal - this.runtime.baseline.upTotal)
+  }
+
   private async tick(): Promise<void> {
     if (this.status !== 'connected') return
     const runtime = this.runtime
@@ -575,6 +683,23 @@ export class VpnEngine extends EventEmitter {
     }
   }
 
+  /** Downloads a fixed payload through the tunnel and reports real throughput. */
+  async runSpeedTest(): Promise<SpeedTestResult> {
+    if (this.status !== 'connected' || !this.runtime.mixedPort) {
+      throw new Error('Connect to a tunnel before running a speed test')
+    }
+    this.pushLog('info', 'Speed test · downloading 10 MB through the tunnel')
+    this.emitUpdate()
+    const { bytes, seconds } = await downloadThroughput(this.runtime.mixedPort)
+    const mbps = Math.round(((bytes * 8) / seconds / 1_000_000) * 10) / 10
+    this.pushLog(
+      'success',
+      `Speed test · ${mbps} Mbps · ${(bytes / 1_000_000).toFixed(1)} MB in ${seconds.toFixed(1)}s`
+    )
+    this.emitUpdate()
+    return { mbps, bytes, seconds: Math.round(seconds * 100) / 100, at: now() }
+  }
+
   /** Toggles the Windows system proxy while a tunnel is already live. */
   async setSystemProxy(enabled: boolean): Promise<void> {
     if (this.status !== 'connected' || !this.runtime.mixedPort) {
@@ -623,7 +748,10 @@ export class VpnEngine extends EventEmitter {
   /* ------------------------------------------------------------------ */
 
   async shutdown(): Promise<void> {
+    this.runtime.userStop = true
+    this.clearReconnectTimer()
     this.stopTelemetry()
+    if (this.status === 'connected') this.finishSession()
     const proc = this.runtime.process
     this.runtime.process = null
     if (proc) {

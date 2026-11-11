@@ -34,6 +34,8 @@ export interface Profile {
   sourceId: string | null
   /** Last measured TCP handshake latency in ms. */
   ping: number | null
+  /** Starred by the user — favourites are pinned to the top of the list. */
+  favorite: boolean
   addedAt: number
 }
 
@@ -122,6 +124,9 @@ export interface Settings {
   dns: DnsMode
   customDns: string
   routingMode: RoutingMode
+  /** Comma/newline separated domains, IPs or CIDRs that bypass the tunnel. */
+  bypassList: string
+  autoReconnect: boolean
   mini: boolean
   launchAtStartup: boolean
   activeProfileId: string | null
@@ -132,6 +137,25 @@ export interface ImportResult {
   updated: number
   subscription: Subscription | null
   profiles: Profile[]
+}
+
+export interface SessionRecord {
+  id: string
+  profileName: string
+  protocol: ProtocolId
+  startedAt: number
+  durationSeconds: number
+  downTotal: number
+  upTotal: number
+  exitIp: string | null
+  exitCountry: string | null
+}
+
+export interface SpeedTestResult {
+  mbps: number
+  bytes: number
+  seconds: number
+  at: number
 }
 
 export interface FreeSourceStatus {
@@ -162,6 +186,7 @@ export interface Snapshot {
   settings: Settings
   profiles: Profile[]
   subscriptions: Subscription[]
+  sessions: SessionRecord[]
   platform: string
   version: string
 }
@@ -169,8 +194,10 @@ export interface Snapshot {
 export interface EagletApi {
   snapshot: () => Promise<Snapshot>
   connect: (profileId?: string) => Promise<void>
+  quickConnect: () => Promise<Profile>
   disconnect: () => Promise<void>
   selectProfile: (profileId: string) => Promise<void>
+  setFavorite: (profileId: string, favorite: boolean) => Promise<Profile[]>
   importProfiles: (text: string) => Promise<ImportResult>
   discoverFree: () => Promise<FreeDiscoveryResult>
   addFreeProfiles: (links: string[]) => Promise<ImportResult>
@@ -178,6 +205,10 @@ export interface EagletApi {
   removeSubscription: (subscriptionId: string) => Promise<void>
   removeProfile: (profileId: string) => Promise<void>
   testProfiles: (profileIds?: string[]) => Promise<Profile[]>
+  runSpeedTest: () => Promise<SpeedTestResult>
+  clearSessions: () => Promise<SessionRecord[]>
+  copyText: (text: string) => Promise<void>
+  readClipboard: () => Promise<string>
   checkIp: () => Promise<void>
   refreshCore: () => Promise<CoreState>
   updateSettings: (patch: Partial<Settings>) => Promise<Settings>

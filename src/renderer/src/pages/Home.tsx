@@ -2,12 +2,13 @@ import type { Snapshot } from '@shared/types'
 import { PowerDial } from '../components/PowerDial'
 import { Sparkline } from '../components/Sparkline'
 import { WorldMap } from '../components/WorldMap'
-import { ArrowDownIcon, ArrowUpIcon, ShieldIcon, SignalIcon } from '../components/Icons'
+import { ArrowDownIcon, ArrowUpIcon, BoltIcon, ShieldIcon, SignalIcon } from '../components/Icons'
 import { formatDuration, formatSpeed } from '../format'
 
 interface Props {
   snap: Snapshot
   onToggle: () => void
+  onQuickConnect: () => void
   onManageServers: () => void
 }
 
@@ -16,11 +17,12 @@ function place(info: { city: string; country: string } | null): string {
   return [info.city, info.country].filter(Boolean).join(', ')
 }
 
-export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Element {
+export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props): React.JSX.Element {
   const { state } = snap
   const { status, profile, metrics, history, ip } = state
   const connected = status === 'connected'
   const busy = status === 'connecting' || status === 'disconnecting'
+  const hasRemote = snap.profiles.some((item) => item.protocol !== 'direct')
 
   const label =
     status === 'connected'
@@ -78,6 +80,27 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
           )}
         </div>
       </section>
+
+      {!connected && !busy && (
+        <button
+          className="quick-connect panel"
+          onClick={() => (hasRemote ? onQuickConnect() : onManageServers())}
+          title={hasRemote ? 'Ping nodes and connect to the fastest' : 'Open the server list'}
+        >
+          <span className="quick-icon">
+            <BoltIcon />
+          </span>
+          <span className="quick-text">
+            <strong>{hasRemote ? 'Quick connect' : 'Find a server first'}</strong>
+            <span>
+              {hasRemote
+                ? 'Pings your nodes in parallel and connects to the fastest one'
+                : 'Import a subscription or run the free-server finder'}
+            </span>
+          </span>
+          <span className="quick-cta">{hasRemote ? 'Auto-pick' : 'Open servers'}</span>
+        </button>
+      )}
 
       <section className="ip-row">
         <div className="ip-card panel">

@@ -28,6 +28,16 @@ export function formatClock(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString([], { hour12: false })
 }
 
+export function formatDateTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  })
+}
+
 export function average(values: number[]): number {
   if (values.length === 0) return 0
   return values.reduce((sum, value) => sum + value, 0) / values.length

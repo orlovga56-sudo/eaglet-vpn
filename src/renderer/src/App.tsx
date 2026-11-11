@@ -79,6 +79,10 @@ export default function App(): React.JSX.Element {
     void window.eaglet.connect(profileId)
   }
 
+  const quickConnect = (): void => {
+    void window.eaglet.quickConnect()
+  }
+
   const selectProfile = (profileId: string): void => {
     void window.eaglet.selectProfile(profileId)
   }
@@ -120,7 +124,12 @@ export default function App(): React.JSX.Element {
 
         <main className="content">
           {page === 'home' && (
-            <Home snap={snap} onToggle={toggle} onManageServers={() => setPage('servers')} />
+            <Home
+              snap={snap}
+              onToggle={toggle}
+              onQuickConnect={quickConnect}
+              onManageServers={() => setPage('servers')}
+            />
           )}
           {page === 'servers' && (
             <Servers snap={snap} onConnect={connectTo} onSelect={selectProfile} onDisconnect={disconnect} />

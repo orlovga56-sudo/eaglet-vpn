@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { FreeDiscoveryResult, Profile, ProtocolId, Snapshot } from '@shared/types'
-import { GlobeIcon, SearchIcon } from '../components/Icons'
+import { CheckIcon, ClipboardIcon, CopyIcon, GlobeIcon, SearchIcon, StarIcon } from '../components/Icons'
 
 interface Props {
   snap: Snapshot
@@ -31,15 +31,17 @@ function formatAgo(timestamp: number): string {
   if (seconds < 60) return 'just now'
   if (seconds < 3600) return `${Math.round(seconds / 60)} min ago`
   if (seconds < 86400) return `${Math.round(seconds / 3600)} h ago`
-  return new Date(timestamp).toLocaleDateString()
+  return new Date(timestamp).toLocaleDateString('en-US')
 }
 
 export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): React.JSX.Element {
   const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState<'all' | 'favorites'>('all')
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [testing, setTesting] = useState(false)
   const [refreshing, setRefreshing] = useState<string | null>(null)
+  const [copied, setCopied] = useState<string | null>(null)
   const [message, setMessage] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
   const [free, setFree] = useState<FreeDiscoveryResult | null>(null)
   const [discovering, setDiscovering] = useState(false)
@@ -49,6 +51,7 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
   const selectedId = state.profile?.id ?? null
   const connected = state.status === 'connected'
   const busyConnection = state.status === 'connecting'
+  const favoriteCount = profiles.filter((profile) => profile.favorite).length
 
   const nameForSource = (sourceId: string | null): string | null => {
     if (!sourceId) return null
@@ -57,14 +60,17 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
-    if (!q) return profiles
-    return profiles.filter((profile) =>
-      [profile.name, profile.host, profile.protocol, nameForSource(profile.sourceId) ?? '']
-        .join(' ')
-        .toLowerCase()
-        .includes(q)
-    )
-  }, [profiles, query, subscriptions])
+    return [...profiles]
+      .filter((profile) => (filter === 'favorites' ? profile.favorite : true))
+      .filter((profile) => {
+        if (!q) return true
+        return [profile.name, profile.host, profile.protocol, nameForSource(profile.sourceId) ?? '']
+          .join(' ')
+          .toLowerCase()
+          .includes(q)
+      })
+      .sort((left, right) => Number(right.favorite) - Number(left.favorite) || right.addedAt - left.addedAt)
+  }, [profiles, query, subscriptions, filter])
 
   const runImport = async (): Promise<void> => {
     const value = input.trim()
@@ -114,6 +120,38 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
   const removeProfile = async (profile: Profile): Promise<void> => {
     try {
       await window.eaglet.removeProfile(profile.id)
+    } catch (error) {
+      setMessage({ tone: 'err', text: cleanError(error) })
+    }
+  }
+
+  const toggleFavorite = async (profile: Profile): Promise<void> => {
+    try {
+      await window.eaglet.setFavorite(profile.id, !profile.favorite)
+    } catch (error) {
+      setMessage({ tone: 'err', text: cleanError(error) })
+    }
+  }
+
+  const copyLink = async (profile: Profile): Promise<void> => {
+    try {
+      await window.eaglet.copyText(profile.raw)
+      setCopied(profile.id)
+      window.setTimeout(() => setCopied((current) => (current === profile.id ? null : current)), 1400)
+    } catch (error) {
+      setMessage({ tone: 'err', text: cleanError(error) })
+    }
+  }
+
+  const pasteFromClipboard = async (): Promise<void> => {
+    try {
+      const text = (await window.eaglet.readClipboard()).trim()
+      if (!text) {
+        setMessage({ tone: 'err', text: 'The clipboard is empty. Copy a subscription URL or a share link first.' })
+        return
+      }
+      setInput(text)
+      setMessage({ tone: 'ok', text: 'Pasted from the clipboard — press Import to add it.' })
     } catch (error) {
       setMessage({ tone: 'err', text: cleanError(error) })
     }
@@ -198,6 +236,10 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
             placeholder="https://provider.example/sub/abc  ·  vless://…  ·  ss://…"
             spellCheck={false}
           />
+          <button className="btn" onClick={() => void pasteFromClipboard()} title="Paste from the clipboard">
+            <ClipboardIcon />
+            Paste
+          </button>
           <button className="btn primary" onClick={() => void runImport()} disabled={busy || !input.trim()}>
             {busy ? 'Importing…' : 'Import'}
           </button>
@@ -367,6 +409,20 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
       )}
 
       <div className="toolbar">
+        <div className="filter-chips">
+          <button
+            className={`filter-chip ${filter === 'all' ? 'active' : ''}`}
+            onClick={() => setFilter('all')}
+          >
+            All <span>{profiles.length}</span>
+          </button>
+          <button
+            className={`filter-chip ${filter === 'favorites' ? 'active' : ''}`}
+            onClick={() => setFilter('favorites')}
+          >
+            <StarIcon filled={filter === 'favorites'} /> Favourites <span>{favoriteCount}</span>
+          </button>
+        </div>
         <div className="search panel">
           <SearchIcon />
           <input
@@ -403,6 +459,16 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                   if (event.key === 'Enter') onSelect(profile.id)
                 }}
               >
+                <button
+                  className={`profile-star ${profile.favorite ? 'is-on' : ''}`}
+                  title={profile.favorite ? 'Remove from favourites' : 'Pin to favourites'}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    void toggleFavorite(profile)
+                  }}
+                >
+                  <StarIcon filled={profile.favorite} />
+                </button>
                 <span className="proto-badge">{PROTOCOL_LABEL[profile.protocol]}</span>
                 <span className="profile-name">
                   <strong>{profile.name}</strong>
@@ -415,6 +481,16 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                   <strong>{profile.ping === null ? '—' : profile.ping}</strong> ms
                 </span>
                 <span className="profile-actions">
+                  <button
+                    className={`icon-btn ${copied === profile.id ? 'is-ok' : ''}`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      void copyLink(profile)
+                    }}
+                    title="Copy share link"
+                  >
+                    {copied === profile.id ? <CheckIcon /> : <CopyIcon />}
+                  </button>
                   <button
                     className="btn tiny"
                     onClick={(event) => {
@@ -451,7 +527,13 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
               </div>
             )
           })}
-          {filtered.length === 0 && <div className="empty-hint">No nodes match “{query}”.</div>}
+          {filtered.length === 0 && (
+            <div className="empty-hint">
+              {filter === 'favorites'
+                ? 'No favourites yet — tap the star on any node to pin it here.'
+                : `No nodes match “${query}”.`}
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import type { DnsMode, RoutingMode, Snapshot } from '@shared/types'
 import { CheckIcon, GlobeIcon, LockIcon, RouteIcon, SparkIcon, WifiIcon } from '../components/Icons'
 import { Toggle } from '../components/Toggle'
@@ -32,6 +33,17 @@ export function Routing({ snap, onUpdate }: Props): React.JSX.Element {
   const { settings, state } = snap
   const connected = state.status === 'connected'
   const tun = settings.tunMode
+  const [bypass, setBypass] = useState(settings.bypassList)
+
+  useEffect(() => {
+    setBypass(settings.bypassList)
+  }, [settings.bypassList])
+
+  const commitBypass = (): void => {
+    if (bypass !== settings.bypassList) onUpdate({ bypassList: bypass })
+  }
+
+  const bypassCount = bypass.split(/[\s,;]+/).filter(Boolean).length
 
   return (
     <div className="page">
@@ -60,6 +72,37 @@ export function Routing({ snap, onUpdate }: Props): React.JSX.Element {
             <p>{mode.text}</p>
           </button>
         ))}
+      </div>
+
+      <div className="section-title">Split tunneling · bypass list</div>
+      <div className="bypass panel">
+        <div className="bypass-head">
+          <div>
+            <strong>Always direct</strong>
+            <span>
+              Domains, IPs or CIDRs that never enter the tunnel. These rules win in both Global and Smart mode and
+              apply on the next connection.
+            </span>
+          </div>
+          <span className="bypass-count">
+            {bypassCount} {bypassCount === 1 ? 'entry' : 'entries'}
+          </span>
+        </div>
+        <textarea
+          className="bypass-input"
+          value={bypass}
+          spellCheck={false}
+          placeholder={'bank.example.com\n192.168.1.0/24\n10.0.0.5'}
+          onChange={(event) => setBypass(event.target.value)}
+          onBlur={commitBypass}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) commitBypass()
+          }}
+        />
+        <div className="bypass-hint">
+          One entry per line or comma-separated · suffix matches cover subdomains, so <code>example.com</code> also
+          bypasses <code>api.example.com</code>. Up to 120 entries.
+        </div>
       </div>
 
       <div className="section-title">How traffic is captured</div>

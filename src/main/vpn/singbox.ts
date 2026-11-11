@@ -366,6 +366,34 @@ function dnsFor(settings: Settings): Record<string, unknown> | undefined {
   }
 }
 
+/**
+ * Splits the user's bypass list into sing-box rules. Domains and IP/CIDR
+ * entries are separated because sing-box matches them with different keys.
+ * The rules always come first so they also win in Global mode.
+ */
+export function bypassRules(settings: Settings): Record<string, unknown>[] {
+  const entries = settings.bypassList
+    .split(/[\s,;]+/)
+    .map((entry) => entry.trim().replace(/^\./, ''))
+    .filter(Boolean)
+    .slice(0, 120)
+  if (entries.length === 0) return []
+
+  const domains: string[] = []
+  const cidrs: string[] = []
+  for (const entry of entries) {
+    const isIpv4 = /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(entry)
+    const isIpv6 = /^[0-9a-f:]+(\/\d{1,3})?$/i.test(entry) && entry.includes(':')
+    if (isIpv4 || isIpv6) cidrs.push(entry)
+    else domains.push(entry)
+  }
+
+  const rules: Record<string, unknown>[] = []
+  if (domains.length > 0) rules.push({ domain_suffix: domains, outbound: 'direct' })
+  if (cidrs.length > 0) rules.push({ ip_cidr: cidrs, outbound: 'direct' })
+  return rules
+}
+
 export function buildConfig(
   profile: Profile,
   settings: Settings,
@@ -392,13 +420,15 @@ export function buildConfig(
   const isDirect = settings.routingMode === 'direct'
 
   // Global sends every packet through the proxy; smart keeps the LAN direct.
-  const rules =
+  // The custom bypass list applies in both modes and takes priority.
+  const modeRules =
     settings.routingMode === 'smart'
       ? [
           { ip_is_private: true, outbound: 'direct' },
           { domain_suffix: ['.local', '.lan', '.home.arpa'], outbound: 'direct' }
         ]
       : []
+  const rules = [...bypassRules(settings), ...modeRules]
 
   const dns = dnsFor(settings)
   const useDns = Boolean(dns && !isDirect)
@@ -652,6 +682,38 @@ export async function quickProxiedIp(port: number, timeoutMs = 6000): Promise<st
   } catch {
     return null
   }
+}
+
+/** Downloads a fixed payload through the local inbound and reports real throughput. */
+export async function downloadThroughput(
+  port: number,
+  bytes = 10_000_000
+): Promise<{ bytes: number; seconds: number }> {
+  const devNull = process.platform === 'win32' ? 'NUL' : '/dev/null'
+  const url = `https://speed.cloudflare.com/__down?bytes=${bytes}`
+  const { stdout } = await execFileAsync(
+    'curl.exe',
+    [
+      '-s',
+      '-o',
+      devNull,
+      '--max-time',
+      '45',
+      '--proxy',
+      `http://127.0.0.1:${port}`,
+      '-w',
+      '%{size_download} %{time_total}',
+      url
+    ],
+    { timeout: 60000, windowsHide: true }
+  )
+  const [sizeRaw, timeRaw] = stdout.trim().split(/\s+/)
+  const size = Number(sizeRaw)
+  const seconds = Number(timeRaw)
+  if (!Number.isFinite(size) || size < 200_000 || !Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error('The speed test did not receive enough data — try again')
+  }
+  return { bytes: size, seconds }
 }
 
 export async function measurePing(port: number): Promise<number> {

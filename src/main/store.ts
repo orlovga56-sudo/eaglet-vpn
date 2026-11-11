@@ -1,7 +1,7 @@
 import { app } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import type { Profile, Settings, Subscription } from '@shared/types'
+import type { Profile, SessionRecord, Settings, Subscription } from '@shared/types'
 
 const DEFAULT_SETTINGS: Settings = {
   theme: 'cyber',
@@ -13,15 +13,20 @@ const DEFAULT_SETTINGS: Settings = {
   dns: 'auto',
   customDns: '',
   routingMode: 'smart',
+  bypassList: '',
+  autoReconnect: true,
   mini: false,
   launchAtStartup: false,
   activeProfileId: null
 }
 
+const SESSION_LIMIT = 40
+
 interface StoreData {
   settings: Settings
   profiles: Profile[]
   subscriptions: Subscription[]
+  sessions: SessionRecord[]
 }
 
 /** JSON-backed configuration store — no native deps, easy to inspect. */
@@ -36,15 +41,20 @@ export class Store {
 
   private load(): StoreData {
     try {
-      if (!existsSync(this.file)) return { settings: { ...DEFAULT_SETTINGS }, profiles: [], subscriptions: [] }
+      if (!existsSync(this.file)) {
+        return { settings: { ...DEFAULT_SETTINGS }, profiles: [], subscriptions: [], sessions: [] }
+      }
       const raw = JSON.parse(readFileSync(this.file, 'utf-8')) as Partial<StoreData>
       return {
         settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
-        profiles: Array.isArray(raw.profiles) ? raw.profiles : [],
-        subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : []
+        profiles: Array.isArray(raw.profiles)
+          ? raw.profiles.map((profile) => ({ ...profile, favorite: Boolean(profile.favorite) }))
+          : [],
+        subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : [],
+        sessions: Array.isArray(raw.sessions) ? raw.sessions : []
       }
     } catch {
-      return { settings: { ...DEFAULT_SETTINGS }, profiles: [], subscriptions: [] }
+      return { settings: { ...DEFAULT_SETTINGS }, profiles: [], subscriptions: [], sessions: [] }
     }
   }
 
@@ -81,10 +91,12 @@ export class Store {
     for (const profile of incoming) {
       const index = this.data.profiles.findIndex((item) => item.id === profile.id)
       if (index >= 0) {
-        this.data.profiles[index] = { ...this.data.profiles[index], ...profile, ping: null }
+        const existing = this.data.profiles[index]
+        // Re-importing a subscription must not drop the user's star.
+        this.data.profiles[index] = { ...existing, ...profile, favorite: existing.favorite, ping: null }
         updated += 1
       } else {
-        this.data.profiles.push(profile)
+        this.data.profiles.push({ ...profile, favorite: Boolean(profile.favorite) })
         added += 1
       }
     }
@@ -92,6 +104,13 @@ export class Store {
     this.data.profiles.sort((a, b) => b.addedAt - a.addedAt)
     this.save()
     return { added, updated }
+  }
+
+  setFavorite(id: string, favorite: boolean): void {
+    const profile = this.data.profiles.find((item) => item.id === id)
+    if (!profile) return
+    profile.favorite = favorite
+    this.save()
   }
 
   removeProfile(id: string): void {
@@ -132,6 +151,21 @@ export class Store {
 
   removeSubscription(id: string): void {
     this.data.subscriptions = this.data.subscriptions.filter((item) => item.id !== id)
+    this.save()
+  }
+
+  getSessions(): SessionRecord[] {
+    return [...this.data.sessions]
+  }
+
+  addSession(session: SessionRecord): void {
+    this.data.sessions.unshift(session)
+    this.data.sessions = this.data.sessions.slice(0, SESSION_LIMIT)
+    this.save()
+  }
+
+  clearSessions(): void {
+    this.data.sessions = []
     this.save()
   }
 }

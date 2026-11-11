@@ -13,6 +13,7 @@ screenshots/tmp/
 /electron.exe
 free-test.json
 free-connect-test.json
+feature-test.json
 
 resources/bin/*
 !resources/bin/.gitkeep

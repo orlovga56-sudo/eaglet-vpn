@@ -29,6 +29,21 @@ core (1.14.x) and drives it end to end:
 - **Happ-style conveniences** — subscription refresh/removal, latency tests,
   search, per-node connect, auto-connect on launch, launch at startup, compact
   always-on-top mode, DNS selection, kill-switch policy and six themes.
+- **Quick connect** — pings a bounded sample of nodes in parallel and connects to
+  the fastest one, preferring nodes you starred.
+- **Favourites and clipboard** — pin any node with a star (favourites sort to the
+  top and get their own filter), copy its share link, and paste a link or
+  subscription URL straight from the clipboard.
+- **Real speed test** — downloads 10 MB through the live tunnel and reports the
+  measured Mbps; nothing is simulated.
+- **Session history** — every finished session is persisted with duration,
+  traffic totals and the exit IP (last 40), with one-click clearing.
+- **Split tunneling** — an always-direct bypass list of domains, IPs and CIDRs
+  that wins in both Smart and Global routing.
+- **Auto-reconnect** — after an unexpected core crash Eaglet retries three times
+  with a growing delay and restores the system proxy.
+- **Desktop notifications** — connect, disconnect, drop and exit-IP-change events
+  are surfaced through the OS notification centre.
 - **Free-server finder** — *Servers → Find free servers* pulls open community
   catalogs from GitHub, deduplicates thousands of links, TCP-probes a sample and
   boots a throwaway sing-box instance for the fastest candidates. Only nodes
@@ -44,6 +59,15 @@ core (1.14.x) and drives it end to end:
 > **Public nodes are untrusted.** The finder proves that a node carries HTTP
 > traffic — not that its operator is honest. Never sign in to banking, work or
 > other sensitive accounts through a free public node.
+
+## Telemetry that is measured, not drawn
+
+![Stats and session history](screenshots/page-stats-history.png)
+
+Speed, totals, latency and per-session history come from the core's Clash API
+and from real HTTP transfers through the active tunnel. The speed test downloads
+a fixed 10 MB payload, and each session records its duration, traffic and exit
+address when the tunnel closes.
 
 ## Interface styles
 
@@ -100,9 +124,9 @@ user-data folder on the first connect.
 ```
 src/shared   IPC contract and domain types
 src/main     Electron main process
-  store.ts            settings, profiles and subscriptions (userData/config.json)
-  vpn/engine.ts       state machine, connect/teardown, IP probes, telemetry
-  vpn/singbox.ts      core discovery/install, config builder, process, Clash API
+  store.ts            settings, profiles, subscriptions and sessions (userData/config.json)
+  vpn/engine.ts       state machine, connect/teardown, IP probes, telemetry, sessions, auto-reconnect, speed test
+  vpn/singbox.ts      core discovery/install, config builder (incl. bypass rules), process, Clash API, speed transfer
   vpn/profiles.ts     share-link and subscription parser
   vpn/system-proxy.ts Windows proxy enable/disable with backup/restore
 src/preload  contextBridge API (window.eaglet)

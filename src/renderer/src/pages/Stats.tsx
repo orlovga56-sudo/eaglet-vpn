@@ -1,5 +1,6 @@
-import type { HistoryPoint, Snapshot } from '@shared/types'
-import { average, formatBytes, formatClock, formatDuration } from '../format'
+import { useState } from 'react'
+import type { HistoryPoint, Snapshot, SpeedTestResult } from '@shared/types'
+import { average, formatBytes, formatClock, formatDateTime, formatDuration, formatSpeed } from '../format'
 
 interface Props {
   snap: Snapshot
@@ -64,6 +65,23 @@ export function Stats({ snap }: Props): React.JSX.Element {
   const { metrics, history, ip } = state
   const live = state.status === 'connected'
   const pingAvg = average(history.map((point) => point.ping).filter((value) => value > 0))
+  const [speed, setSpeed] = useState<SpeedTestResult | null>(null)
+  const [speedBusy, setSpeedBusy] = useState(false)
+  const [speedError, setSpeedError] = useState<string | null>(null)
+
+  const runSpeed = async (): Promise<void> => {
+    setSpeedBusy(true)
+    setSpeedError(null)
+    try {
+      const result = await window.eaglet.runSpeedTest()
+      setSpeed(result)
+    } catch (error) {
+      const message = (error as Error)?.message ?? 'Speed test failed'
+      setSpeedError(message.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, ''))
+    } finally {
+      setSpeedBusy(false)
+    }
+  }
 
   return (
     <div className="page">
@@ -106,6 +124,29 @@ export function Stats({ snap }: Props): React.JSX.Element {
         </div>
       </div>
 
+      <div className="speed-card panel">
+        <div className="speed-main">
+          <div className="tile-label">Speed test</div>
+          <div className="speed-value">
+            {speedBusy ? '…' : speed ? formatSpeed(speed.mbps) : '—'}
+            <span className="unit">Mbps</span>
+          </div>
+          <div className="speed-foot">
+            {speedBusy
+              ? 'Downloading 10 MB through the tunnel…'
+              : speed
+                ? `${formatBytes(speed.bytes)} in ${speed.seconds.toFixed(1)}s · measured at ${formatClock(speed.at)}`
+                : live
+                  ? 'Measure real throughput through the active core'
+                  : 'Connect a tunnel to run the test'}
+          </div>
+        </div>
+        <button className="btn primary" onClick={() => void runSpeed()} disabled={!live || speedBusy}>
+          {speedBusy ? 'Testing…' : 'Run speed test'}
+        </button>
+      </div>
+      {speedError && <div className="callout danger">{speedError}</div>}
+
       <div className="chart-card panel">
         <div className="chart-head">
           <div className="tile-label" style={{ margin: 0 }}>
@@ -121,6 +162,50 @@ export function Stats({ snap }: Props): React.JSX.Element {
           </div>
         </div>
         <SpeedChart history={history} />
+      </div>
+
+      <div className="section-title">Session history</div>
+      <div className="sessions panel">
+        {snap.sessions.length === 0 ? (
+          <div className="empty-hint">No finished sessions yet. Connect and disconnect to record one.</div>
+        ) : (
+          <>
+            <div className="session-head">
+              <span className="tile-label" style={{ margin: 0 }}>
+                Recent sessions · {snap.sessions.length}
+              </span>
+              <button className="btn small danger" onClick={() => void window.eaglet.clearSessions()}>
+                Clear history
+              </button>
+            </div>
+            <div className="session-table">
+              <div className="session-row is-head">
+                <span>Node</span>
+                <span>Started</span>
+                <span>Duration</span>
+                <span>Down</span>
+                <span>Up</span>
+                <span>Exit</span>
+              </div>
+              {snap.sessions.map((session) => (
+                <div className="session-row" key={session.id}>
+                  <span className="session-node">
+                    <strong>{session.profileName}</strong>
+                    <span>{session.protocol.toUpperCase()}</span>
+                  </span>
+                  <span>{formatDateTime(session.startedAt)}</span>
+                  <span>{formatDuration(session.durationSeconds)}</span>
+                  <span>{formatBytes(session.downTotal)}</span>
+                  <span>{formatBytes(session.upTotal)}</span>
+                  <span className="session-exit">
+                    {session.exitIp ?? '—'}
+                    {session.exitCountry ? ` · ${session.exitCountry}` : ''}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
       </div>
 
       <div className="section-title">Tunnel facts</div>

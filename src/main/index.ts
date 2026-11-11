@@ -1,12 +1,13 @@
-import { app, BrowserWindow, ipcMain, shell } from 'electron'
-import { writeFileSync } from 'node:fs'
+import { app, BrowserWindow, clipboard, ipcMain, Notification, shell } from 'electron'
+import { execFile } from 'node:child_process'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { Store } from './store'
 import { VpnEngine } from './vpn/engine'
 import { isHttpUrl, parseProfileUri, parseProfilesPayload, subscriptionName } from './vpn/profiles'
 import { discoverFreeProfiles } from './vpn/free-sources'
-import type { ImportResult, Profile, Settings, Snapshot, Subscription } from '@shared/types'
+import type { ImportResult, Profile, Settings, Snapshot, Subscription, VpnState } from '@shared/types'
 
 const isDev = !app.isPackaged
 const isShotMode = process.argv.includes('--eaglet-shots')
@@ -23,6 +24,7 @@ function snapshot(): Snapshot {
     settings: store.getSettings(),
     profiles: store.getProfiles(),
     subscriptions: store.getSubscriptions(),
+    sessions: store.getSessions(),
     platform: process.platform,
     version: app.getVersion()
   }
@@ -205,6 +207,75 @@ function addFreeProfiles(links: string[]): ImportResult {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Quick connect + notifications                                     */
+/* ------------------------------------------------------------------ */
+
+/** Refreshes a bounded sample of nodes and returns the fastest one. */
+async function pickFastestProfile(): Promise<Profile> {
+  const profiles = store.getProfiles().filter((profile) => profile.protocol !== 'direct' && profile.port > 0)
+  if (profiles.length === 0) {
+    throw new Error('No nodes yet — import a subscription or find free servers first')
+  }
+
+  // Favourites and nodes without a measurement are worth re-testing first.
+  const ranked = [...profiles].sort((left, right) => {
+    if (left.favorite !== right.favorite) return left.favorite ? -1 : 1
+    if (left.ping === null && right.ping === null) return right.addedAt - left.addedAt
+    if (left.ping === null) return -1
+    if (right.ping === null) return 1
+    return left.ping - right.ping
+  })
+
+  const sample = ranked.slice(0, 16)
+  await engine.testProfiles(sample.map((profile) => profile.id))
+
+  const measured = store
+    .getProfiles()
+    .filter((profile) => sample.some((item) => item.id === profile.id) && profile.ping !== null)
+    .sort((left, right) => (left.ping ?? Infinity) - (right.ping ?? Infinity))
+
+  return measured[0] ?? sample[0]
+}
+
+function notify(title: string, body: string): void {
+  if (isShotMode || !Notification.isSupported()) return
+  if (!store.getSettings().notifications) return
+  try {
+    new Notification({ title, body, silent: false }).show()
+  } catch {
+    // Notifications are best-effort.
+  }
+}
+
+let lastNotifiedStatus = 'disconnected'
+let lastNotifiedIpCheck = 0
+
+/** Turns real state transitions into desktop notifications. */
+function notifyState(state: VpnState): void {
+  if (!store || isShotMode) return
+  if (state.status !== lastNotifiedStatus) {
+    if (state.status === 'connected') {
+      notify(
+        'Eaglet · Tunnel up',
+        state.profile
+          ? `${state.profile.name} · exit ${state.ip.exit?.ip ?? 'measuring…'}`
+          : 'Encrypted tunnel established'
+      )
+    } else if (state.status === 'error') {
+      notify('Eaglet · Tunnel dropped', state.error ?? 'The core stopped unexpectedly')
+    } else if (state.status === 'disconnected' && lastNotifiedStatus === 'connected') {
+      notify('Eaglet · Disconnected', 'Direct connection restored')
+    }
+    lastNotifiedStatus = state.status
+  }
+
+  if (state.ip.changed && state.ip.checkedAt && state.ip.checkedAt !== lastNotifiedIpCheck) {
+    lastNotifiedIpCheck = state.ip.checkedAt
+    notify('Eaglet · Exit IP changed', `${state.ip.direct?.ip ?? 'unknown'} → ${state.ip.exit?.ip ?? 'unknown'}`)
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  IPC                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -216,6 +287,26 @@ function registerIpc(): void {
     broadcast()
   })
 
+  ipcMain.handle('vpn:quick-connect', async () => {
+    if (engine.getState().status === 'connected' || engine.getState().status === 'connecting') {
+      throw new Error('Disconnect before picking a new fastest node')
+    }
+    try {
+      const fastest = await pickFastestProfile()
+      engine.pushExternalLog(
+        'info',
+        `Quick connect · fastest node ${fastest.name}${fastest.ping !== null ? ` (${fastest.ping} ms)` : ''}`
+      )
+      await engine.connect(fastest.id)
+      broadcast()
+      return fastest
+    } catch (error) {
+      engine.pushExternalLog('error', (error as Error).message)
+      broadcast()
+      throw error
+    }
+  })
+
   ipcMain.handle('vpn:disconnect', async () => {
     await engine.disconnect()
     broadcast()
@@ -224,6 +315,13 @@ function registerIpc(): void {
   ipcMain.handle('vpn:select-profile', (_event, id: string) => {
     engine.selectProfile(id)
     broadcast()
+  })
+
+  ipcMain.handle('profiles:favorite', (_event, id: string, favorite: boolean) => {
+    store.setFavorite(id, favorite)
+    engine.pushExternalLog('info', favorite ? 'Pinned node to favourites' : 'Removed node from favourites')
+    broadcast()
+    return store.getProfiles()
   })
 
   ipcMain.handle('profiles:import', async (_event, text: string) => {
@@ -333,6 +431,31 @@ function registerIpc(): void {
     broadcast()
   })
 
+  ipcMain.handle('speed:test', async () => {
+    try {
+      const result = await engine.runSpeedTest()
+      broadcast()
+      return result
+    } catch (error) {
+      engine.pushExternalLog('warn', `Speed test failed: ${(error as Error).message}`)
+      broadcast()
+      throw error
+    }
+  })
+
+  ipcMain.handle('sessions:clear', () => {
+    store.clearSessions()
+    engine.pushExternalLog('info', 'Session history cleared')
+    broadcast()
+    return store.getSessions()
+  })
+
+  ipcMain.handle('clipboard:write', (_event, text: string) => {
+    clipboard.writeText(String(text ?? ''))
+  })
+
+  ipcMain.handle('clipboard:read', () => clipboard.readText())
+
   ipcMain.handle('core:refresh', async () => {
     const core = await engine.refreshCore()
     broadcast()
@@ -382,7 +505,8 @@ app.whenReady().then(async () => {
   const settings = store.getSettings()
   engine = new VpnEngine(store)
 
-  engine.on('state', () => {
+  engine.on('state', (state: VpnState) => {
+    notifyState(state)
     broadcast()
   })
 
@@ -449,6 +573,126 @@ app.whenReady().then(async () => {
       report.storedFreeProfiles = store.getProfiles().filter((p) => p.sourceId === FREE_SOURCE_ID).length
     } catch (error) {
       report.error = (error as Error).message
+    }
+    writeFileSync(outFile, JSON.stringify(report, null, 2), 'utf8')
+    await engine.shutdown()
+    app.exit(0)
+    return
+  }
+
+  if (process.argv.includes('--eaglet-feature-test')) {
+    // Dev harness for the "quality of life" batch: favourites, bypass rules,
+    // speed test, auto-reconnect after a real core crash, and session history.
+    const outFile = process.env.EAGLET_FEATURE_OUT ?? join(process.cwd(), 'feature-test.json')
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+    const report: Record<string, unknown> = {}
+    const originalSettings = store.getSettings()
+    let addedDirectId: string | null = null
+    try {
+      await engine.init()
+      await engine.ensureCore()
+      report.core = engine.getState().core
+
+      // 1. Favourites survive a round-trip through the store.
+      let direct = store.getProfiles().find((profile) => profile.protocol === 'direct')
+      if (!direct) {
+        const [parsed] = parseProfilesPayload('direct://Feature%20test')
+        if (!parsed) throw new Error('Could not create a direct profile')
+        store.addProfiles([parsed])
+        engine.reconcileProfiles()
+        direct = store.getProfile(parsed.id) ?? undefined
+        addedDirectId = parsed.id
+      }
+      if (!direct) throw new Error('Direct profile missing')
+
+      store.setFavorite(direct.id, true)
+      report.favoriteOn = store.getProfile(direct.id)?.favorite
+      store.setFavorite(direct.id, false)
+      report.favoriteOff = store.getProfile(direct.id)?.favorite
+
+      // 2. Bypass rules end up in the generated config and must validate.
+      store.updateSettings({
+        bypassList: 'bank.example.com\napi.test.local\n10.0.0.0/8\n192.168.50.7',
+        autoReconnect: true,
+        systemProxy: true,
+        notifications: false
+      })
+      report.bypassParsed = store.getSettings().bypassList.split(/\s+/).filter(Boolean).length
+      report.notificationsStored = store.getSettings().notifications
+
+      engine.setProfile(direct.id)
+      await engine.connect()
+      const connectDeadline = Date.now() + 60000
+      while (engine.getState().status === 'connecting' && Date.now() < connectDeadline) await sleep(250)
+      const state = engine.getState()
+      report.connected = state.status
+      report.exitIp = state.ip.exit?.ip ?? null
+      report.changed = state.ip.changed
+
+      const configPath = join(app.getPath('userData'), 'core', 'config.json')
+      const config = JSON.parse(readFileSync(configPath, 'utf-8')) as { route?: { rules?: unknown[] } }
+      report.bypassRules = (config.route?.rules ?? []).filter(
+        (rule) => (rule as { outbound?: string }).outbound === 'direct'
+      )
+
+      // 3. Real throughput test through the mixed inbound.
+      if (state.status === 'connected') {
+        try {
+          report.speed = await engine.runSpeedTest()
+        } catch (error) {
+          report.speedError = (error as Error).message
+        }
+      }
+
+      // 4. Kill the core for real and let auto-reconnect bring it back.
+      if (engine.getState().status === 'connected') {
+        report.autoReconnect = { killed: true }
+        await new Promise<void>((resolve) => {
+          execFile('taskkill.exe', ['/F', '/IM', 'sing-box.exe'], () => resolve())
+        })
+        const reconnectDeadline = Date.now() + 60000
+        let sawError = false
+        while (Date.now() < reconnectDeadline) {
+          const current = engine.getState().status
+          if (current === 'error') sawError = true
+          if (sawError && current === 'connected') break
+          if (current === 'error' && !store.getSettings().autoReconnect) break
+          await sleep(300)
+        }
+        const after = engine.getState()
+        report.autoReconnect = {
+          killed: true,
+          finalStatus: after.status,
+          restored: sawError && after.status === 'connected',
+          logs: after.logs
+            .filter((entry) => /auto-reconnect|stopped unexpectedly/i.test(entry.message))
+            .map((entry) => entry.message)
+        }
+      }
+
+      // 5. Disconnect records a persistent session.
+      if (engine.getState().status === 'connected') {
+        await engine.disconnect()
+        const disconnectDeadline = Date.now() + 30000
+        while (engine.getState().status !== 'disconnected' && Date.now() < disconnectDeadline) await sleep(250)
+      }
+      const sessions = store.getSessions()
+      report.sessions = sessions.length
+      report.lastSession = sessions[0] ?? null
+      report.proxyRestored = true
+    } catch (error) {
+      report.error = (error as Error).message
+    }
+
+    // Restore the user's settings, keeping the recorded sessions as evidence.
+    try {
+      store.updateSettings(originalSettings)
+      if (addedDirectId) {
+        store.removeProfile(addedDirectId)
+        engine.reconcileProfiles()
+      }
+    } catch {
+      // Best effort.
     }
     writeFileSync(outFile, JSON.stringify(report, null, 2), 'utf8')
     await engine.shutdown()
@@ -523,8 +767,8 @@ app.on('before-quit', (event) => {
 const SHOT_SOURCE = '__shots__'
 
 async function seedShotProfiles(): Promise<void> {
-  const hasDirect = store.getProfiles().some((profile) => profile.protocol === 'direct')
-  const links = hasDirect
+  const hasShotProfiles = store.getProfiles().some((profile) => profile.sourceId === SHOT_SOURCE)
+  const links = hasShotProfiles
     ? []
     : [
         'direct://Showcase%20direct',
@@ -539,7 +783,10 @@ async function seedShotProfiles(): Promise<void> {
     if (profile) store.addProfiles([{ ...profile, sourceId: SHOT_SOURCE }])
   }
   engine.reconcileProfiles()
-  const direct = store.getProfiles().find((profile) => profile.protocol === 'direct')
+  const shotProfiles = store.getProfiles().filter((profile) => profile.sourceId === SHOT_SOURCE)
+  const favourite = shotProfiles.find((profile) => profile.name.includes('Frankfurt'))
+  if (favourite) store.setFavorite(favourite.id, true)
+  const direct = shotProfiles.find((profile) => profile.protocol === 'direct')
   if (direct) engine.setProfile(direct.id)
   await engine.testProfiles()
 }
@@ -561,8 +808,13 @@ async function scheduleShots(win: BrowserWindow): Promise<void> {
     await wait(1200)
     await seedShotProfiles()
     const freeOnly = process.env['EAGLET_SHOT_ONLY'] === 'free'
+    const beforeBypass = store.getSettings().bypassList
 
     if (!freeOnly) {
+      // Show a populated bypass list and a clean, real session history.
+      store.updateSettings({ bypassList: 'bank.example.com\n10.0.0.0/8\n192.168.50.7' })
+      store.clearSessions()
+
       const themes = ['cyber', 'glass', 'minimal', 'hud', 'neon', 'aurora']
       for (const theme of themes) {
         await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('${theme}')`)
@@ -571,14 +823,59 @@ async function scheduleShots(win: BrowserWindow): Promise<void> {
         writeFileSync(join(dir, `theme-${theme}.png`), image.toPNG())
       }
 
+      // Two short real sessions give the history table believable data.
+      for (let index = 0; index < 2; index += 1) {
+        await win.webContents.executeJavaScript(`window.eaglet.connect()`)
+        await wait(2600)
+        await win.webContents.executeJavaScript(`window.eaglet.runSpeedTest().catch(() => null)`)
+        await wait(1200)
+        await win.webContents.executeJavaScript(`window.eaglet.disconnect()`)
+        await wait(1600)
+      }
+
       await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('cyber')`)
       await win.webContents.executeJavaScript(`window.eaglet.connect()`)
       await wait(22000)
       for (const page of ['home', 'servers', 'routing', 'stats', 'settings']) {
         await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('${page}')`)
         await wait(900)
+        if (page === 'stats') {
+          // Click the real speed-test button so the card shows a measured value.
+          const clicked = await win.webContents.executeJavaScript(`
+            (() => {
+              const button = [...document.querySelectorAll('button')].find((item) =>
+                /Run speed test/i.test(item.textContent || '')
+              )
+              if (!button) return false
+              button.click()
+              return true
+            })()
+          `)
+          if (clicked) {
+            const started = Date.now()
+            for (;;) {
+              const ready = await win.webContents.executeJavaScript(
+                `(() => { const value = document.querySelector('.speed-value'); return Boolean(value) && /^\\d/.test((value.textContent || '').trim()) })()`
+              )
+              if (ready || Date.now() - started > 45000) break
+              await wait(500)
+            }
+            await wait(500)
+          }
+        }
         const image = await win.webContents.capturePage()
         writeFileSync(join(dir, page === 'home' ? 'connected.png' : `page-${page}.png`), image.toPNG())
+        if (page === 'stats') {
+          await win.webContents.executeJavaScript(
+            `document.querySelector('.sessions') && document.querySelector('.sessions').scrollIntoView({ block: 'center' })`
+          )
+          await wait(600)
+          const historyShot = await win.webContents.capturePage()
+          writeFileSync(join(dir, 'page-stats-history.png'), historyShot.toPNG())
+          await win.webContents.executeJavaScript(
+            `document.querySelector('.content') && document.querySelector('.content').scrollTo(0, 0)`
+          )
+        }
       }
     }
 
@@ -620,6 +917,7 @@ async function scheduleShots(win: BrowserWindow): Promise<void> {
     }
 
     console.log('[shots] done')
+    if (!freeOnly) store.updateSettings({ bypassList: beforeBypass })
     await engine.shutdown()
     clearShotProfiles()
     app.exit(0)

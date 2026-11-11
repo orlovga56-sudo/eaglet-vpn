@@ -57,6 +57,7 @@ function buildProfile(raw: string, fields: Partial<Profile> & Pick<Profile, 'nam
     raw: raw.trim(),
     sourceId: null,
     ping: null,
+    favorite: false,
     addedAt: Date.now(),
     ...fields
   }
