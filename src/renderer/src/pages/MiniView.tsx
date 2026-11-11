@@ -81,7 +81,7 @@ export function MiniView({ snap, onToggle, onManageServers, onExpand }: Props): 
           <strong>{state.ip.exit?.ip ?? '—'}</strong>
         </div>
         <span className={`ip-badge ${state.ip.changed ? 'ok' : 'idle'}`}>
-          {state.ip.changed ? 'Changed' : connected ? 'Live' : 'Standby'}
+          {state.ip.changed ? 'Changed' : connected ? 'No change' : 'Standby'}
         </span>
         <div className="mini-ip-place">{place || 'No probe yet'}</div>
       </div>

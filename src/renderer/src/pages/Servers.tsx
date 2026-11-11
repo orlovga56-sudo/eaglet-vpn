@@ -155,7 +155,7 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
         {message && <div className={`import-message ${message.tone}`}>{message.text}</div>}
         {!message && (
           <div className="import-hint">
-            Happ, v2rayN, Shadowrocket and Clash subscriptions all work. Auto-refresh keeps the node list current.
+            Happ, v2rayN and Shadowrocket base64 subscriptions work. Use Update on a subscription to refresh its nodes.
           </div>
         )}
       </div>
