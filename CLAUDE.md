@@ -12,9 +12,9 @@ Aurora*). Every screen, animation and accent colour is driven by CSS custom
 properties, so a theme is purely a token set — no theme-specific component
 code.
 
-The tunnel itself is currently **simulated** (see "VPN engine" below). The
-architecture is deliberately shaped so that swapping in a real WireGuard
-transport is a contained change.
+The tunnel is **real**: it runs the bundled [sing-box](https://sing-box.sagernet.org/)
+core, generates a config from the selected profile, applies the Windows system
+proxy and streams live telemetry through the core's Clash API.
 
 ## Tech stack
 
@@ -24,6 +24,7 @@ transport is a contained change.
 | UI        | React 19 + TypeScript                        | Component model for the six themes             |
 | Build     | electron-vite (Vite 8)                       | HMR in dev, single `build` for main/preload/UI |
 | Styling   | Hand-written CSS with custom properties      | Max fidelity to the concept sheet, zero deps   |
+| Tunnel    | sing-box (child process + Clash API)         | All mainstream protocols, no native bindings   |
 | Map       | Pre-rendered Natural Earth path (`npm run map`) | Offline, no runtime mapping dependency       |
 | Packaging | electron-builder                             | `npm run dist` builds installers               |
 
@@ -33,12 +34,14 @@ in `src/renderer/src/components/Icons.tsx`.
 ## Commands
 
 ```bash
+npm install
+npm run core       # download/sing-box into resources/bin
 npm run dev        # HMR dev session (Electron + Vite)
 npm run build      # bundle main, preload and renderer into out/
 npm start          # preview the production bundle
 npm run typecheck  # tsc for node + web projects
 npm run map        # regenerate the dotted world map from world-atlas data
-npm run shots      # render offscreen and capture screenshots/theme-*.png
+npm run shots      # render offscreen and capture screenshots/*.png
 npm run dist       # electron-builder installers
 ```
 
@@ -48,25 +51,29 @@ npm run dist       # electron-builder installers
 ## Repository layout
 
 ```
+resources/bin/         sing-box.exe + libcronet.dll (git-ignored, npm run core)
+scripts/fetch-core.mjs downloads the core for the current platform
 src/
-  shared/types.ts        # Single source of truth for the IPC contract
+  shared/types.ts      single source of truth for the IPC contract
   main/
-    index.ts             # Window, IPC handlers, mini-mode, screenshot harness
-    store.ts             # JSON settings persistence (userData/settings.json)
+    index.ts           window, IPC handlers, subscription fetching, shots
+    store.ts           JSON settings/profiles/subscriptions persistence
     vpn/
-      engine.ts          # State machine + traffic simulator (replaceable)
-      servers.ts         # Node catalogue with map coordinates
-  preload/index.ts       # contextBridge → window.eaglet
+      engine.ts        state machine, connect/teardown, IP probes, telemetry
+      singbox.ts       core discovery/install, config builder, process, Clash API
+      profiles.ts      share-link + base64 subscription parser
+      system-proxy.ts  WinINET proxy enable/disable and crash recovery
+  preload/index.ts     contextBridge → window.eaglet
   renderer/
     index.html
     src/
-      App.tsx            # Routing between pages, theme override plumbing
-      format.ts          # Speed/bytes/duration formatters
-      data/worldMap.json # Generated — do not hand-edit (npm run map)
-      components/        # TitleBar, Sidebar, PowerDial, WorldMap, …
-      pages/             # Home, Servers, Routing, Stats, Settings, MiniView
-      styles/theme.css   # Theme tokens + backdrops
-      styles/app.css     # Layout and components
+      App.tsx          page routing, theme override plumbing
+      format.ts        speed/bytes/duration formatters
+      data/worldMap.json
+      components/      TitleBar, Sidebar, PowerDial, WorldMap, …
+      pages/           Home, Servers, Routing, Stats, Settings, MiniView
+      styles/theme.css theme tokens + backdrops
+      styles/app.css   layout and components
 ```
 
 ## The theme system
@@ -95,37 +102,72 @@ Design rules that keep the six styles coherent:
 
 ## VPN engine
 
-`src/main/vpn/engine.ts` owns a `VpnEngine extends EventEmitter` with the state
-machine `disconnected → connecting → connected → disconnecting` and a traffic
-simulator (mean-reverting latency, eased throughput, 60-sample history).
+`src/main/vpn/engine.ts` owns `VpnEngine extends EventEmitter`. Public surface:
 
-To make Eaglet a real client:
+- `init()` / `refreshCore()` — discover the binary and read its version.
+- `connect(profileId?)` — stage machine: prepare profile → ensure core →
+  build + `sing-box check` config → spawn → wait for the mixed port → probe
+  the exit IP → enable the system proxy → connected.
+- `disconnect()` / `shutdown()` — stop telemetry, kill the process tree,
+  restore the previous Windows proxy.
+- `checkIp()` — probes the direct address and, while connected, the exit
+  address through the local inbound; sets `ip.changed` only when they differ.
+- `testProfiles(ids?)` — TCP handshake latency per node.
+- `setSystemProxy(bool)` — live proxy toggle while a tunnel is up.
+- `getState()` + `'state'` event — the renderer consumes full snapshots.
 
-1. Create `src/main/vpn/wireguard.ts` exposing `connect(server)`,
-   `disconnect()` and a `stats()` poller. On Windows the usual approach is a
-   bundled `wireguard.exe` / WireGuard DLL plus a generated tunnel config.
-2. Replace the `establish()` / `tick()` / `disconnect()` internals of
-   `VpnEngine` with calls into that adapter. **Keep the public surface
-   (`getState`, `connect`, `disconnect`, `selectServer`, `'state'` event) and
-   the `VpnState` shape** — the renderer and preload depend on it.
-3. Feed real numbers into `metrics` and `history`; the UI needs no changes.
+### Core integration (`singbox.ts`)
 
-The `Mock`/`Simulated` nature of the current engine is intentional and must be
-documented in any user-facing text until a real adapter lands.
+- Binary lookup: `resources/bin` (packaged `extraResources`), repo
+  `resources/bin`, then `userData/bin`. `installCore()` can download the
+  latest release as a fallback.
+- `buildConfig(profile, settings, mixedPort, apiPort, secret)` emits a
+  sing-box 1.14 config: mixed inbound, optional TUN inbound, the profile
+  outbound, smart/global routing rules, optional DoH DNS with
+  `route.default_domain_resolver`, and a Clash API on loopback.
+- `outboundFor(profile)` maps every supported share link. When adding a
+  protocol, extend `parseProfileUri` in `profiles.ts` and this function, then
+  verify with `sing-box check -c out/main/...` or the generated
+  `userData/core/config.json`.
+- Telemetry: GET `/connections` with the bearer secret; totals are diffed per
+  second and converted to Mbps. Latency is a `curl` request through the local
+  proxy every 5 s.
+
+### Windows routing
+
+`system-proxy.ts` writes `HKCU\…\Internet Settings`, notifies WinINET and keeps
+a JSON backup in `userData/proxy-backup.json`. `recoverStaleProxy()` runs at
+startup so a crash never leaves the user behind a dead proxy. Always call the
+restore path from `shutdown()`; the main process prevents quit until it runs.
 
 ## IPC contract
 
 All renderer↔main traffic goes through `window.eaglet` (`src/shared/types.ts`
 defines `EagletApi`):
 
-- `snapshot()` → full `Snapshot` (state + settings + servers + version)
-- `connect(serverId?)`, `disconnect()`, `selectServer(id)`
+- `snapshot()` → `Snapshot` (state + settings + profiles + subscriptions)
+- `connect(profileId?)`, `disconnect()`, `selectProfile(id)`
+- `importProfiles(text)` — URL, share link or base64 list
+- `updateSubscription(id)`, `removeSubscription(id)`, `removeProfile(id)`
+- `testProfiles(ids?)`, `checkIp()`, `refreshCore()`
 - `updateSettings(patch)` → persisted `Settings`
 - `setMini(bool)`, `windowMinimize()`, `windowClose()`,
   `windowToggleMaximize()`
 - `onState(cb)` → main pushes a new `Snapshot` on every engine tick
 
 Do not add `nodeIntegration`; the renderer must stay sandboxed behind preload.
+
+## Testing checklist
+
+1. `npm run typecheck && npm run build`.
+2. Import `direct://Test` (or a real node) and connect. Confirm:
+   - the mixed inbound opens and `curl --proxy http://127.0.0.1:<port>` works;
+   - the WinINET proxy is set while connected and restored after disconnect;
+   - speed/connection counters move on Stats;
+   - Home shows direct and exit addresses.
+3. `Get-Process sing-box` should be empty after disconnect.
+4. `npm run shots` exercises the whole flow (it seeds demo profiles, connects
+   through the direct profile, captures screenshots and cleans up).
 
 ## Conventions
 
@@ -138,10 +180,10 @@ Do not add `nodeIntegration`; the renderer must stay sandboxed behind preload.
 ## Screenshot harness
 
 `npm run shots` builds the app and launches the main process with
-`--eaglet-shots`. `scheduleShots()` in `src/main/index.ts` then walks the six
-themes, calls `window.__eagletSetTheme(id)` inside the renderer and writes
-`screenshots/theme-*.png`. It also captures the connected state
-(`connected.png`), every page (`page-*.png`) and compact mode (`mini.png`).
-Use it to verify visual changes without a human looking at the screen. The
+`--eaglet-shots`. `scheduleShots()` in `src/main/index.ts` seeds demo profiles
+(source `__shots__`), walks the six themes, calls
+`window.__eagletSetTheme(id)` / `window.__eagletSetPage(id)` inside the
+renderer, connects to the direct profile and writes `screenshots/*.png`.
+Seeded profiles are deleted and the tunnel is shut down before exit. The
 window is shown during capture (`showInactive`) and `backgroundThrottling` is
 off, otherwise Chromium may return stale frames.

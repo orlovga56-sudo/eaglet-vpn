@@ -1,11 +1,18 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { EagletApi, Settings, Snapshot } from '@shared/types'
+import type { CoreState, EagletApi, ImportResult, Profile, Settings, Snapshot } from '@shared/types'
 
 const api: EagletApi = {
   snapshot: () => ipcRenderer.invoke('app:snapshot'),
-  connect: (serverId?: string) => ipcRenderer.invoke('vpn:connect', serverId),
+  connect: (profileId?: string) => ipcRenderer.invoke('vpn:connect', profileId),
   disconnect: () => ipcRenderer.invoke('vpn:disconnect'),
-  selectServer: (serverId: string) => ipcRenderer.invoke('vpn:select-server', serverId),
+  selectProfile: (profileId: string) => ipcRenderer.invoke('vpn:select-profile', profileId),
+  importProfiles: (text: string): Promise<ImportResult> => ipcRenderer.invoke('profiles:import', text),
+  updateSubscription: (id: string): Promise<ImportResult> => ipcRenderer.invoke('subscriptions:update', id),
+  removeSubscription: (id: string) => ipcRenderer.invoke('subscriptions:remove', id),
+  removeProfile: (id: string) => ipcRenderer.invoke('profiles:remove', id),
+  testProfiles: (ids?: string[]): Promise<Profile[]> => ipcRenderer.invoke('profiles:test', ids),
+  checkIp: () => ipcRenderer.invoke('ip:check'),
+  refreshCore: (): Promise<CoreState> => ipcRenderer.invoke('core:refresh'),
   updateSettings: (patch: Partial<Settings>) => ipcRenderer.invoke('settings:update', patch),
   setMini: (mini: boolean) => ipcRenderer.invoke('window:set-mini', mini),
   windowMinimize: () => ipcRenderer.send('window:minimize'),

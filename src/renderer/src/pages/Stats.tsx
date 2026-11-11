@@ -5,9 +5,6 @@ interface Props {
   snap: Snapshot
 }
 
-const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-const WEEK = [62, 78, 54, 88, 70, 92, 66]
-
 function SpeedChart({ history }: { history: HistoryPoint[] }): React.JSX.Element {
   const W = 620
   const H = 150
@@ -53,12 +50,20 @@ function SpeedChart({ history }: { history: HistoryPoint[] }): React.JSX.Element
   )
 }
 
+function Fact({ label, value }: { label: string; value: string }): React.JSX.Element {
+  return (
+    <div className="fact">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  )
+}
+
 export function Stats({ snap }: Props): React.JSX.Element {
-  const { state } = snap
-  const { metrics, history } = state
+  const { state, settings, subscriptions } = snap
+  const { metrics, history, ip } = state
   const live = state.status === 'connected'
-  const pingAvg = average(history.map((point) => point.ping))
-  const total = metrics.downTotal + metrics.upTotal
+  const pingAvg = average(history.map((point) => point.ping).filter((value) => value > 0))
 
   return (
     <div className="page">
@@ -66,15 +71,18 @@ export function Stats({ snap }: Props): React.JSX.Element {
         <div>
           <p className="page-eyebrow">Telemetry</p>
           <h1 className="page-title">Stats</h1>
-          <p className="page-sub">Live tunnel telemetry for the current session. History resets on every reconnect.</p>
+          <p className="page-sub">
+            Numbers come straight from the sing-box Clash API — no simulation. History resets on every reconnect.
+          </p>
         </div>
+        <span className={`status-pill ${live ? 'ok' : ''}`}>{live ? 'Live session' : 'Offline'}</span>
       </header>
 
       <div className="tile-grid">
         <div className="tile panel">
           <div className="tile-label">Session</div>
           <div className="tile-value">{formatDuration(metrics.sessionSeconds)}</div>
-          <div className="tile-foot">{live ? `On ${state.server.code} · ${snap.settings.protocol}` : 'Not connected'}</div>
+          <div className="tile-foot">{live ? `${metrics.connections} active connections` : 'Not connected'}</div>
         </div>
         <div className="tile panel">
           <div className="tile-label">Downloaded</div>
@@ -87,12 +95,14 @@ export function Stats({ snap }: Props): React.JSX.Element {
           <div className="tile-foot">Session total</div>
         </div>
         <div className="tile panel">
-          <div className="tile-label">Average ping</div>
+          <div className="tile-label">Latency</div>
           <div className="tile-value">
-            {live ? Math.round(pingAvg) : '—'}
+            {live ? Math.round(metrics.ping) : '—'}
             <span className="unit">ms</span>
           </div>
-          <div className="tile-foot">Across last {history.length || 0} samples</div>
+          <div className="tile-foot">
+            {live ? `${Math.round(pingAvg)} ms average · ${history.length} samples` : 'Waiting for a tunnel'}
+          </div>
         </div>
       </div>
 
@@ -113,32 +123,21 @@ export function Stats({ snap }: Props): React.JSX.Element {
         <SpeedChart history={history} />
       </div>
 
-      <div className="chart-card panel">
-        <div className="chart-head">
-          <div className="tile-label" style={{ margin: 0 }}>
-            Traffic · last 7 days
-          </div>
-          <div className="chart-legend">
-            <span className="down">
-              <i />
-              {formatBytes(total * 7 + 4_400_000_000)}
-            </span>
-          </div>
-        </div>
-        <div className="bars">
-          {WEEK.map((value, index) => (
-            <div key={DAYS[index]} style={{ height: `${value}%` }} />
-          ))}
-        </div>
-        <div className="bar-labels">
-          {DAYS.map((day) => (
-            <span key={day}>{day}</span>
-          ))}
-        </div>
+      <div className="section-title">Tunnel facts</div>
+      <div className="facts panel">
+        <Fact label="Profile" value={state.profile?.name ?? 'None selected'} />
+        <Fact label="Protocol" value={state.profile?.protocol.toUpperCase() ?? '—'} />
+        <Fact label="Exit IP" value={ip.exit?.ip ?? '—'} />
+        <Fact label="Exit location" value={[ip.exit?.city, ip.exit?.country].filter(Boolean).join(', ') || '—'} />
+        <Fact label="Core" value={state.core.version ? `sing-box ${state.core.version}` : 'Not installed'} />
+        <Fact label="Routing" value={settings.routingMode.toUpperCase()} />
+        <Fact label="System proxy" value={settings.systemProxy ? 'On' : 'Off'} />
+        <Fact label="Subscriptions" value={subscriptions.length ? String(subscriptions.length) : '—'} />
       </div>
 
       <div className="section-title">Event log</div>
       <div className="log-panel panel">
+        {state.logs.length === 0 && <div className="empty-hint">Nothing logged yet.</div>}
         {state.logs.map((entry) => (
           <div className="log-row" key={entry.id}>
             <span className="log-time">{formatClock(entry.time)}</span>

@@ -12,8 +12,9 @@ interface Props {
 }
 
 export function MiniView({ snap, onToggle, onManageServers, onExpand }: Props): React.JSX.Element {
-  const { state, settings } = snap
+  const { state } = snap
   const connected = state.status === 'connected'
+  const profile = state.profile
   const label =
     state.status === 'connected'
       ? 'Connected'
@@ -21,7 +22,11 @@ export function MiniView({ snap, onToggle, onManageServers, onExpand }: Props): 
         ? 'Connecting'
         : state.status === 'disconnecting'
           ? 'Closing'
-          : 'Disconnected'
+          : state.status === 'error'
+            ? 'Error'
+            : 'Disconnected'
+
+  const place = [state.ip.exit?.city, state.ip.exit?.country].filter(Boolean).join(', ')
 
   return (
     <div className="mini">
@@ -33,16 +38,16 @@ export function MiniView({ snap, onToggle, onManageServers, onExpand }: Props): 
           {label}
         </div>
         <div className="status-location">
-          {connected ? (
+          {profile ? (
             <>
-              <strong>{state.server.city}</strong> · {state.server.country}
+              <strong>{profile.name}</strong>
             </>
           ) : (
-            'No active tunnel'
+            'No profile selected'
           )}
         </div>
         <div className="status-meta">
-          {connected ? formatDuration(state.metrics.sessionSeconds) : settings.protocol}
+          {connected ? formatDuration(state.metrics.sessionSeconds) : (profile?.protocol.toUpperCase() ?? 'No tunnel')}
         </div>
       </div>
 
@@ -70,11 +75,22 @@ export function MiniView({ snap, onToggle, onManageServers, onExpand }: Props): 
         />
       </div>
 
+      <div className={`mini-ip panel ${state.ip.changed ? 'is-changed' : ''}`}>
+        <div>
+          <span>Exit IP</span>
+          <strong>{state.ip.exit?.ip ?? '—'}</strong>
+        </div>
+        <span className={`ip-badge ${state.ip.changed ? 'ok' : 'idle'}`}>
+          {state.ip.changed ? 'Changed' : connected ? 'Live' : 'Standby'}
+        </span>
+        <div className="mini-ip-place">{place || 'No probe yet'}</div>
+      </div>
+
       <button className="mini-server panel" onClick={onManageServers}>
-        <span className="server-code">{state.server.code}</span>
+        <span className="server-code">{state.ip.exit?.countryCode ?? profile?.protocol.slice(0, 2).toUpperCase() ?? '··'}</span>
         <span className="mini-server-info">
-          <strong>{state.server.city}</strong>
-          <span>{state.server.country}</span>
+          <strong>{profile?.name ?? 'No profile'}</strong>
+          <span>{profile ? `${state.metrics.connections} connections` : 'Import a subscription'}</span>
         </span>
         <span style={{ color: 'var(--dim)' }}>›</span>
       </button>

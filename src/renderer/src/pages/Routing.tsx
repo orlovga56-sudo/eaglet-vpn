@@ -1,45 +1,37 @@
-import { useState } from 'react'
-import type { DnsMode, RoutingMode, Settings } from '@shared/types'
-import { CheckIcon, GlobeIcon, RouteIcon, SparkIcon, WifiIcon, LockIcon } from '../components/Icons'
+import type { DnsMode, RoutingMode, Snapshot } from '@shared/types'
+import { CheckIcon, GlobeIcon, LockIcon, RouteIcon, SparkIcon, WifiIcon } from '../components/Icons'
 import { Toggle } from '../components/Toggle'
 
 interface Props {
-  settings: Settings
-  onUpdate: (patch: Partial<Settings>) => void
+  snap: Snapshot
+  onUpdate: (patch: Partial<Snapshot['settings']>) => void
 }
 
 const MODES: Array<{ id: RoutingMode; title: string; text: string; icon: React.JSX.Element }> = [
   {
     id: 'global',
     title: 'Global',
-    text: 'Every packet goes through the encrypted tunnel. Maximum privacy, simplest setup.',
+    text: 'Every packet, including the local network, leaves through the encrypted tunnel. Maximum privacy.',
     icon: <GlobeIcon />
   },
   {
     id: 'smart',
     title: 'Smart',
-    text: 'Local traffic stays direct, everything else is tunnelled automatically.',
+    text: 'Private addresses and local domains stay direct; everything else is tunnelled. The everyday default.',
     icon: <SparkIcon />
   },
   {
-    id: 'split',
-    title: 'Split',
-    text: 'Choose exactly which apps use the VPN and which use your normal connection.',
+    id: 'direct',
+    title: 'Direct',
+    text: 'The core still runs, but traffic bypasses the proxy. Useful for debugging and split setups.',
     icon: <RouteIcon />
   }
 ]
 
-const APPS = ['Chrome', 'Spotify', 'Telegram', 'Steam', 'Slack', 'Zoom']
-
-export function Routing({ settings, onUpdate }: Props): React.JSX.Element {
-  const [apps, setApps] = useState<Record<string, boolean>>({
-    Chrome: true,
-    Spotify: true,
-    Telegram: true,
-    Steam: false,
-    Slack: false,
-    Zoom: true
-  })
+export function Routing({ snap, onUpdate }: Props): React.JSX.Element {
+  const { settings, state } = snap
+  const connected = state.status === 'connected'
+  const tun = settings.tunMode
 
   return (
     <div className="page">
@@ -48,7 +40,7 @@ export function Routing({ settings, onUpdate }: Props): React.JSX.Element {
           <p className="page-eyebrow">Tunnel</p>
           <h1 className="page-title">Routing</h1>
           <p className="page-sub">
-            Decide what travels through the tunnel. Smart mode is a good default for everyday browsing.
+            Decide what travels through the core. Routing changes apply on the next connection.
           </p>
         </div>
       </header>
@@ -70,25 +62,61 @@ export function Routing({ settings, onUpdate }: Props): React.JSX.Element {
         ))}
       </div>
 
-      <div className="section-title">Split tunneling · applications</div>
+      <div className="section-title">How traffic is captured</div>
       <div className="rows panel">
-        {APPS.map((app) => (
-          <div className="row" key={app}>
-            <span className="row-icon">
-              <WifiIcon />
+        <div className="row">
+          <span className="row-icon">
+            <WifiIcon />
+          </span>
+          <span className="row-main">
+            <strong>Windows system proxy</strong>
+            <span>
+              Routes browsers and desktop apps that honour WinINet through 127.0.0.1. Applies instantly — no reconnect.
             </span>
-            <span className="row-main">
-              <strong>{app}</strong>
-              <span>{apps[app] ? 'Routes through Eaglet' : 'Uses your direct connection'}</span>
+          </span>
+          <Toggle
+            checked={settings.systemProxy}
+            label="System proxy"
+            onChange={(value) => onUpdate({ systemProxy: value })}
+          />
+        </div>
+        <div className="row">
+          <span className="row-icon">
+            <RouteIcon />
+          </span>
+          <span className="row-main">
+            <strong>TUN mode</strong>
+            <span>
+              Creates a virtual adapter and captures every process, including games and terminals. Needs an
+              administrator session and a reconnect.
             </span>
-            <Toggle
-              checked={Boolean(apps[app])}
-              label={`${app} tunneling`}
-              onChange={(value) => setApps((prev) => ({ ...prev, [app]: value }))}
-            />
-          </div>
-        ))}
+          </span>
+          <Toggle checked={settings.tunMode} label="TUN mode" onChange={(value) => onUpdate({ tunMode: value })} />
+        </div>
+        <div className="row">
+          <span className="row-icon">
+            <LockIcon />
+          </span>
+          <span className="row-main">
+            <strong>Kill switch</strong>
+            <span>
+              Restores the tunnel-only policy after a drop. Pair it with TUN mode for full coverage.
+            </span>
+          </span>
+          <Toggle
+            checked={settings.killSwitch}
+            label="Kill switch"
+            onChange={(value) => onUpdate({ killSwitch: value })}
+          />
+        </div>
       </div>
+
+      {tun && !connected && (
+        <div className="callout">
+          TUN mode is enabled. The next connect will ask the core to create the adapter; make sure Eaglet runs as
+          administrator.
+        </div>
+      )}
 
       <div className="section-title">DNS</div>
       <div className="rows panel">
@@ -98,13 +126,10 @@ export function Routing({ settings, onUpdate }: Props): React.JSX.Element {
           </span>
           <span className="row-main">
             <strong>DNS resolver</strong>
-            <span>Queries are resolved inside the tunnel and never logged.</span>
+            <span>Queries are sent through the tunnel when a resolver is pinned. Automatic uses the core defaults.</span>
           </span>
-          <select
-            value={settings.dns}
-            onChange={(event) => onUpdate({ dns: event.target.value as DnsMode })}
-          >
-            <option value="auto">Automatic (Eaglet)</option>
+          <select value={settings.dns} onChange={(event) => onUpdate({ dns: event.target.value as DnsMode })}>
+            <option value="auto">Automatic (core)</option>
             <option value="cloudflare">Cloudflare · 1.1.1.1</option>
             <option value="google">Google · 8.8.8.8</option>
             <option value="custom">Custom…</option>
@@ -117,28 +142,28 @@ export function Routing({ settings, onUpdate }: Props): React.JSX.Element {
             </span>
             <span className="row-main">
               <strong>Custom resolver</strong>
-              <span>Enter an IPv4 address of your DNS server.</span>
+              <span>Enter a DoH endpoint such as https://dns.example.com/dns-query.</span>
             </span>
             <input
               value={settings.customDns}
-              placeholder="10.0.0.53"
+              placeholder="https://…/dns-query"
               onChange={(event) => onUpdate({ customDns: event.target.value })}
             />
           </div>
         )}
         <div className="row">
           <span className="row-icon">
-            <LockIcon />
+            <WifiIcon />
           </span>
           <span className="row-main">
-            <strong>Kill switch</strong>
-            <span>Blocks all traffic if the tunnel drops unexpectedly.</span>
+            <strong>Active exit</strong>
+            <span>
+              {connected
+                ? `${state.ip.exit?.ip ?? 'pending'} · ${state.ip.exit?.country ?? 'tunnel'}`
+                : 'Not connected'}
+            </span>
           </span>
-          <Toggle
-            checked={settings.killSwitch}
-            label="Kill switch"
-            onChange={(value) => onUpdate({ killSwitch: value })}
-          />
+          <span className={`status-pill ${connected ? 'ok' : ''}`}>{connected ? 'Live' : 'Idle'}</span>
         </div>
       </div>
     </div>

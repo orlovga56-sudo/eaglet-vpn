@@ -2,7 +2,7 @@ import type { Snapshot } from '@shared/types'
 import { PowerDial } from '../components/PowerDial'
 import { Sparkline } from '../components/Sparkline'
 import { WorldMap } from '../components/WorldMap'
-import { ArrowDownIcon, ArrowUpIcon, SignalIcon } from '../components/Icons'
+import { ArrowDownIcon, ArrowUpIcon, ShieldIcon, SignalIcon } from '../components/Icons'
 import { formatDuration, formatSpeed } from '../format'
 
 interface Props {
@@ -11,9 +11,14 @@ interface Props {
   onManageServers: () => void
 }
 
+function place(info: { city: string; country: string } | null): string {
+  if (!info) return ''
+  return [info.city, info.country].filter(Boolean).join(', ')
+}
+
 export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Element {
-  const { state, settings } = snap
-  const { status, server, metrics, history } = state
+  const { state } = snap
+  const { status, profile, metrics, history, ip } = state
   const connected = status === 'connected'
   const busy = status === 'connecting' || status === 'disconnecting'
 
@@ -28,22 +33,31 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
             ? 'Error'
             : 'Disconnected'
 
-  const location = connected || status === 'connecting' ? (
+  const location = profile ? (
     <>
-      <strong>{server.city}</strong> · {server.country}
+      <strong>{profile.name}</strong> · {profile.protocol.toUpperCase()}
     </>
   ) : (
-    <>No active tunnel</>
+    <>No profile selected</>
   )
 
   const meta = connected
-    ? `Session ${formatDuration(metrics.sessionSeconds)} · ${settings.protocol}`
+    ? `Session ${formatDuration(metrics.sessionSeconds)} · ${ip.exit?.countryCode ?? 'tunnel active'}`
     : busy
       ? (state.stage ?? 'Working…')
-      : 'Tap the dial to connect'
+      : profile
+        ? 'Tap the dial to connect'
+        : 'Import a subscription to begin'
 
-  const downSeries = history.map((point) => point.down)
-  const upSeries = history.map((point) => point.up)
+  const verdict = ip.checking
+    ? { text: 'Checking', tone: 'wait' }
+    : ip.changed
+      ? { text: 'IP changed', tone: 'ok' }
+      : connected && ip.exit
+        ? { text: 'Unchanged', tone: 'idle' }
+        : ip.exit
+          ? { text: 'Last known', tone: 'idle' }
+          : { text: 'Standby', tone: 'idle' }
 
   return (
     <div className="home">
@@ -65,6 +79,52 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
         </div>
       </section>
 
+      <section className="ip-row">
+        <div className="ip-card panel">
+          <div className="ip-head">
+            <span className="ip-dot" />
+            Direct address
+            <span className="ip-tag">before tunnel</span>
+          </div>
+          <div className={`ip-value ${ip.direct ? '' : 'is-empty'}`}>{ip.direct?.ip ?? '—'}</div>
+          <div className="ip-meta">
+            {ip.direct ? place(ip.direct) || 'Direct connection' : 'Waiting for the first probe'}
+          </div>
+        </div>
+
+        <div className={`ip-card panel ${ip.changed ? 'is-changed' : ''}`}>
+          <div className="ip-head">
+            <span className="ip-dot exit" />
+            Tunnel exit
+            <span className={`ip-badge ${verdict.tone}`}>{verdict.text}</span>
+            <button
+              className="ip-refresh"
+              onClick={() => void window.eaglet.checkIp()}
+              disabled={ip.checking}
+              title="Re-probe both addresses"
+            >
+              {ip.checking ? 'Probing…' : 'Re-check'}
+            </button>
+          </div>
+          <div className={`ip-value ${ip.exit ? '' : 'is-empty'}`}>{ip.exit?.ip ?? '—'}</div>
+          <div className="ip-meta">
+            {ip.exit ? place(ip.exit) || ip.exit.countryCode : connected ? 'Probing the tunnel…' : 'Connect to measure the exit'}
+          </div>
+        </div>
+      </section>
+
+      {ip.changed && (
+        <div className="ip-note panel">
+          <span className="ip-note-icon">
+            <ShieldIcon />
+          </span>
+          <span>
+            Your public address changed from <strong>{ip.direct?.ip}</strong> to <strong>{ip.exit?.ip}</strong>.
+            Traffic is leaving through {place(ip.exit) || ip.exit?.countryCode}.
+          </span>
+        </div>
+      )}
+
       <section className="stats-row">
         <div className="stat panel">
           <div className="stat-icon">
@@ -78,12 +138,7 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
             </div>
           </div>
           {connected && (
-            <Sparkline
-              className="stat-spark"
-              values={history.map((point) => point.ping)}
-              width={56}
-              height={24}
-            />
+            <Sparkline className="stat-spark" values={history.map((point) => point.ping)} width={56} height={24} />
           )}
         </div>
 
@@ -98,7 +153,7 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
               <span className="unit">Mbps</span>
             </div>
           </div>
-          {connected && <Sparkline className="stat-spark" values={downSeries} width={56} height={24} />}
+          {connected && <Sparkline className="stat-spark" values={history.map((p) => p.down)} width={56} height={24} />}
         </div>
 
         <div className="stat panel">
@@ -112,11 +167,11 @@ export function Home({ snap, onToggle, onManageServers }: Props): React.JSX.Elem
               <span className="unit">Mbps</span>
             </div>
           </div>
-          {connected && <Sparkline className="stat-spark" values={upSeries} width={56} height={24} />}
+          {connected && <Sparkline className="stat-spark" values={history.map((p) => p.up)} width={56} height={24} />}
         </div>
       </section>
 
-      <WorldMap server={server} status={status} onManage={onManageServers} />
+      <WorldMap direct={ip.direct} exit={ip.exit} status={status} onManage={onManageServers} />
     </div>
   )
 }

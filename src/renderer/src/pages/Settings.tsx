@@ -1,10 +1,10 @@
-import type { Protocol, Settings, ThemeId } from '@shared/types'
-import { CheckIcon, LogoIcon, PowerIcon } from '../components/Icons'
+import { useState } from 'react'
+import type { DnsMode, Settings, Snapshot, ThemeId } from '@shared/types'
+import { CheckIcon, GlobeIcon, LogoIcon, PowerIcon, ServerIcon } from '../components/Icons'
 import { Toggle } from '../components/Toggle'
 
 interface Props {
-  settings: Settings
-  version: string
+  snap: Snapshot
   onUpdate: (patch: Partial<Settings>) => void
 }
 
@@ -73,13 +73,19 @@ const THEMES: ThemeMeta[] = [
   }
 ]
 
-const PROTOCOLS: Array<{ id: Protocol; label: string }> = [
-  { id: 'wireguard', label: 'WireGuard' },
-  { id: 'openvpn', label: 'OpenVPN' },
-  { id: 'ikev2', label: 'IKEv2' }
-]
+export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
+  const { settings, state, version } = snap
+  const [refreshing, setRefreshing] = useState(false)
 
-export function SettingsPage({ settings, version, onUpdate }: Props): React.JSX.Element {
+  const refreshCore = async (): Promise<void> => {
+    setRefreshing(true)
+    try {
+      await window.eaglet.refreshCore()
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   return (
     <div className="page">
       <header className="page-head">
@@ -124,21 +130,36 @@ export function SettingsPage({ settings, version, onUpdate }: Props): React.JSX.
         <div className="rows panel">
           <div className="row">
             <span className="row-main">
-              <strong>Protocol</strong>
-              <span>Tunnel implementation used for new sessions.</span>
+              <strong>System proxy</strong>
+              <span>Point WinINet apps at the local mixed inbound while the tunnel is up.</span>
             </span>
-            <div className="segmented">
-              {PROTOCOLS.map((protocol) => (
-                <button
-                  key={protocol.id}
-                  className={settings.protocol === protocol.id ? 'active' : ''}
-                  onClick={() => onUpdate({ protocol: protocol.id })}
-                >
-                  {protocol.label}
-                </button>
-              ))}
-            </div>
+            <Toggle
+              checked={settings.systemProxy}
+              label="System proxy"
+              onChange={(value) => onUpdate({ systemProxy: value })}
+            />
           </div>
+          <div className="row">
+            <span className="row-main">
+              <strong>TUN mode</strong>
+              <span>Capture every process through a virtual adapter. Needs admin and a reconnect.</span>
+            </span>
+            <Toggle checked={settings.tunMode} label="TUN mode" onChange={(value) => onUpdate({ tunMode: value })} />
+          </div>
+          <div className="row">
+            <span className="row-main">
+              <strong>Kill switch</strong>
+              <span>Keep the tunnel-only policy after an unexpected drop.</span>
+            </span>
+            <Toggle
+              checked={settings.killSwitch}
+              label="Kill switch"
+              onChange={(value) => onUpdate({ killSwitch: value })}
+            />
+          </div>
+        </div>
+
+        <div className="rows panel">
           <div className="row">
             <span className="row-main">
               <strong>Auto-connect on launch</strong>
@@ -161,42 +182,77 @@ export function SettingsPage({ settings, version, onUpdate }: Props): React.JSX.
               onChange={(value) => onUpdate({ launchAtStartup: value })}
             />
           </div>
-        </div>
-
-        <div className="rows panel">
-          <div className="row">
-            <span className="row-main">
-              <strong>Kill switch</strong>
-              <span>Cut all traffic whenever the tunnel drops.</span>
-            </span>
-            <Toggle
-              checked={settings.killSwitch}
-              label="Kill switch"
-              onChange={(value) => onUpdate({ killSwitch: value })}
-            />
-          </div>
-          <div className="row">
-            <span className="row-main">
-              <strong>Notifications</strong>
-              <span>Toast when the connection state changes.</span>
-            </span>
-            <Toggle
-              checked={settings.notifications}
-              label="Notifications"
-              onChange={(value) => onUpdate({ notifications: value })}
-            />
-          </div>
           <div className="row">
             <span className="row-main">
               <strong>Compact mode</strong>
-              <span>Shrink Eaglet to a always-on-top mini window.</span>
+              <span>Shrink Eaglet to an always-on-top mini window.</span>
             </span>
-            <Toggle
-              checked={settings.mini}
-              label="Compact mode"
-              onChange={(value) => onUpdate({ mini: value })}
+            <Toggle checked={settings.mini} label="Compact mode" onChange={(value) => onUpdate({ mini: value })} />
+          </div>
+        </div>
+      </div>
+
+      <div className="section-title">DNS</div>
+      <div className="rows panel">
+        <div className="row">
+          <span className="row-icon">
+            <GlobeIcon />
+          </span>
+          <span className="row-main">
+            <strong>Resolver</strong>
+            <span>Pinned resolvers are queried inside the tunnel.</span>
+          </span>
+          <select value={settings.dns} onChange={(event) => onUpdate({ dns: event.target.value as DnsMode })}>
+            <option value="auto">Automatic (core)</option>
+            <option value="cloudflare">Cloudflare · 1.1.1.1</option>
+            <option value="google">Google · 8.8.8.8</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </div>
+        {settings.dns === 'custom' && (
+          <div className="row">
+            <span className="row-icon">
+              <GlobeIcon />
+            </span>
+            <span className="row-main">
+              <strong>Custom resolver</strong>
+              <span>DoH endpoint used for tunnelled queries.</span>
+            </span>
+            <input
+              value={settings.customDns}
+              placeholder="https://…/dns-query"
+              onChange={(event) => onUpdate({ customDns: event.target.value })}
             />
           </div>
+        )}
+      </div>
+
+      <div className="section-title">Core</div>
+      <div className="rows panel">
+        <div className="row">
+          <span className="row-icon">
+            <ServerIcon />
+          </span>
+          <span className="row-main">
+            <strong>sing-box {state.core.version ?? '—'}</strong>
+            <span className="mono-path">{state.core.path ?? 'Core binary not found'}</span>
+          </span>
+          <span className={`status-pill ${state.core.available ? 'ok' : 'warn'}`}>
+            {state.core.running ? 'Running' : state.core.available ? 'Ready' : 'Missing'}
+          </span>
+          <button className="btn small" onClick={() => void refreshCore()} disabled={refreshing}>
+            {refreshing ? 'Checking…' : 'Re-detect'}
+          </button>
+        </div>
+        <div className="row">
+          <span className="row-main">
+            <strong>Automatic core install</strong>
+            <span>
+              When the binary is missing, Eaglet downloads the latest sing-box release into its user data folder on
+              the next connect.
+            </span>
+          </span>
+          <span className="status-pill">{state.core.available ? 'Bundled' : 'On demand'}</span>
         </div>
       </div>
 
@@ -208,8 +264,8 @@ export function SettingsPage({ settings, version, onUpdate }: Props): React.JSX.
         <div>
           <strong>Eaglet {version}</strong>
           <p>
-            A fast, private desktop VPN client. Interface system with six swappable themes, live telemetry and a
-            WireGuard-ready engine.
+            A private desktop VPN client on the sing-box core. Six interchangeable themes, live Clash telemetry,
+            real exit-IP verification and subscription import in one window.
           </p>
         </div>
       </div>

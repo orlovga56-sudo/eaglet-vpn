@@ -11,3 +11,7 @@ screenshots/tmp/
 
 *.tsbuildinfo
 /electron.exe
+
+resources/bin/*
+!resources/bin/.gitkeep
+
