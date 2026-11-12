@@ -1,4 +1,4 @@
-import { ChartIcon, GearIcon, GlobeIcon, HomeIcon, LogoIcon, RouteIcon } from './Icons'
+import { ChartIcon, GearIcon, GlobeIcon, HomeIcon, LogoIcon, RouteIcon, SparkIcon } from './Icons'
 import type { PageId } from '../App'
 
 interface Props {
@@ -6,14 +6,17 @@ interface Props {
   onNavigate: (page: PageId) => void
   profileCount: number
   subscriptions: number
-  coreVersion: string | null
+  engineName: string
+  engineVersion: string | null
   systemProxy: boolean
+  protection: boolean
   version: string
 }
 
 const ITEMS: Array<{ id: PageId; label: string; icon: React.JSX.Element }> = [
   { id: 'home', label: 'Home', icon: <HomeIcon /> },
   { id: 'servers', label: 'Servers', icon: <GlobeIcon /> },
+  { id: 'scenarios', label: 'Scenarios', icon: <SparkIcon /> },
   { id: 'routing', label: 'Routing', icon: <RouteIcon /> },
   { id: 'stats', label: 'Stats', icon: <ChartIcon /> },
   { id: 'settings', label: 'Settings', icon: <GearIcon /> }
@@ -24,8 +27,10 @@ export function Sidebar({
   onNavigate,
   profileCount,
   subscriptions,
-  coreVersion,
+  engineName,
+  engineVersion,
   systemProxy,
+  protection,
   version
 }: Props): React.JSX.Element {
   return (
@@ -56,12 +61,12 @@ export function Sidebar({
 
       <div className="side-foot">
         <div className="side-chip">
-          <span>Core</span>
-          <strong>{coreVersion ? `sing-box ${coreVersion}` : 'not found'}</strong>
+          <span>Engine</span>
+          <strong>{engineVersion ? `${engineName} ${engineVersion}` : `${engineName} · not installed`}</strong>
         </div>
         <div className="side-chip">
-          <span>Routing</span>
-          <strong>{systemProxy ? 'system proxy' : 'manual'}</strong>
+          <span>Protection</span>
+          <strong>{protection ? 'armed' : systemProxy ? 'system proxy' : 'manual'}</strong>
         </div>
         <div className="side-version">
           EAGLET v{version} · {subscriptions} SUB{subscriptions === 1 ? '' : 'S'}

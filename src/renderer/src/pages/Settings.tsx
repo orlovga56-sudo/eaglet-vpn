@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import type { DnsMode, Settings, Snapshot, ThemeId } from '@shared/types'
-import { CheckIcon, GlobeIcon, LogoIcon, PowerIcon, ServerIcon } from '../components/Icons'
+import type { DnsMode, EngineChoice, EngineId, Settings, Snapshot, ThemeId } from '@shared/types'
+import { CheckIcon, GlobeIcon, LogoIcon, PowerIcon, ServerIcon, ShieldIcon } from '../components/Icons'
 import { Toggle } from '../components/Toggle'
 
 interface Props {
@@ -76,13 +76,62 @@ const THEMES: ThemeMeta[] = [
 export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
   const { settings, state, version } = snap
   const [refreshing, setRefreshing] = useState(false)
+  const [engineBusy, setEngineBusy] = useState<EngineId | 'check' | null>(null)
+  const [engineMessage, setEngineMessage] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
 
   const refreshCore = async (): Promise<void> => {
     setRefreshing(true)
     try {
-      await window.eaglet.refreshCore()
+      await window.eaglet.refreshEngines()
     } finally {
       setRefreshing(false)
+    }
+  }
+
+  const engineAction = async (id: EngineId): Promise<void> => {
+    setEngineBusy(id)
+    setEngineMessage(null)
+    try {
+      const engine = state.engines.find((item) => item.id === id)
+      if (engine?.installed) await window.eaglet.removeEngine(id)
+      else await window.eaglet.installEngine(id)
+      setEngineMessage({ tone: 'ok', text: engine?.installed ? 'Engine removed' : 'Engine installed' })
+    } catch (error) {
+      setEngineMessage({
+        tone: 'err',
+        text: (error as Error).message.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, '')
+      })
+    } finally {
+      setEngineBusy(null)
+    }
+  }
+
+  const checkUpdates = async (): Promise<void> => {
+    setEngineBusy('check')
+    setEngineMessage(null)
+    try {
+      const engines = await window.eaglet.checkEngineUpdates()
+      const updates = engines.filter((engine) => engine.updateAvailable)
+      setEngineMessage({
+        tone: 'ok',
+        text:
+          updates.length > 0
+            ? `Updates available: ${updates.map((engine) => `${engine.name} ${engine.latestVersion}`).join(', ')}`
+            : 'All installed engines are up to date'
+      })
+    } catch (error) {
+      setEngineMessage({ tone: 'err', text: (error as Error).message })
+    } finally {
+      setEngineBusy(null)
+    }
+  }
+
+  const setEngine = async (choice: EngineChoice): Promise<void> => {
+    try {
+      const updated = await window.eaglet.setEngine(choice)
+      onUpdate(updated)
+    } catch (error) {
+      setEngineMessage({ tone: 'err', text: (error as Error).message })
     }
   }
 
@@ -159,6 +208,35 @@ export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
           </div>
           <div className="row">
             <span className="row-main">
+              <strong>Network protection</strong>
+              <span>Master switch: arms the kill switch and the local DNS guard together.</span>
+            </span>
+            <Toggle
+              checked={settings.networkProtection}
+              label="Network protection"
+              onChange={(value) => onUpdate({ networkProtection: value })}
+            />
+          </div>
+          <div className="row">
+            <span className="row-main">
+              <strong>DNS protection</strong>
+              <span>Run a real DoH relay on 127.0.0.1 and point the system resolver at it.</span>
+            </span>
+            <Toggle
+              checked={settings.dnsProtection}
+              label="DNS protection"
+              onChange={(value) => onUpdate({ dnsProtection: value })}
+            />
+          </div>
+          <div className="row">
+            <span className="row-main">
+              <strong>IPv6</strong>
+              <span>Off rejects IPv6 inside the tunnel so leaks cannot bypass the core.</span>
+            </span>
+            <Toggle checked={settings.ipv6} label="IPv6" onChange={(value) => onUpdate({ ipv6: value })} />
+          </div>
+          <div className="row">
+            <span className="row-main">
               <strong>Auto-reconnect</strong>
               <span>If the core drops, retry up to three times with a growing delay.</span>
             </span>
@@ -211,6 +289,24 @@ export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
               onChange={(value) => onUpdate({ notifications: value })}
             />
           </div>
+          <div className="row">
+            <span className="row-main">
+              <strong>Keep in tray</strong>
+              <span>Keep Eaglet and the tunnel running from the system tray.</span>
+            </span>
+            <Toggle checked={settings.tray} label="System tray" onChange={(value) => onUpdate({ tray: value })} />
+          </div>
+          <div className="row">
+            <span className="row-main">
+              <strong>Close to tray</strong>
+              <span>The window hides instead of quitting when you press close.</span>
+            </span>
+            <Toggle
+              checked={settings.closeToTray}
+              label="Close to tray"
+              onChange={(value) => onUpdate({ closeToTray: value })}
+            />
+          </div>
         </div>
       </div>
 
@@ -249,32 +345,122 @@ export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
         )}
       </div>
 
-      <div className="section-title">Core</div>
-      <div className="rows panel">
+      <div className="section-title">Tunnel engines</div>
+      <div className="rows panel engine-choice">
         <div className="row">
           <span className="row-icon">
             <ServerIcon />
           </span>
           <span className="row-main">
-            <strong>sing-box {state.core.version ?? '—'}</strong>
-            <span className="mono-path">{state.core.path ?? 'Core binary not found'}</span>
+            <strong>Global engine</strong>
+            <span>
+              Auto prefers an installed core that supports the profile protocol and TUN when it is enabled. Profiles can
+              override this choice individually.
+            </span>
           </span>
-          <span className={`status-pill ${state.core.available ? 'ok' : 'warn'}`}>
-            {state.core.running ? 'Running' : state.core.available ? 'Ready' : 'Missing'}
+          <select value={settings.engine} onChange={(event) => void setEngine(event.target.value as EngineChoice)}>
+            <option value="auto">Auto · best installed</option>
+            <option value="sing-box">sing-box</option>
+            <option value="xray">Xray-core</option>
+            <option value="mihomo">Mihomo</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="engine-grid">
+        {state.engines.map((engine) => (
+          <div
+            className={`engine-card panel ${engine.id === state.engine ? 'is-active' : ''} ${
+              engine.installed ? '' : 'is-missing'
+            }`}
+            key={engine.id}
+          >
+            <div className="engine-card-head">
+              <span className="engine-icon">
+                <ServerIcon />
+              </span>
+              <div>
+                <strong>{engine.name}</strong>
+                <span>{engine.installed ? engine.version ? `v${engine.version}` : 'Installed' : 'Not installed'}</span>
+              </div>
+              <span className={`status-pill ${engine.installed ? 'ok' : 'warn'}`}>
+                {engine.running ? 'Running' : engine.installed ? 'Ready' : 'Missing'}
+              </span>
+            </div>
+            <div className="engine-tags">
+              <span>{engine.supportsTun ? 'TUN' : 'No TUN'}</span>
+              <span>{engine.telemetry ? 'Live counters' : 'Basic counters'}</span>
+              <span>{engine.protocols.length} protocols</span>
+              <span className={`platform-${engine.platformSupport}`}>{engine.platformSupport}</span>
+            </div>
+            <div className="engine-path mono-path">{engine.path ?? 'Eaglet downloads it on first use'}</div>
+            {engine.updateAvailable && (
+              <div className="engine-update">Update available · {engine.latestVersion}</div>
+            )}
+            <div className="engine-card-actions">
+              <button
+                className="btn small"
+                onClick={() => void engineAction(engine.id)}
+                disabled={engineBusy !== null || (engine.removable === false && engine.installed)}
+              >
+                {engineBusy === engine.id ? 'Working…' : engine.installed ? (engine.removable ? 'Remove' : 'Bundled') : 'Install'}
+              </button>
+              {engine.id === state.engine && <span className="engine-current">Active engine</span>}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="engine-toolbar">
+        <button className="btn small" onClick={() => void refreshCore()} disabled={refreshing}>
+          {refreshing ? 'Detecting…' : 'Re-detect engines'}
+        </button>
+        <button className="btn small" onClick={() => void checkUpdates()} disabled={engineBusy !== null}>
+          {engineBusy === 'check' ? 'Checking…' : 'Check updates'}
+        </button>
+        {engineMessage && <span className={`engine-message ${engineMessage.tone}`}>{engineMessage.text}</span>}
+      </div>
+
+      <div className="section-title">Subscriptions</div>
+      <div className="rows panel">
+        <div className="row">
+          <span className="row-main">
+            <strong>Automatic updates</strong>
+            <span>Refresh HTTP subscriptions in the background so nodes and keys stay current.</span>
           </span>
-          <button className="btn small" onClick={() => void refreshCore()} disabled={refreshing}>
-            {refreshing ? 'Checking…' : 'Re-detect'}
-          </button>
+          <Toggle
+            checked={settings.autoUpdateSubscriptions}
+            label="Automatic subscription updates"
+            onChange={(value) => onUpdate({ autoUpdateSubscriptions: value })}
+          />
         </div>
         <div className="row">
           <span className="row-main">
-            <strong>Automatic core install</strong>
-            <span>
-              When the binary is missing, Eaglet downloads the latest sing-box release into its user data folder on
-              the next connect.
-            </span>
+            <strong>Update interval</strong>
+            <span>How often a due subscription is refreshed.</span>
           </span>
-          <span className="status-pill">{state.core.available ? 'Bundled' : 'On demand'}</span>
+          <select
+            value={settings.subscriptionIntervalHours}
+            onChange={(event) => onUpdate({ subscriptionIntervalHours: Number(event.target.value) })}
+            disabled={!settings.autoUpdateSubscriptions}
+          >
+            <option value={1}>Every hour</option>
+            <option value={3}>Every 3 hours</option>
+            <option value={6}>Every 6 hours</option>
+            <option value={12}>Every 12 hours</option>
+            <option value={24}>Every 24 hours</option>
+          </select>
+        </div>
+        <div className="row">
+          <span className="row-icon">
+            <ShieldIcon />
+          </span>
+          <span className="row-main">
+            <strong>Refresh all now</strong>
+            <span>Force an update of every HTTP subscription, ignoring the interval.</span>
+          </span>
+          <button className="btn small" onClick={() => void window.eaglet.updateAllSubscriptions()}>
+            Update all
+          </button>
         </div>
       </div>
 
@@ -286,8 +472,8 @@ export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
         <div>
           <strong>Eaglet {version}</strong>
           <p>
-            A private desktop VPN client on the sing-box core. Six interchangeable themes, live Clash telemetry,
-            real exit-IP verification and subscription import in one window.
+            A private desktop VPN client with three tunnel cores — sing-box, Xray-core and Mihomo. Six interchangeable
+            themes, live core telemetry, real exit-IP verification and subscription import in one window.
           </p>
         </div>
       </div>

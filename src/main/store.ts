@@ -1,7 +1,17 @@
 import { app } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import type { Profile, SessionRecord, Settings, Subscription } from '@shared/types'
+import type {
+  EngineId,
+  EngineSwitchRecord,
+  GeoPoint,
+  Profile,
+  ProfileEvent,
+  Scenario,
+  SessionRecord,
+  Settings,
+  Subscription
+} from '@shared/types'
 
 const DEFAULT_SETTINGS: Settings = {
   theme: 'cyber',
@@ -17,16 +27,30 @@ const DEFAULT_SETTINGS: Settings = {
   autoReconnect: true,
   mini: false,
   launchAtStartup: false,
-  activeProfileId: null
+  activeProfileId: null,
+  engine: 'auto',
+  dnsProtection: false,
+  ipv6: true,
+  networkProtection: false,
+  autoUpdateSubscriptions: false,
+  subscriptionIntervalHours: 6,
+  tray: true,
+  closeToTray: true
 }
 
 const SESSION_LIMIT = 40
+const EVENT_LIMIT = 120
+const ENGINE_HISTORY_LIMIT = 60
+const QUALITY_LIMIT = 30
 
 interface StoreData {
   settings: Settings
   profiles: Profile[]
   subscriptions: Subscription[]
   sessions: SessionRecord[]
+  scenarios: Scenario[]
+  profileHistory: ProfileEvent[]
+  engineHistory: EngineSwitchRecord[]
 }
 
 /** JSON-backed configuration store — no native deps, easy to inspect. */
@@ -39,22 +63,49 @@ export class Store {
     this.data = this.load()
   }
 
+  private empty(): StoreData {
+    return {
+      settings: { ...DEFAULT_SETTINGS },
+      profiles: [],
+      subscriptions: [],
+      sessions: [],
+      scenarios: [],
+      profileHistory: [],
+      engineHistory: []
+    }
+  }
+
   private load(): StoreData {
     try {
-      if (!existsSync(this.file)) {
-        return { settings: { ...DEFAULT_SETTINGS }, profiles: [], subscriptions: [], sessions: [] }
-      }
+      if (!existsSync(this.file)) return this.empty()
       const raw = JSON.parse(readFileSync(this.file, 'utf-8')) as Partial<StoreData>
       return {
         settings: { ...DEFAULT_SETTINGS, ...(raw.settings ?? {}) },
         profiles: Array.isArray(raw.profiles)
-          ? raw.profiles.map((profile) => ({ ...profile, favorite: Boolean(profile.favorite) }))
+          ? raw.profiles.map((profile) => ({
+              ...profile,
+              favorite: Boolean(profile.favorite),
+              engine: profile.engine ?? null,
+              geo: profile.geo ?? null,
+              quality: Array.isArray(profile.quality) ? profile.quality.slice(-QUALITY_LIMIT) : []
+            }))
           : [],
         subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : [],
-        sessions: Array.isArray(raw.sessions) ? raw.sessions : []
+        sessions: Array.isArray(raw.sessions)
+          ? raw.sessions.map((session) => ({
+              ...session,
+              engine: session.engine ?? 'sing-box',
+              ping: session.ping ?? null,
+              jitter: session.jitter ?? null,
+              loss: session.loss ?? null
+            }))
+          : [],
+        scenarios: Array.isArray(raw.scenarios) ? raw.scenarios : [],
+        profileHistory: Array.isArray(raw.profileHistory) ? raw.profileHistory.slice(0, EVENT_LIMIT) : [],
+        engineHistory: Array.isArray(raw.engineHistory) ? raw.engineHistory.slice(0, ENGINE_HISTORY_LIMIT) : []
       }
     } catch {
-      return { settings: { ...DEFAULT_SETTINGS }, profiles: [], subscriptions: [], sessions: [] }
+      return this.empty()
     }
   }
 
@@ -92,11 +143,23 @@ export class Store {
       const index = this.data.profiles.findIndex((item) => item.id === profile.id)
       if (index >= 0) {
         const existing = this.data.profiles[index]
-        // Re-importing a subscription must not drop the user's star.
-        this.data.profiles[index] = { ...existing, ...profile, favorite: existing.favorite, ping: null }
+        // Re-importing a subscription must not drop the user's star or engine override.
+        this.data.profiles[index] = {
+          ...existing,
+          ...profile,
+          favorite: existing.favorite,
+          engine: existing.engine,
+          ping: null
+        }
         updated += 1
       } else {
-        this.data.profiles.push({ ...profile, favorite: Boolean(profile.favorite) })
+        this.data.profiles.push({
+          ...profile,
+          favorite: Boolean(profile.favorite),
+          engine: profile.engine ?? null,
+          geo: profile.geo ?? null,
+          quality: Array.isArray(profile.quality) ? profile.quality : []
+        })
         added += 1
       }
     }
@@ -110,6 +173,20 @@ export class Store {
     const profile = this.data.profiles.find((item) => item.id === id)
     if (!profile) return
     profile.favorite = favorite
+    this.save()
+  }
+
+  setProfileEngine(id: string, engine: EngineId | null): void {
+    const profile = this.data.profiles.find((item) => item.id === id)
+    if (!profile) return
+    profile.engine = engine
+    this.save()
+  }
+
+  setGeo(id: string, geo: GeoPoint): void {
+    const profile = this.data.profiles.find((item) => item.id === id)
+    if (!profile) return
+    profile.geo = geo
     this.save()
   }
 
@@ -134,6 +211,9 @@ export class Store {
     const profile = this.data.profiles.find((item) => item.id === id)
     if (!profile) return
     profile.ping = ping
+    if (ping !== null && ping >= 0) {
+      profile.quality = [...profile.quality, ping].slice(-QUALITY_LIMIT)
+    }
     this.save()
   }
 
@@ -166,6 +246,71 @@ export class Store {
 
   clearSessions(): void {
     this.data.sessions = []
+    this.save()
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Scenarios, history and backup                                     */
+  /* ------------------------------------------------------------------ */
+
+  getScenarios(): Scenario[] {
+    return [...this.data.scenarios]
+  }
+
+  saveScenario(scenario: Scenario): void {
+    const index = this.data.scenarios.findIndex((item) => item.id === scenario.id)
+    if (index >= 0) this.data.scenarios[index] = scenario
+    else this.data.scenarios.push(scenario)
+    this.save()
+  }
+
+  removeScenario(id: string): void {
+    this.data.scenarios = this.data.scenarios.filter((scenario) => scenario.id !== id)
+    this.save()
+  }
+
+  addProfileEvent(event: ProfileEvent): void {
+    this.data.profileHistory.unshift(event)
+    this.data.profileHistory = this.data.profileHistory.slice(0, EVENT_LIMIT)
+    this.save()
+  }
+
+  getProfileHistory(): ProfileEvent[] {
+    return [...this.data.profileHistory]
+  }
+
+  addEngineSwitch(record: EngineSwitchRecord): void {
+    this.data.engineHistory.unshift(record)
+    this.data.engineHistory = this.data.engineHistory.slice(0, ENGINE_HISTORY_LIMIT)
+    this.save()
+  }
+
+  getEngineHistory(): EngineSwitchRecord[] {
+    return [...this.data.engineHistory]
+  }
+
+  clearEngineHistory(): void {
+    this.data.engineHistory = []
+    this.save()
+  }
+
+  /** Used by Backup Manager import after validation. */
+  replaceAll(payload: {
+    settings: Settings
+    profiles: Profile[]
+    subscriptions: Subscription[]
+    scenarios: Scenario[]
+  }): void {
+    this.data.settings = { ...DEFAULT_SETTINGS, ...payload.settings }
+    this.data.profiles = payload.profiles.map((profile) => ({
+      ...profile,
+      favorite: Boolean(profile.favorite),
+      engine: profile.engine ?? null,
+      geo: profile.geo ?? null,
+      quality: Array.isArray(profile.quality) ? profile.quality.slice(-QUALITY_LIMIT) : []
+    }))
+    this.data.subscriptions = payload.subscriptions
+    this.data.scenarios = payload.scenarios
     this.save()
   }
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { DnsMode, RoutingMode, Snapshot } from '@shared/types'
-import { CheckIcon, GlobeIcon, LockIcon, RouteIcon, SparkIcon, WifiIcon } from '../components/Icons'
+import { CheckIcon, GlobeIcon, LockIcon, RouteIcon, ShieldIcon, SparkIcon, WifiIcon } from '../components/Icons'
 import { Toggle } from '../components/Toggle'
 
 interface Props {
@@ -112,9 +112,10 @@ export function Routing({ snap, onUpdate }: Props): React.JSX.Element {
             <WifiIcon />
           </span>
           <span className="row-main">
-            <strong>Windows system proxy</strong>
+            <strong>System proxy</strong>
             <span>
-              Routes browsers and desktop apps that honour WinINet through 127.0.0.1. Applies instantly — no reconnect.
+              Routes browsers and desktop apps that honour the OS proxy through 127.0.0.1. WinINet on Windows,
+              networksetup on macOS, GSettings on GNOME.
             </span>
           </span>
           <Toggle
@@ -151,6 +152,47 @@ export function Routing({ snap, onUpdate }: Props): React.JSX.Element {
             label="Kill switch"
             onChange={(value) => onUpdate({ killSwitch: value })}
           />
+        </div>
+        <div className="row">
+          <span className="row-icon">
+            <ShieldIcon />
+          </span>
+          <span className="row-main">
+            <strong>Network protection</strong>
+            <span>Arms the kill switch and the DNS guard together on every connection.</span>
+          </span>
+          <Toggle
+            checked={settings.networkProtection}
+            label="Network protection"
+            onChange={(value) => onUpdate({ networkProtection: value })}
+          />
+        </div>
+        <div className="row">
+          <span className="row-icon">
+            <GlobeIcon />
+          </span>
+          <span className="row-main">
+            <strong>DNS protection</strong>
+            <span>
+              Starts a real DNS-over-HTTPS relay on 127.0.0.1:53, backs up the system resolver and restores it on
+              disconnect.
+            </span>
+          </span>
+          <Toggle
+            checked={settings.dnsProtection}
+            label="DNS protection"
+            onChange={(value) => onUpdate({ dnsProtection: value })}
+          />
+        </div>
+        <div className="row">
+          <span className="row-icon">
+            <WifiIcon />
+          </span>
+          <span className="row-main">
+            <strong>IPv6</strong>
+            <span>Turn off to reject IPv6 inside the tunnel and prevent leaks around the core.</span>
+          </span>
+          <Toggle checked={settings.ipv6} label="IPv6" onChange={(value) => onUpdate({ ipv6: value })} />
         </div>
       </div>
 

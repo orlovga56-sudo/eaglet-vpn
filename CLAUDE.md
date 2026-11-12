@@ -5,16 +5,19 @@ Guidance for AI agents and humans working inside the **Eaglet** repository.
 ## What this project is
 
 Eaglet is a desktop **VPN client** for Windows/macOS/Linux built with
-**Electron + React + TypeScript + Vite**. Its defining feature is the interface
-system: **six swappable visual themes** taken from the original concept sheet
-(*Electric Cyber, Glassmorphism, Minimal Dark, HUD/Scifi, Neon Purple, Nature
-Aurora*). Every screen, animation and accent colour is driven by CSS custom
-properties, so a theme is purely a token set — no theme-specific component
-code.
+**Electron + React + TypeScript + Vite**. Its two defining features are:
 
-The tunnel is **real**: it runs the bundled [sing-box](https://sing-box.sagernet.org/)
-core, generates a config from the selected profile, applies the Windows system
-proxy and streams live telemetry through the core's Clash API.
+1. **Three real tunnel cores** — sing-box, Xray-core and Mihomo — selected per
+   profile, globally or automatically, each with its own native config adapter.
+2. **Six swappable visual themes** — *Electric Cyber, Glassmorphism, Minimal
+   Dark, HUD/Scifi, Neon Purple, Nature Aurora*. Every screen, animation and
+   accent colour is driven by CSS custom properties, so a theme is purely a
+   token set — no theme-specific component code.
+
+The tunnel is real: Eaglet generates a native config, validates it with the
+chosen core, spawns it, verifies the exit address through the local inbound,
+applies system routing and protection, and restores everything on disconnect or
+crash.
 
 ## Tech stack
 
@@ -24,7 +27,7 @@ proxy and streams live telemetry through the core's Clash API.
 | UI        | React 19 + TypeScript                        | Component model for the six themes             |
 | Build     | electron-vite (Vite 8)                       | HMR in dev, single `build` for main/preload/UI |
 | Styling   | Hand-written CSS with custom properties      | Max fidelity to the concept sheet, zero deps   |
-| Tunnel    | sing-box (child process + Clash API)         | All mainstream protocols, no native bindings   |
+| Tunnels   | sing-box, Xray-core, Mihomo (child processes)| All mainstream protocols, no native bindings   |
 | Map       | Pre-rendered Natural Earth path (`npm run map`) | Offline, no runtime mapping dependency       |
 | Packaging | electron-builder                             | `npm run dist` builds installers               |
 
@@ -35,7 +38,7 @@ in `src/renderer/src/components/Icons.tsx`.
 
 ```bash
 npm install
-npm run core       # download/sing-box into resources/bin
+npm run core       # download sing-box into resources/bin
 npm run dev        # HMR dev session (Electron + Vite)
 npm run build      # bundle main, preload and renderer into out/
 npm start          # preview the production bundle
@@ -47,23 +50,38 @@ npm run dist       # electron-builder installers
 
 > On this machine `npm`, `git` and `gh` are not on `PATH` for the shell; use
 > the full paths (e.g. `& 'C:\Program Files\nodejs\npm.cmd'`) or prepend them.
+> Electron GUI harnesses must be started with `Start-Process -Wait`, otherwise
+> the command returns before the app exits.
 
 ## Repository layout
 
 ```
 resources/bin/         sing-box.exe + libcronet.dll (git-ignored, npm run core)
-scripts/fetch-core.mjs downloads the core for the current platform
+scripts/fetch-core.mjs downloads the bundled sing-box core
 src/
   shared/types.ts      single source of truth for the IPC contract
   main/
-    index.ts           window, IPC handlers, subscription fetching, shots
-    store.ts           JSON settings/profiles/subscriptions persistence
+    index.ts           window, IPC handlers, tray, subscriptions, QR/backup, shots
+    store.ts           JSON settings/profiles/subscriptions/scenarios/sessions
     vpn/
-      engine.ts        state machine, connect/teardown, IP probes, telemetry
-      singbox.ts       core discovery/install, config builder, process, Clash API
+      engine.ts        state machine, connect/teardown, telemetry, protection,
+                       diagnostics, scenarios, engine comparison
+      singbox.ts       sing-box config, Clash API, speed transfer, port helpers
+      engines/
+        manager.ts     discovery, install/update/remove, auto choice, TUN staging
+        types.ts       EngineAdapter contract
+        singbox-adapter.ts
+        xray-adapter.ts + xray-stats.ts
+        mihomo-adapter.ts
+      firewall/        Windows Firewall, macOS pf, Linux iptables kill switch
+      system-proxy/    WinINET, networksetup, GSettings backends
+      dns-guard.ts     local DoH relay + system resolver backup/restore
+      scenarios.ts     built-in Gaming/Performance/Privacy/Manual presets
       profiles.ts      share-link + base64 subscription parser
       free-sources.ts  public catalogs, TCP probe, live node verification
-      system-proxy.ts  WinINET proxy enable/disable and crash recovery
+      geo.ts           DNS + ip-api geolocation (no invented coordinates)
+      process-usage.ts CPU/RAM sampler for the core process
+      engine-test.ts   dev harness for the full engine matrix
   preload/index.ts     contextBridge → window.eaglet
   renderer/
     index.html
@@ -72,7 +90,7 @@ src/
       format.ts        speed/bytes/duration/date-time formatters
       data/worldMap.json
       components/      TitleBar, Sidebar, PowerDial, WorldMap, …
-      pages/           Home, Servers, Routing, Stats, Settings, MiniView
+      pages/           Home, Servers, Scenarios, Routing, Stats, Settings, MiniView
       styles/theme.css theme tokens + backdrops
       styles/app.css   layout and components
 ```
@@ -101,133 +119,159 @@ Design rules that keep the six styles coherent:
 - `minimal` has no glow (`--glow: none`) — do not add box-shadows conditionally
   in components.
 
-## VPN engine
+## Multi-engine architecture
 
-`src/main/vpn/engine.ts` owns `VpnEngine extends EventEmitter`. Public surface:
+`src/main/vpn/engines/manager.ts` is the only place that knows about specific
+cores. Every core implements `EngineAdapter` (`engines/types.ts`):
 
-- `init()` / `refreshCore()` — discover the binary and read its version.
-- `connect(profileId?, automatic?)` — stage machine: prepare profile → ensure
-  core → build + `sing-box check` config → spawn → wait for the mixed port →
-  probe the exit IP → enable the system proxy → connected. `automatic` keeps the
-  reconnect counter; a manual connect resets it.
-- `disconnect()` / `shutdown()` — stop telemetry, kill the process tree, restore
-  the previous Windows proxy, and persist the finished session. Teardown takes
-  one final Clash sample so short sessions record their real traffic.
-- `checkIp()` — probes the direct address and, while connected, the exit
-  address through the local inbound; sets `ip.changed` only when they differ.
-- `testProfiles(ids?)` — TCP handshake latency per node.
-- `runSpeedTest()` — downloads 10 MB through the mixed inbound with `curl` and
-  returns `{ mbps, bytes, seconds, at }`; throws when no tunnel is live.
-- `setSystemProxy(bool)` — live proxy toggle while a tunnel is up.
-- `getState()` + `'state'` event — the renderer consumes full snapshots.
+```ts
+interface EngineAdapter {
+  id: EngineId
+  name: string
+  releaseRepo: string
+  protocols: ProtocolId[]
+  telemetry: boolean
+  supportsTun: boolean
+  supportsProfile?: (profile: Profile) => boolean
+  assetPattern(platform, arch): RegExp
+  binaryName(platform): string
+  configFileName: string
+  buildConfig(input): string
+  validateArgs(configPath): string[]
+  versionArgs: string[]
+  parseVersion(output): string | null
+  runArgs(configPath): string[]
+}
+```
 
-Resilience and history live in the same class: `onCoreExit()` marks the drop,
-records the session and calls `scheduleReconnect()` (three attempts, 2.5 s × n,
-skipped when `settings.autoReconnect` is off or the user stopped manually).
-`finishSession()` writes at most one `SessionRecord` per connection; the store
-keeps the last 40.
+Key rules:
 
-### Core integration (`singbox.ts`)
+- `EngineManager.choose()` order is **profile override → global choice → auto**.
+  Auto walks `sing-box, mihomo, xray`, requires an installed binary that
+  `supportsProfile()` and, when `tunMode` is on, `supportsTun`.
+- `supportsProfile()` is not just protocol membership. Xray’s adapter rejects
+  legacy Shadowsocks ciphers (`aes-256-cfb`, …) before spawn; a pinned core that
+  cannot carry the node is reported in the log and the manager falls back.
+- `buildConfig()` receives `{ profile, settings, mixedPort, apiPort, auxPort,
+  apiSecret }`. Xray has no mixed inbound, so `auxPort` is its SOCKS listener;
+  `apiPort` is Xray’s native stats API, not a Clash API.
+- `validate()` shells out to `sing-box check`, `xray run -test` or `mihomo -t`
+  and surfaces stderr to the UI.
+- `start()` spawns with `cwd = userData/bin` because Windows resolves `wintun.dll`
+  relative to the working directory. `ensureTun()` downloads
+  `wintun-0.14.1.zip` once, extracts the matching architecture and stages the
+  core next to the DLL.
+- Installs come from the official GitHub releases into `userData/bin`;
+  `resources/bin` is only the bundled sing-box fallback. Archives whose payload
+  name differs from the binary name (Mihomo) are matched by executable content,
+  not by a fixed filename.
+- Mihomo config uses explicit private CIDRs and
+  `fallback-filter.geoip: false` so validation never downloads a GeoIP database.
 
-- Binary lookup: `resources/bin` (packaged `extraResources`), repo
-  `resources/bin`, then `userData/bin`. `installCore()` can download the
-  latest release as a fallback.
-- `buildConfig(profile, settings, mixedPort, apiPort, secret)` emits a
-  sing-box 1.14 config: mixed inbound, optional TUN inbound, the profile
-  outbound, smart/global routing rules, the user's bypass list, optional DoH DNS
-  with `route.default_domain_resolver`, and a Clash API on loopback.
-  `bypassRules(settings)` splits the list into `domain_suffix` and `ip_cidr`
-  rules and always places them before the mode rules so they win in Global mode
-  too.
-- `outboundFor(profile)` maps every supported share link. When adding a
-  protocol, extend `parseProfileUri` in `profiles.ts` and this function, then
-  verify with `sing-box check -c out/main/...` or the generated
-  `userData/core/config.json`.
-- Telemetry: GET `/connections` with the bearer secret; totals are diffed per
-  second and converted to Mbps. Latency is a `curl` request through the local
-  proxy every 5 s.
+### Engine state machine (`vpn/engine.ts`)
 
-### Free-server finder (`free-sources.ts`)
+`VpnEngine extends EventEmitter` owns the runtime:
 
-`discoverFreeProfiles({ settings, corePath })` never trusts a catalog:
+- `connect(profileId?, automatic?)` — probe direct IP → prepare/install core →
+  optional TUN staging → build + validate native config → spawn → wait for the
+  mixed port → verify exit IP → apply system proxy → arm protection → connected.
+- `disconnect()` / `shutdown()` — one final telemetry sample, stop telemetry,
+  kill the process tree, restore proxy, remove kill switch/DNS guard, persist the
+  session, emit a disconnected snapshot.
+- `onCoreExit()` — keeps protection armed during a crash, records the session and
+  calls `scheduleReconnect()` (three attempts, 2.5 s × n).
+- `applyProtection()` — real kill switch via `firewall/` and real DoH relay via
+  `dns-guard.ts`. Both need elevation; failures are logged, never hidden.
+- `diagnose()` — returns real checks (binary, version, config, proxy, TUN, kill
+  switch, DNS, resolution, exit IP, latency, loss, subscriptions, updates,
+  platform support).
+- `applyScenario()` — writes real settings, selects an engine, records a switch
+  and can pick the fastest/favourite server.
+- `validateEngineConfig(id)` — builds a native config for one engine without
+  connecting and runs its validator.
+- `prepareTun()` — prepares `wintun.dll` and a staged core without opening a
+  tunnel.
 
-1. Downloads seven community lists (V2RayAggregator, NoMoreWalls, ermaozi,
-   ts-sf/fly, Pawdroid, freefq, ripaojiedian) in parallel, parses them with the
-   same `parseProfilesPayload` used by subscriptions, and dedupes by `profile.id`.
-2. TCP-probes 140 random candidates (24 concurrent, 2.2 s timeout).
-3. Boots up to 40 of the fastest in throwaway sing-box instances (4 concurrent,
-   distinct loopback ports, TUN forced off) and keeps only nodes where `curl`
-   through the local inbound gets a real IP from `ip-api.com`.
-4. Returns working nodes sorted by handshake latency plus per-source statuses.
+### Telemetry
 
-`free:add` stores the picked links with `sourceId = 'free-public-nodes'` and a
-`eaglet://free-public` pseudo-subscription, so the whole set can be removed at
-once. If the core is missing, discovery falls back to TCP-only results and sets
-`verified: false` — the UI warns about it.
+- sing-box/Mihomo: Clash API (`/connections`) with the bearer secret.
+- Xray: native `StatsService` through `xray api statsquery --server=…`; only
+  inbound counters are summed. Sampled every other tick because it spawns the
+  CLI.
+- Latency: an HTTP probe through the local inbound every 5 s. Jitter is the mean
+  absolute difference between consecutive samples; loss is failed probes divided
+  by the rolling window.
+- CPU/RAM: `process-usage.ts` reads the live core PID.
+- `SessionRecord` stores the engine, traffic, duration, exit IP, ping, jitter
+  and loss.
 
-Dev harnesses (both write JSON because Electron's stdout is invisible on
-Windows): `electron . --eaglet-free-test` reports catalogs and working nodes,
-`electron . --eaglet-free-connect-test` adds found nodes, connects to the first
-one that works, compares direct/exit IP and tears the tunnel down.
+### Protection layers
 
-`electron . --eaglet-feature-test` covers the quality-of-life batch: favourite
-round-trip, generated bypass rules, a real 10 MB speed test, a forced
-`taskkill` of `sing-box.exe` to prove auto-reconnect, and the persisted session
-row. It writes `feature-test.json` and restores the settings it changed.
+| Layer | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| System proxy | WinINET registry | `networksetup` | GSettings (GNOME) |
+| Kill switch | Firewall default outbound Block + allow rules | `pf` anchor | dedicated `iptables` chain |
+| DNS protection | Local DoH relay on `127.0.0.1:53`, resolver backup/restore | same | same |
+| TUN | `wintun.dll` + elevated core | — | — |
 
-### Windows routing
-
-`system-proxy.ts` writes `HKCU\…\Internet Settings`, notifies WinINET and keeps
-a JSON backup in `userData/proxy-backup.json`. `recoverStaleProxy()` runs at
-startup so a crash never leaves the user behind a dead proxy. Always call the
-restore path from `shutdown()`; the main process prevents quit until it runs.
+Support is deliberately asymmetric: only Windows is in the verified matrix;
+macOS/Linux backends exist but are marked **experimental**. Never claim a
+platform feature you have not tested.
 
 ## IPC contract
 
 All renderer↔main traffic goes through `window.eaglet` (`src/shared/types.ts`
-defines `EagletApi`):
+defines `EagletApi`). Highlights:
 
-- `snapshot()` → `Snapshot` (state + settings + profiles + subscriptions +
-  sessions)
-- `connect(profileId?)`, `quickConnect()` → picks the fastest node, `disconnect()`,
-  `selectProfile(id)`, `setFavorite(id, bool)` → updated profiles
-- `importProfiles(text)` — URL, share link or base64 list
-- `discoverFree()` → reachable/verified public nodes; `addFreeProfiles(links)` —
-  stores picked finder nodes as the `free-public-nodes` subscription
-- `updateSubscription(id)`, `removeSubscription(id)`, `removeProfile(id)`
-- `testProfiles(ids?)`, `runSpeedTest()`, `clearSessions()`, `checkIp()`,
-  `refreshCore()`
-- `copyText(text)`, `readClipboard()` — clipboard access stays in main
-- `updateSettings(patch)` → persisted `Settings` (incl. `bypassList`,
-  `autoReconnect`, `notifications`)
-- `setMini(bool)`, `windowMinimize()`, `windowClose()`,
-  `windowToggleMaximize()`
-- `onState(cb)` → main pushes a new `Snapshot` on every engine tick
+- snapshot/state: `snapshot()`, `onState(cb)`
+- tunnel: `connect`, `quickConnect`, `disconnect`, `selectProfile`,
+  `checkIp`, `runSpeedTest`
+- profiles: `importProfiles`, `importQr`, `updateSubscription`,
+  `updateAllSubscriptions`, `removeSubscription`, `removeProfile`,
+  `setFavorite`, `testProfiles`, `clearSessions`
+- engines: `refreshEngines`, `installEngine`, `removeEngine`,
+  `checkEngineUpdates`, `setEngine`, `setProfileEngine`, `clearEngineHistory`
+- scenarios/diagnostics: `applyScenario`, `saveScenario`, `removeScenario`,
+  `diagnose`
+- data: `exportBackup`, `importBackup`, `exportConfig`
+- settings/window: `updateSettings`, `setMini`, minimize/close/maximize
 
 Do not add `nodeIntegration`; the renderer must stay sandboxed behind preload.
+
+## Dev harnesses
+
+All harnesses write JSON because Electron’s stdout is invisible on Windows.
+
+- `electron . --eaglet-engine-test` (`vpn/engine-test.ts`) — installs all three
+  cores, validates standard/hardened configs, opens a real tunnel with each
+  engine, kills each core to prove auto-reconnect, checks per-profile/global/auto
+  selection, applies scenarios, verifies proxy restoration and TUN preparation,
+  and performs an emergency shutdown. Protection layers that need elevation are
+  reported as skipped. It restores the user’s settings, profile pins, session
+  list and engine history before exit. Writes `engine-test.json`.
+- `--eaglet-free-test` / `--eaglet-free-connect-test` — free-server catalogs and
+  a real connection to a discovered node.
+- `--eaglet-feature-test` — favourites, bypass rules, speed test, forced core
+  kill and session persistence.
 
 ## Testing checklist
 
 1. `npm run typecheck && npm run build`.
-2. Import `direct://Test` (or a real node) and connect. Confirm:
-   - the mixed inbound opens and `curl --proxy http://127.0.0.1:<port>` works;
-   - the WinINET proxy is set while connected and restored after disconnect;
-   - speed/connection counters move on Stats;
-   - Home shows direct and exit addresses.
-3. `Get-Process sing-box` should be empty after disconnect.
-4. Exercise the quality-of-life batch: star a node and switch to the
-   *Favourites* filter, copy its link and paste it back; add entries to
-   *Routing → bypass list*, connect and confirm `userData/core/config.json`
-   contains the expected `domain_suffix` / `ip_cidr` rules; run the speed test;
-   disconnect and confirm the session appears in *Stats → Session history*.
-   `electron . --eaglet-feature-test` automates the same checks and proves
-   auto-reconnect by killing the core.
-5. *Find free servers* in Servers must return at least one working node on a
-   normal connection (catalogs are volatile, retry if the first pass is empty),
-   and adding a node must create the *Free public nodes* subscription.
-6. `npm run shots` exercises the whole flow (it seeds demo profiles, creates two
-   real sessions, connects through the direct profile, clicks the speed test,
-   captures screenshots and cleans up). Set `EAGLET_SHOT_FREE=1` to also capture
+2. Run `electron . --eaglet-engine-test` (elevated when testing kill
+   switch/DNS/TUN). All three engines must install, validate, connect, show live
+   counters, reconnect after `taskkill`, and restore the proxy.
+3. Import `direct://Test` or a real node and connect. Confirm the mixed inbound
+   opens, WinINET proxy is restored after disconnect, telemetry moves, and Home
+   shows direct/exit addresses.
+4. Verify `Get-Process sing-box, xray, mihomo` is empty after disconnect.
+5. Exercise split tunneling: add domains/CIDRs, connect, inspect
+   `userData/core/config.json` (or `config.yaml`) for the expected direct rules.
+6. Exercise the quality-of-life batch: star a node, copy/paste links, run the
+   speed test, confirm the session row, apply a scenario, run diagnostics,
+   export a backup and the active core config.
+7. `npm run shots` seeds demo profiles, creates two real sessions, connects
+   through the direct profile, clicks the speed test, captures every page
+   (including Scenarios) and cleans up. Set `EAGLET_SHOT_FREE=1` to also capture
    the free-server panel.
 
 ## Conventions
@@ -237,6 +281,8 @@ Do not add `nodeIntegration`; the renderer must stay sandboxed behind preload.
 - Keep components presentational — data and actions arrive as props from
   `App.tsx`.
 - Russian-speaking users: UI copy stays in English to match the concept sheet.
+- Never invent server coordinates, telemetry, traffic or protection status. If a
+  capability needs elevation or is not implemented, report it honestly.
 
 ## Screenshot harness
 

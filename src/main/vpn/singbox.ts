@@ -1,4 +1,4 @@
-import { spawn, execFile } from 'node:child_process'
+﻿import { spawn, execFile } from 'node:child_process'
 import { createServer, connect as netConnect } from 'node:net'
 import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -8,6 +8,7 @@ import { app } from 'electron'
 import type { IpInfo, Profile, Settings } from '@shared/types'
 
 const execFileAsync = promisify(execFile)
+const CURL = process.platform === 'win32' ? 'curl.exe' : 'curl'
 
 /**
  * sing-box integration: binary discovery/installation, config generation,
@@ -64,7 +65,7 @@ export async function installCore(log: (message: string) => void): Promise<strin
   const existing = findCore()
   if (existing) return existing
 
-  log('Downloading sing-box core…')
+  log('Downloading sing-box coreвЂ¦')
   const response = await fetch('https://api.github.com/repos/SagerNet/sing-box/releases/latest', {
     headers: { 'User-Agent': 'Eaglet-VPN' }
   })
@@ -327,7 +328,8 @@ export function outboundFor(profile: Profile): Record<string, unknown> {
 }
 
 function dnsFor(settings: Settings): Record<string, unknown> | undefined {
-  if (settings.dns === 'auto') return undefined
+  const protectedDns = settings.dnsProtection || settings.networkProtection
+  if (settings.dns === 'auto' && !protectedDns) return undefined
 
   let endpoint = 'https://1.1.1.1/dns-query'
   if (settings.dns === 'google') endpoint = 'https://8.8.8.8/dns-query'
@@ -362,7 +364,8 @@ function dnsFor(settings: Settings): Record<string, unknown> | undefined {
       }
     ],
     rules: [{ ip_is_private: true, server: 'dns-direct' }],
-    final: 'dns-proxy'
+    final: 'dns-proxy',
+    strategy: settings.ipv6 ? 'prefer_ipv4' : 'ipv4_only'
   }
 }
 
@@ -428,15 +431,23 @@ export function buildConfig(
           { domain_suffix: ['.local', '.lan', '.home.arpa'], outbound: 'direct' }
         ]
       : []
-  const rules = [...bypassRules(settings), ...modeRules]
+  const protectionRules: Record<string, unknown>[] = []
+  if (!settings.ipv6) protectionRules.push({ ip_version: 6, action: 'reject' })
+  if (settings.dnsProtection || settings.networkProtection) {
+    // Plaintext DNS must not leave through the physical interface.
+    protectionRules.push({ port: 53, outbound: isDirect ? 'direct' : 'proxy' })
+  }
+  const rules = [...bypassRules(settings), ...modeRules, ...protectionRules]
 
   const dns = dnsFor(settings)
   const useDns = Boolean(dns && !isDirect)
 
+  const outbounds: Record<string, unknown>[] = [proxy, { type: 'direct', tag: 'direct' }]
+
   const config: Record<string, unknown> = {
     log: { level: 'info', timestamp: true },
     inbounds,
-    outbounds: [proxy, { type: 'direct', tag: 'direct' }],
+    outbounds,
     route: {
       rules,
       final: isDirect ? 'direct' : 'proxy',
@@ -648,7 +659,7 @@ export async function proxiedIp(port: number): Promise<IpInfo | null> {
   for (const source of sources) {
     try {
       const { stdout } = await execFileAsync(
-        'curl.exe',
+        CURL,
         ['-s', '--max-time', '12', '--proxy', `http://127.0.0.1:${port}`, source],
         { timeout: 15000, windowsHide: true }
       )
@@ -666,7 +677,7 @@ export async function proxiedIp(port: number): Promise<IpInfo | null> {
 export async function quickProxiedIp(port: number, timeoutMs = 6000): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
-      'curl.exe',
+      CURL,
       [
         '-s',
         '--max-time',
@@ -692,7 +703,7 @@ export async function downloadThroughput(
   const devNull = process.platform === 'win32' ? 'NUL' : '/dev/null'
   const url = `https://speed.cloudflare.com/__down?bytes=${bytes}`
   const { stdout } = await execFileAsync(
-    'curl.exe',
+    CURL,
     [
       '-s',
       '-o',
@@ -711,7 +722,7 @@ export async function downloadThroughput(
   const size = Number(sizeRaw)
   const seconds = Number(timeRaw)
   if (!Number.isFinite(size) || size < 200_000 || !Number.isFinite(seconds) || seconds <= 0) {
-    throw new Error('The speed test did not receive enough data — try again')
+    throw new Error('The speed test did not receive enough data вЂ” try again')
   }
   return { bytes: size, seconds }
 }
@@ -721,7 +732,7 @@ export async function measurePing(port: number): Promise<number> {
   const started = Date.now()
   try {
     await execFileAsync(
-      'curl.exe',
+      CURL,
       [
         '-s',
         '-o',
@@ -756,3 +767,4 @@ export function tcpPing(host: string, port: number, timeoutMs = 4000): Promise<n
     socket.once('error', () => done(null))
   })
 }
+

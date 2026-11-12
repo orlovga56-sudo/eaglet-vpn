@@ -17,8 +17,14 @@ function place(info: { city: string; country: string } | null): string {
   return [info.city, info.country].filter(Boolean).join(', ')
 }
 
+const ENGINE_NAME: Record<Snapshot['state']['engine'], string> = {
+  'sing-box': 'sing-box',
+  xray: 'Xray-core',
+  mihomo: 'Mihomo'
+}
+
 export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props): React.JSX.Element {
-  const { state } = snap
+  const { state, settings } = snap
   const { status, profile, metrics, history, ip } = state
   const connected = status === 'connected'
   const busy = status === 'connecting' || status === 'disconnecting'
@@ -78,6 +84,19 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
               <span style={{ ['--p' as string]: `${Math.round(state.progress * 100)}%` }} />
             </div>
           )}
+          <div className="home-badges">
+            <span className="home-badge">
+              <BoltIcon /> {ENGINE_NAME[state.engine]}
+            </span>
+            {state.killSwitchActive && (
+              <span className="home-badge is-on">
+                <ShieldIcon /> Kill switch
+              </span>
+            )}
+            {state.dnsProtectionActive && <span className="home-badge is-on">DNS guard</span>}
+            {settings.tunMode && <span className="home-badge">TUN</span>}
+            {!settings.ipv6 && <span className="home-badge">IPv4 only</span>}
+          </div>
         </div>
       </section>
 
@@ -194,7 +213,36 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
         </div>
       </section>
 
-      <WorldMap direct={ip.direct} exit={ip.exit} status={status} onManage={onManageServers} />
+      {snap.scenarios.length > 0 && (
+        <section className="scenario-strip panel">
+          <div className="scenario-strip-head">
+            <strong>Scenarios</strong>
+            <span>One click applies engine, routing and protection settings</span>
+          </div>
+          <div className="scenario-strip-actions">
+            {snap.scenarios.map((scenario) => (
+              <button
+                key={scenario.id}
+                className="toggle-chip"
+                title={scenario.description}
+                onClick={() => void window.eaglet.applyScenario(scenario.id)}
+              >
+                {scenario.name}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <WorldMap
+        direct={ip.direct}
+        exit={ip.exit}
+        status={status}
+        onManage={onManageServers}
+        profiles={snap.profiles}
+        selected={profile}
+        onPick={(id) => void window.eaglet.selectProfile(id)}
+      />
     </div>
   )
 }

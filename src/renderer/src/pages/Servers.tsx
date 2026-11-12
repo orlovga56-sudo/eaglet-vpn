@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
-import type { FreeDiscoveryResult, Profile, ProtocolId, Snapshot } from '@shared/types'
+import type { EngineId, FreeDiscoveryResult, Profile, ProtocolId, Snapshot } from '@shared/types'
 import { CheckIcon, ClipboardIcon, CopyIcon, GlobeIcon, SearchIcon, StarIcon } from '../components/Icons'
+import { Sparkline } from '../components/Sparkline'
 
 interface Props {
   snap: Snapshot
@@ -90,6 +91,41 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
       setMessage({ tone: 'err', text: cleanError(error) })
     } finally {
       setBusy(false)
+    }
+  }
+
+  const importQr = async (): Promise<void> => {
+    setMessage(null)
+    try {
+      const result = await window.eaglet.importQr()
+      setMessage({ tone: 'ok', text: `QR code decoded · ${result.imported} node(s) added` })
+    } catch (error) {
+      setMessage({ tone: 'err', text: cleanError(error) })
+    }
+  }
+
+  const updateAll = async (): Promise<void> => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const results = await window.eaglet.updateAllSubscriptions()
+      const nodes = results.reduce((sum, item) => sum + item.imported + item.updated, 0)
+      setMessage({
+        tone: 'ok',
+        text: results.length > 0 ? `${results.length} subscription(s) refreshed · ${nodes} nodes` : 'No HTTP subscriptions to refresh'
+      })
+    } catch (error) {
+      setMessage({ tone: 'err', text: cleanError(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const pinEngine = async (profile: Profile, engine: EngineId | null): Promise<void> => {
+    try {
+      await window.eaglet.setProfileEngine(profile.id, engine)
+    } catch (error) {
+      setMessage({ tone: 'err', text: cleanError(error) })
     }
   }
 
@@ -210,6 +246,9 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
           </p>
         </div>
         <div className="head-actions">
+          <button className="btn" onClick={() => void importQr()} title="Decode a QR code from an image file">
+            QR import
+          </button>
           <button className="btn" onClick={() => void findFree()} disabled={discovering}>
             <GlobeIcon />
             {discovering ? 'Searching…' : 'Find free servers'}
@@ -369,7 +408,12 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
 
       {subscriptions.length > 0 && (
         <>
-          <div className="section-title">Subscriptions</div>
+          <div className="section-title section-title-row">
+            <span>Subscriptions</span>
+            <button className="btn small" onClick={() => void updateAll()} disabled={busy}>
+              Update all
+            </button>
+          </div>
           <div className="sub-list">
             {subscriptions.map((subscription) => (
               <div className="sub-item panel" key={subscription.id}>
@@ -474,9 +518,29 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                   <strong>{profile.name}</strong>
                   <span>
                     {profile.protocol === 'direct' ? 'Built-in direct route' : `${profile.host}:${profile.port}`}
+                    {profile.geo ? ` · ${[profile.geo.city, profile.geo.country].filter(Boolean).join(', ')}` : ''}
                     {source ? ` · ${source}` : ''}
                   </span>
                 </span>
+                {profile.quality.length > 1 && (
+                  <Sparkline className="profile-quality" values={profile.quality} width={52} height={22} />
+                )}
+                {profile.protocol !== 'direct' && (
+                  <select
+                    className="engine-select"
+                    value={profile.engine ?? ''}
+                    title="Per-profile engine override"
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={(event) => void pinEngine(profile, (event.target.value || null) as EngineId | null)}
+                  >
+                    <option value="">Auto</option>
+                    {snap.state.engines.map((engine) => (
+                      <option key={engine.id} value={engine.id}>
+                        {engine.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
                 <span className={`ping ${profile.ping === null ? 'is-idle' : ''}`}>
                   <strong>{profile.ping === null ? '—' : profile.ping}</strong> ms
                 </span>

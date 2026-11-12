@@ -59,6 +59,9 @@ function buildProfile(raw: string, fields: Partial<Profile> & Pick<Profile, 'nam
     ping: null,
     favorite: false,
     addedAt: Date.now(),
+    engine: null,
+    geo: null,
+    quality: [],
     ...fields
   }
 }

@@ -14,7 +14,7 @@ screenshots/tmp/
 free-test.json
 free-connect-test.json
 feature-test.json
+engine-test.json
 
 resources/bin/*
 !resources/bin/.gitkeep
-

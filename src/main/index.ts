@@ -1,22 +1,41 @@
-import { app, BrowserWindow, clipboard, ipcMain, Notification, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, shell, Tray } from 'electron'
 import { execFile } from 'node:child_process'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
+import jsQR from 'jsqr'
 import { Store } from './store'
 import { VpnEngine } from './vpn/engine'
+import { runEngineTest } from './vpn/engine-test'
 import { isHttpUrl, parseProfileUri, parseProfilesPayload, subscriptionName } from './vpn/profiles'
 import { discoverFreeProfiles } from './vpn/free-sources'
-import type { ImportResult, Profile, Settings, Snapshot, Subscription, VpnState } from '@shared/types'
+import { normalizeScenario } from './vpn/scenarios'
+import type {
+  BackupPayload,
+  EngineChoice,
+  EngineId,
+  ImportResult,
+  Profile,
+  ProfileEvent,
+  QrImportResult,
+  Scenario,
+  Settings,
+  Snapshot,
+  Subscription,
+  VpnState
+} from '@shared/types'
 
 const isDev = !app.isPackaged
 const isShotMode = process.argv.includes('--eaglet-shots')
 
 let mainWindow: BrowserWindow | null = null
+let tray: Tray | null = null
 let store: Store
 let engine: VpnEngine
 let normalBounds: Electron.Rectangle | null = null
 let quitting = false
+let subscriptionTimer: NodeJS.Timeout | null = null
+let trayRefreshTimer: NodeJS.Timeout | null = null
 
 function snapshot(): Snapshot {
   return {
@@ -25,9 +44,16 @@ function snapshot(): Snapshot {
     profiles: store.getProfiles(),
     subscriptions: store.getSubscriptions(),
     sessions: store.getSessions(),
+    scenarios: engine.getScenarios(),
+    profileHistory: store.getProfileHistory(),
+    engineHistory: store.getEngineHistory(),
     platform: process.platform,
     version: app.getVersion()
   }
+}
+
+function logProfileEvent(kind: ProfileEvent['kind'], message: string): void {
+  store.addProfileEvent({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, at: Date.now(), kind, message })
 }
 
 function broadcast(): void {
@@ -37,7 +63,17 @@ function broadcast(): void {
   }
 }
 
+function iconPath(): string {
+  return app.isPackaged ? join(process.resourcesPath, 'icon.png') : join(app.getAppPath(), 'resources', 'icon.png')
+}
+
+function appIcon(): Electron.NativeImage {
+  const path = iconPath()
+  return existsSync(path) ? nativeImage.createFromPath(path) : nativeImage.createEmpty()
+}
+
 function createWindow(): void {
+  const icon = appIcon()
   mainWindow = new BrowserWindow({
     width: 1180,
     height: 780,
@@ -47,6 +83,7 @@ function createWindow(): void {
     frame: false,
     backgroundColor: '#04060d',
     title: 'Eaglet',
+    ...(icon.isEmpty() ? {} : { icon }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -61,6 +98,14 @@ function createWindow(): void {
   mainWindow.on('ready-to-show', () => {
     if (isShotMode) mainWindow?.showInactive()
     else mainWindow?.show()
+  })
+
+  mainWindow.on('close', (event) => {
+    if (!quitting && !isShotMode && store?.getSettings().closeToTray) {
+      event.preventDefault()
+      mainWindow?.hide()
+      ensureTray()
+    }
   })
 
   mainWindow.on('closed', () => {
@@ -150,6 +195,7 @@ async function importFromUrl(url: string): Promise<ImportResult> {
   store.upsertSubscription(subscription)
   engine.reconcileProfiles()
   engine.pushExternalLog('success', `Subscription imported · ${profiles.length} nodes · ${subscription.name}`)
+  logProfileEvent('subscription', `Subscription ${subscription.name} imported · ${profiles.length} nodes`)
   broadcast()
 
   return {
@@ -166,6 +212,7 @@ function importFromText(text: string): ImportResult {
   const { added, updated } = store.addProfiles(profiles)
   engine.reconcileProfiles()
   engine.pushExternalLog('success', `Imported ${profiles.length} node(s) from a share link`)
+  logProfileEvent('import', `Imported ${profiles.length} node(s) from a share link`)
   broadcast()
   return { imported: added, updated, subscription: null, profiles: store.getProfiles() }
 }
@@ -176,6 +223,59 @@ async function importAnything(input: string): Promise<ImportResult> {
   if (isHttpUrl(text)) return importFromUrl(text)
   return importFromText(text)
 }
+
+/** Refreshes one HTTP subscription and removes nodes the provider dropped. */
+async function updateSubscriptionById(id: string): Promise<ImportResult> {
+  const subscription = store.getSubscriptions().find((item) => item.id === id)
+  if (!subscription) throw new Error('Subscription not found')
+  const text = await fetchSubscription(subscription.url)
+  const profiles = parseProfilesPayload(text)
+  if (profiles.length === 0) throw new Error('Subscription returned no supported nodes')
+  const incoming: Profile[] = profiles.map((profile) => ({ ...profile, sourceId: id }))
+  const incomingIds = new Set(incoming.map((profile) => profile.id))
+  for (const old of store.getProfiles().filter((profile) => profile.sourceId === id)) {
+    if (!incomingIds.has(old.id)) store.removeProfile(old.id)
+  }
+  const { added, updated } = store.addProfiles(incoming)
+  const refreshed: Subscription = { ...subscription, updatedAt: Date.now(), count: incoming.length }
+  store.upsertSubscription(refreshed)
+  engine.reconcileProfiles()
+  engine.pushExternalLog('success', `Subscription refreshed · ${incoming.length} nodes · ${subscription.name}`)
+  logProfileEvent('subscription', `Subscription ${subscription.name} refreshed · ${incoming.length} nodes`)
+  broadcast()
+  return { imported: added, updated, subscription: refreshed, profiles: store.getProfiles() }
+}
+
+async function updateAllSubscriptions(onlyDue = false): Promise<ImportResult[]> {
+  const settings = store.getSettings()
+  const interval = Math.max(1, settings.subscriptionIntervalHours) * 60 * 60 * 1000
+  const targets = store
+    .getSubscriptions()
+    .filter((subscription) => !subscription.url.startsWith('eaglet://'))
+    .filter((subscription) => !onlyDue || Date.now() - subscription.updatedAt > interval)
+  const results: ImportResult[] = []
+  for (const subscription of targets) {
+    try {
+      results.push(await updateSubscriptionById(subscription.id))
+    } catch (error) {
+      engine.pushExternalLog('warn', `Auto-update failed · ${subscription.name}: ${(error as Error).message}`)
+    }
+  }
+  if (results.length > 0) broadcast()
+  return results
+}
+
+function scheduleSubscriptionUpdates(): void {
+  if (subscriptionTimer) clearInterval(subscriptionTimer)
+  subscriptionTimer = null
+  const settings = store.getSettings()
+  if (!settings.autoUpdateSubscriptions) return
+  const hours = Math.max(1, settings.subscriptionIntervalHours)
+  subscriptionTimer = setInterval(() => void updateAllSubscriptions(true), hours * 60 * 60 * 1000)
+  // Catch up shortly after launch instead of waiting a whole interval.
+  setTimeout(() => void updateAllSubscriptions(true), 20000)
+}
+
 
 const FREE_SOURCE_ID = 'free-public-nodes'
 
@@ -202,8 +302,129 @@ function addFreeProfiles(links: string[]): ImportResult {
   store.upsertSubscription(subscription)
   engine.reconcileProfiles()
   engine.pushExternalLog('success', `Added ${added} free node(s) from public catalogs`)
+  logProfileEvent('import', `Added ${added} free node(s) from public catalogs`)
   broadcast()
   return { imported: added, updated, subscription, profiles: store.getProfiles() }
+}
+
+/* ------------------------------------------------------------------ */
+/*  QR import                                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Decodes a QR code from an image file. Electron exposes the bitmap as BGRA,
+ * so both channel orders are tried — jsQR only understands RGBA.
+ */
+function decodeQr(file: string): string {
+  const image = nativeImage.createFromPath(file)
+  if (image.isEmpty()) throw new Error('That image could not be read')
+  const { width, height } = image.getSize()
+  if (width <= 0 || height <= 0) throw new Error('That image has no pixels')
+  const raw = image.toBitmap()
+  const direct = new Uint8ClampedArray(width * height * 4)
+  const swapped = new Uint8ClampedArray(width * height * 4)
+  for (let index = 0; index + 3 < raw.length; index += 4) {
+    direct[index] = raw[index]
+    direct[index + 1] = raw[index + 1]
+    direct[index + 2] = raw[index + 2]
+    direct[index + 3] = raw[index + 3]
+    swapped[index] = raw[index + 2]
+    swapped[index + 1] = raw[index + 1]
+    swapped[index + 2] = raw[index]
+    swapped[index + 3] = raw[index + 3]
+  }
+  const code = jsQR(direct, width, height) ?? jsQR(swapped, width, height)
+  if (!code?.data) throw new Error('No QR code was found in that image')
+  return code.data
+}
+
+/* ------------------------------------------------------------------ */
+/*  Tray                                                              */
+/* ------------------------------------------------------------------ */
+
+function showWindow(): void {
+  if (!mainWindow) {
+    createWindow()
+    return
+  }
+  if (!mainWindow.isVisible()) mainWindow.show()
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.focus()
+}
+
+function toggleFromTray(): void {
+  const status = engine.getState().status
+  if (status === 'connected' || status === 'connecting') {
+    void engine.disconnect().then(() => broadcast())
+  } else {
+    void engine.connect().then(() => broadcast())
+  }
+}
+
+function refreshTray(): void {
+  if (!tray) return
+  const state = engine.getState()
+  const connected = state.status === 'connected'
+  const favourites = store
+    .getProfiles()
+    .filter((profile) => profile.favorite && profile.protocol !== 'direct')
+    .slice(0, 8)
+  const menu = Menu.buildFromTemplate([
+    { label: `Eaglet · ${connected ? 'connected' : state.status}`, enabled: false },
+    {
+      label: state.profile ? state.profile.name : 'No node selected',
+      enabled: false
+    },
+    { type: 'separator' },
+    {
+      label: connected ? 'Disconnect' : 'Connect',
+      click: () => toggleFromTray()
+    },
+    { type: 'separator' },
+    ...favourites.map((profile) => ({
+      label: profile.name,
+      type: 'checkbox' as const,
+      checked: state.profile?.id === profile.id,
+      click: () => {
+        engine.selectProfile(profile.id)
+        broadcast()
+      }
+    })),
+    ...(favourites.length > 0 ? [{ type: 'separator' as const }] : []),
+    { label: 'Open Eaglet', click: () => showWindow() },
+    {
+      label: 'Quit',
+      click: () => {
+        quitting = true
+        app.quit()
+      }
+    }
+  ])
+  tray.setContextMenu(menu)
+  tray.setToolTip(
+    state.profile ? `Eaglet · ${connected ? state.profile.name : state.status}` : `Eaglet · ${state.status}`
+  )
+}
+
+function ensureTray(): void {
+  if (tray || isShotMode) return
+  const icon = appIcon()
+  tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon)
+  tray.setToolTip('Eaglet VPN')
+  tray.on('click', () => {
+    if (mainWindow?.isVisible()) mainWindow.hide()
+    else showWindow()
+  })
+  refreshTray()
+  if (trayRefreshTimer) clearInterval(trayRefreshTimer)
+  trayRefreshTimer = setInterval(() => refreshTray(), 5000)
+}
+
+function destroyTray(): void {
+  if (trayRefreshTimer) clearInterval(trayRefreshTimer)
+  trayRefreshTimer = null
+  tray?.destroy()
+  tray = null
 }
 
 /* ------------------------------------------------------------------ */
@@ -375,29 +596,8 @@ function registerIpc(): void {
   })
 
   ipcMain.handle('subscriptions:update', async (_event, id: string) => {
-    const subscription = store.getSubscriptions().find((item) => item.id === id)
-    if (!subscription) throw new Error('Subscription not found')
     try {
-      const text = await fetchSubscription(subscription.url)
-      const profiles = parseProfilesPayload(text)
-      if (profiles.length === 0) throw new Error('Subscription returned no supported nodes')
-      // Drop removed nodes, then upsert the fresh list.
-      const incoming: Profile[] = profiles.map((profile) => ({ ...profile, sourceId: id }))
-      const incomingIds = new Set(incoming.map((profile) => profile.id))
-      for (const old of store.getProfiles().filter((profile) => profile.sourceId === id)) {
-        if (!incomingIds.has(old.id)) store.removeProfile(old.id)
-      }
-      const { added, updated } = store.addProfiles(incoming)
-      store.upsertSubscription({ ...subscription, updatedAt: Date.now(), count: incoming.length })
-      engine.reconcileProfiles()
-      engine.pushExternalLog('success', `Subscription refreshed · ${incoming.length} nodes`)
-      broadcast()
-      return {
-        imported: added,
-        updated,
-        subscription: { ...subscription, updatedAt: Date.now(), count: incoming.length },
-        profiles: store.getProfiles()
-      } satisfies ImportResult
+      return await updateSubscriptionById(id)
     } catch (error) {
       engine.pushExternalLog('error', `Subscription refresh failed: ${(error as Error).message}`)
       broadcast()
@@ -405,18 +605,31 @@ function registerIpc(): void {
     }
   })
 
+  ipcMain.handle('subscriptions:update-all', async () => {
+    try {
+      return await updateAllSubscriptions(false)
+    } catch (error) {
+      engine.pushExternalLog('error', `Subscription refresh failed: ${(error as Error).message}`)
+      throw error
+    }
+  })
+
   ipcMain.handle('subscriptions:remove', (_event, id: string) => {
+    const subscription = store.getSubscriptions().find((item) => item.id === id)
     store.removeProfilesBySource(id)
     store.removeSubscription(id)
     engine.reconcileProfiles()
     engine.pushExternalLog('info', 'Subscription removed')
+    logProfileEvent('remove', `Subscription ${subscription?.name ?? id} removed`)
     broadcast()
   })
 
   ipcMain.handle('profiles:remove', (_event, id: string) => {
+    const profile = store.getProfile(id)
     store.removeProfile(id)
     engine.reconcileProfiles()
     engine.pushExternalLog('info', 'Node removed')
+    logProfileEvent('remove', `Node ${profile?.name ?? id} removed`)
     broadcast()
   })
 
@@ -462,6 +675,187 @@ function registerIpc(): void {
     return core
   })
 
+  /* ---------------------------------------------------------------- */
+  /*  Engines                                                          */
+  /* ---------------------------------------------------------------- */
+
+  ipcMain.handle('engines:refresh', async () => {
+    const engines = await engine.refreshEngines(false)
+    broadcast()
+    return engines
+  })
+
+  ipcMain.handle('engines:check-updates', async () => {
+    try {
+      const engines = await engine.checkEngineUpdates()
+      broadcast()
+      return engines
+    } catch (error) {
+      engine.pushExternalLog('warn', `Engine update check failed: ${(error as Error).message}`)
+      broadcast()
+      throw error
+    }
+  })
+
+  ipcMain.handle('engines:install', async (_event, id: EngineId) => {
+    try {
+      const engines = await engine.installEngine(id)
+      broadcast()
+      return engines
+    } catch (error) {
+      engine.pushExternalLog('error', `Engine install failed: ${(error as Error).message}`)
+      broadcast()
+      throw error
+    }
+  })
+
+  ipcMain.handle('engines:remove', async (_event, id: EngineId) => {
+    try {
+      const engines = await engine.removeEngine(id)
+      broadcast()
+      return engines
+    } catch (error) {
+      engine.pushExternalLog('error', `Engine removal failed: ${(error as Error).message}`)
+      broadcast()
+      throw error
+    }
+  })
+
+  ipcMain.handle('engines:set', (_event, choice: EngineChoice) => {
+    const settings = engine.setEngine(choice)
+    broadcast()
+    return settings
+  })
+
+  ipcMain.handle('profiles:engine', (_event, profileId: string, id: EngineId | null) => {
+    const profiles = engine.setProfileEngine(profileId, id)
+    broadcast()
+    return profiles
+  })
+
+  ipcMain.handle('engine-history:clear', () => {
+    const history = engine.clearEngineHistory()
+    broadcast()
+    return history
+  })
+
+  /* ---------------------------------------------------------------- */
+  /*  Scenarios + diagnostics                                          */
+  /* ---------------------------------------------------------------- */
+
+  ipcMain.handle('scenarios:apply', async (_event, id: string) => {
+    try {
+      await engine.applyScenario(id)
+      scheduleSubscriptionUpdates()
+      broadcast()
+    } catch (error) {
+      engine.pushExternalLog('error', `Scenario failed: ${(error as Error).message}`)
+      broadcast()
+      throw error
+    }
+  })
+
+  ipcMain.handle('scenarios:save', (_event, input: Partial<Scenario>) => {
+    try {
+      const scenario = normalizeScenario(input)
+      const scenarios = engine.saveScenario(scenario)
+      broadcast()
+      return scenarios
+    } catch (error) {
+      engine.pushExternalLog('error', `Scenario save failed: ${(error as Error).message}`)
+      throw error
+    }
+  })
+
+  ipcMain.handle('scenarios:remove', (_event, id: string) => {
+    const scenarios = engine.removeScenario(id)
+    broadcast()
+    return scenarios
+  })
+
+  ipcMain.handle('diagnostics:run', async () => {
+    const result = await engine.diagnose()
+    broadcast()
+    return result
+  })
+
+  /* ---------------------------------------------------------------- */
+  /*  Backup, config export and QR import                              */
+  /* ---------------------------------------------------------------- */
+
+  ipcMain.handle('backup:export', async () => {
+    const payload: BackupPayload = {
+      format: 'eaglet-backup',
+      version: 1,
+      createdAt: Date.now(),
+      settings: store.getSettings(),
+      profiles: store.getProfiles(),
+      subscriptions: store.getSubscriptions(),
+      scenarios: store.getScenarios()
+    }
+    const result = await dialog.showSaveDialog({
+      title: 'Export Eaglet backup',
+      defaultPath: `eaglet-backup-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: 'JSON', extensions: ['json'] }]
+    })
+    if (result.canceled || !result.filePath) return null
+    writeFileSync(result.filePath, JSON.stringify(payload, null, 2), 'utf-8')
+    engine.pushExternalLog('success', `Backup exported · ${payload.profiles.length} profiles`)
+    broadcast()
+    return result.filePath
+  })
+
+  ipcMain.handle('backup:import', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Import Eaglet backup',
+      properties: ['openFile'],
+      filters: [{ name: 'JSON', extensions: ['json'] }]
+    })
+    if (result.canceled || result.filePaths.length === 0) return null
+    const raw = JSON.parse(readFileSync(result.filePaths[0], 'utf-8')) as Partial<BackupPayload>
+    if (raw.format !== 'eaglet-backup' || !raw.settings || !Array.isArray(raw.profiles)) {
+      throw new Error('That file is not an Eaglet backup')
+    }
+    store.replaceAll({
+      settings: raw.settings,
+      profiles: raw.profiles,
+      subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : [],
+      scenarios: Array.isArray(raw.scenarios) ? raw.scenarios : []
+    })
+    engine.reconcileProfiles()
+    scheduleSubscriptionUpdates()
+    engine.pushExternalLog('success', `Backup imported · ${raw.profiles.length} profiles`)
+    logProfileEvent('import', 'Configuration restored from a backup')
+    broadcast()
+    return snapshot()
+  })
+
+  ipcMain.handle('config:export', async () => {
+    const exported = engine.buildExportConfig()
+    const result = await dialog.showSaveDialog({
+      title: `Export ${exported.engine} configuration`,
+      defaultPath: `eaglet-${exported.engine}-config.${exported.extension}`,
+      filters: [{ name: exported.extension.toUpperCase(), extensions: [exported.extension] }]
+    })
+    if (result.canceled || !result.filePath) return null
+    writeFileSync(result.filePath, exported.content, 'utf-8')
+    engine.pushExternalLog('success', `${exported.engine} configuration exported`)
+    broadcast()
+    return result.filePath
+  })
+
+  ipcMain.handle('profiles:qr', async (): Promise<QrImportResult> => {
+    const result = await dialog.showOpenDialog({
+      title: 'Import a QR code from an image',
+      properties: ['openFile'],
+      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp'] }]
+    })
+    if (result.canceled || result.filePaths.length === 0) throw new Error('No image selected')
+    const text = decodeQr(result.filePaths[0])
+    const imported = await importAnything(text)
+    return { ...imported, codes: 1 }
+  })
+
   ipcMain.handle('settings:update', async (_event, patch: Partial<Settings>) => {
     const previous = store.getSettings()
     const settings = store.updateSettings(patch)
@@ -476,6 +870,13 @@ function registerIpc(): void {
       if (engine.getState().status === 'connected') {
         engine.pushExternalLog('warn', 'Routing changes apply on the next connection')
       }
+    }
+    if (patch.autoUpdateSubscriptions !== undefined || patch.subscriptionIntervalHours !== undefined) {
+      scheduleSubscriptionUpdates()
+    }
+    if (patch.tray !== undefined) {
+      if (settings.tray) ensureTray()
+      else destroyTray()
     }
     broadcast()
     return settings
@@ -509,6 +910,22 @@ app.whenReady().then(async () => {
     notifyState(state)
     broadcast()
   })
+
+  if (process.argv.includes('--eaglet-engine-test')) {
+    // Dev harness for the multi-engine batch. Electron hides stdout on Windows,
+    // so the full report is written as JSON next to the project.
+    const outFile = process.env.EAGLET_ENGINE_OUT ?? join(process.cwd(), 'engine-test.json')
+    let report: Record<string, unknown> = {}
+    try {
+      report = await runEngineTest(store, engine)
+    } catch (error) {
+      report = { error: (error as Error).message }
+    }
+    writeFileSync(outFile, JSON.stringify(report, null, 2), 'utf8')
+    await engine.shutdown()
+    app.exit(0)
+    return
+  }
 
   if (process.argv.includes('--eaglet-free-connect-test')) {
     // Dev harness: proves the whole finder → connect → exit-IP → teardown
@@ -739,6 +1156,8 @@ app.whenReady().then(async () => {
   createWindow()
   await engine.init()
   engine.reconcileProfiles()
+  if (settings.tray && !isShotMode) ensureTray()
+  scheduleSubscriptionUpdates()
 
   if (settings.autoConnect && !isShotMode) {
     setTimeout(() => void engine.connect(), 900)
@@ -750,13 +1169,16 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  // With the tray icon enabled Eaglet keeps running in the background.
+  if (process.platform !== 'darwin' && !store?.getSettings().tray) app.quit()
 })
 
 app.on('before-quit', (event) => {
   if (quitting || !engine) return
   quitting = true
   event.preventDefault()
+  if (subscriptionTimer) clearInterval(subscriptionTimer)
+  destroyTray()
   void engine.shutdown().finally(() => app.exit(0))
 })
 
@@ -836,7 +1258,7 @@ async function scheduleShots(win: BrowserWindow): Promise<void> {
       await win.webContents.executeJavaScript(`window.__eagletSetTheme && window.__eagletSetTheme('cyber')`)
       await win.webContents.executeJavaScript(`window.eaglet.connect()`)
       await wait(22000)
-      for (const page of ['home', 'servers', 'routing', 'stats', 'settings']) {
+      for (const page of ['home', 'servers', 'scenarios', 'routing', 'stats', 'settings']) {
         await win.webContents.executeJavaScript(`window.__eagletSetPage && window.__eagletSetPage('${page}')`)
         await wait(900)
         if (page === 'stats') {

@@ -5,12 +5,13 @@ import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
 import { Home } from './pages/Home'
 import { Servers } from './pages/Servers'
+import { Scenarios } from './pages/Scenarios'
 import { Routing } from './pages/Routing'
 import { Stats } from './pages/Stats'
 import { SettingsPage } from './pages/Settings'
 import { MiniView } from './pages/MiniView'
 
-export type PageId = 'home' | 'servers' | 'routing' | 'stats' | 'settings'
+export type PageId = 'home' | 'servers' | 'scenarios' | 'routing' | 'stats' | 'settings'
 
 export default function App(): React.JSX.Element {
   const [snap, setSnap] = useState<Snapshot | null>(null)
@@ -117,8 +118,10 @@ export default function App(): React.JSX.Element {
           onNavigate={setPage}
           profileCount={snap.profiles.length}
           subscriptions={snap.subscriptions.length}
-          coreVersion={state.core.version}
+          engineName={state.engines.find((engine) => engine.id === state.engine)?.name ?? state.engine}
+          engineVersion={state.engines.find((engine) => engine.id === state.engine)?.version ?? state.core.version}
           systemProxy={settings.systemProxy}
+          protection={state.killSwitchActive || state.dnsProtectionActive || settings.networkProtection}
           version={snap.version}
         />
 
@@ -134,6 +137,7 @@ export default function App(): React.JSX.Element {
           {page === 'servers' && (
             <Servers snap={snap} onConnect={connectTo} onSelect={selectProfile} onDisconnect={disconnect} />
           )}
+          {page === 'scenarios' && <Scenarios snap={snap} />}
           {page === 'routing' && <Routing snap={snap} onUpdate={updateSettings} />}
           {page === 'stats' && <Stats snap={snap} />}
           {page === 'settings' && <SettingsPage snap={snap} onUpdate={updateSettings} />}
