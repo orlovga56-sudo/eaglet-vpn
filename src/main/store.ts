@@ -1,5 +1,5 @@
 import { app } from 'electron'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type {
   EngineId,
@@ -12,6 +12,7 @@ import type {
   Settings,
   Subscription
 } from '@shared/types'
+import { profileSecretKey, SecretVault, subscriptionSecretKey } from './secret-vault'
 
 const DEFAULT_SETTINGS: Settings = {
   theme: 'cyber',
@@ -53,14 +54,24 @@ interface StoreData {
   engineHistory: EngineSwitchRecord[]
 }
 
-/** JSON-backed configuration store — no native deps, easy to inspect. */
+/**
+ * JSON-backed configuration store — no native deps, easy to inspect.
+ *
+ * Secrets (share links and subscription URLs) are never written to
+ * config.json. They live in a separate safeStorage vault and are hydrated only
+ * when a caller asks for profiles or subscriptions. Older configs are migrated
+ * on first launch: the profile entries survive, only the secret fields move.
+ */
 export class Store {
   private file: string
   private data: StoreData
+  private vault: SecretVault
 
-  constructor(file?: string) {
+  constructor(file?: string, vault?: SecretVault) {
     this.file = file ?? join(app.getPath('userData'), 'config.json')
+    this.vault = vault ?? new SecretVault(join(dirname(this.file), 'secrets.bin'))
     this.data = this.load()
+    this.migrateSecrets()
   }
 
   private empty(): StoreData {
@@ -109,12 +120,75 @@ export class Store {
     }
   }
 
+  /**
+   * Moves secrets out of a legacy config.json. A vault write failure keeps the
+   * original value in place so a later launch can retry instead of losing the
+   * profile's connection data.
+   */
+  private migrateSecrets(): void {
+    let changed = false
+    for (const profile of this.data.profiles) {
+      const secret = profile.raw?.trim()
+      if (!secret) continue
+      try {
+        this.vault.set(profileSecretKey(profile.id), secret)
+        profile.raw = ''
+        changed = true
+      } catch {
+        // Keep the raw link so the profile is still usable.
+      }
+    }
+    for (const subscription of this.data.subscriptions) {
+      const secret = subscription.url?.trim()
+      if (!secret) continue
+      try {
+        this.vault.set(subscriptionSecretKey(subscription.id), secret)
+        subscription.url = ''
+        changed = true
+      } catch {
+        // Keep the URL so the subscription can still be refreshed.
+      }
+    }
+    if (changed) this.save()
+  }
+
   private save(): void {
     try {
       mkdirSync(dirname(this.file), { recursive: true })
-      writeFileSync(this.file, JSON.stringify(this.data, null, 2), 'utf-8')
+      // Atomic replace: a crash must not truncate the configuration.
+      const temporary = `${this.file}.tmp`
+      writeFileSync(temporary, JSON.stringify(this.data, null, 2), 'utf-8')
+      renameSync(temporary, this.file)
     } catch {
       // Persisting configuration must never crash the app.
+    }
+  }
+
+  private hydrateProfile(profile: Profile): Profile {
+    const raw = this.vault.get(profileSecretKey(profile.id))
+    return raw ? { ...profile, raw } : { ...profile }
+  }
+
+  /** Copies a profile into the store, keeping its share link in the vault. */
+  private stashProfile(profile: Profile): Profile {
+    const secret = profile.raw?.trim()
+    if (!secret) return { ...profile, raw: '' }
+    try {
+      this.vault.set(profileSecretKey(profile.id), secret)
+      return { ...profile, raw: '' }
+    } catch {
+      return { ...profile }
+    }
+  }
+
+  private stashSubscription(subscription: Subscription): Subscription {
+    const secret = subscription.url?.trim()
+    if (!secret) return { ...subscription, url: '' }
+    try {
+      this.vault.set(subscriptionSecretKey(subscription.id), secret)
+      return { ...subscription, url: '' }
+    } catch {
+      return { ...subscription }
     }
   }
 
@@ -129,11 +203,12 @@ export class Store {
   }
 
   getProfiles(): Profile[] {
-    return [...this.data.profiles]
+    return this.data.profiles.map((profile) => this.hydrateProfile(profile))
   }
 
   getProfile(id: string): Profile | null {
-    return this.data.profiles.find((profile) => profile.id === id) ?? null
+    const profile = this.data.profiles.find((item) => item.id === id)
+    return profile ? this.hydrateProfile(profile) : null
   }
 
   addProfiles(incoming: Profile[]): { added: number; updated: number } {
@@ -146,15 +221,16 @@ export class Store {
         // Re-importing a subscription must not drop the user's star or engine override.
         this.data.profiles[index] = {
           ...existing,
-          ...profile,
+          ...this.stashProfile(profile),
           favorite: existing.favorite,
           engine: existing.engine,
           ping: null
         }
         updated += 1
       } else {
+        const stored = this.stashProfile(profile)
         this.data.profiles.push({
-          ...profile,
+          ...stored,
           favorite: Boolean(profile.favorite),
           engine: profile.engine ?? null,
           geo: profile.geo ?? null,
@@ -195,11 +271,14 @@ export class Store {
     if (this.data.settings.activeProfileId === id) {
       this.data.settings.activeProfileId = this.data.profiles[0]?.id ?? null
     }
+    this.vault.delete(profileSecretKey(id))
     this.save()
   }
 
   removeProfilesBySource(sourceId: string): void {
+    const removed = this.data.profiles.filter((profile) => profile.sourceId === sourceId)
     this.data.profiles = this.data.profiles.filter((profile) => profile.sourceId !== sourceId)
+    for (const profile of removed) this.vault.delete(profileSecretKey(profile.id))
     const active = this.data.settings.activeProfileId
     if (active && !this.data.profiles.some((profile) => profile.id === active)) {
       this.data.settings.activeProfileId = this.data.profiles[0]?.id ?? null
@@ -218,19 +297,24 @@ export class Store {
   }
 
   getSubscriptions(): Subscription[] {
-    return [...this.data.subscriptions]
+    return this.data.subscriptions.map((subscription) => {
+      const url = this.vault.get(subscriptionSecretKey(subscription.id))
+      return url ? { ...subscription, url } : { ...subscription }
+    })
   }
 
   upsertSubscription(subscription: Subscription): void {
     const index = this.data.subscriptions.findIndex((item) => item.id === subscription.id)
-    if (index >= 0) this.data.subscriptions[index] = subscription
-    else this.data.subscriptions.push(subscription)
+    const stored = this.stashSubscription(subscription)
+    if (index >= 0) this.data.subscriptions[index] = stored
+    else this.data.subscriptions.push(stored)
     this.data.subscriptions.sort((a, b) => b.updatedAt - a.updatedAt)
     this.save()
   }
 
   removeSubscription(id: string): void {
     this.data.subscriptions = this.data.subscriptions.filter((item) => item.id !== id)
+    this.vault.delete(subscriptionSecretKey(id))
     this.save()
   }
 
@@ -301,15 +385,28 @@ export class Store {
     subscriptions: Subscription[]
     scenarios: Scenario[]
   }): void {
+    const secrets: Record<string, string> = {}
+    const profiles = payload.profiles.map((profile) => {
+      const raw = profile.raw?.trim()
+      if (raw) secrets[profileSecretKey(profile.id)] = raw
+      return {
+        ...profile,
+        raw: '',
+        favorite: Boolean(profile.favorite),
+        engine: profile.engine ?? null,
+        geo: profile.geo ?? null,
+        quality: Array.isArray(profile.quality) ? profile.quality.slice(-QUALITY_LIMIT) : []
+      }
+    })
+    const subscriptions = payload.subscriptions.map((subscription) => {
+      const url = subscription.url?.trim()
+      if (url) secrets[subscriptionSecretKey(subscription.id)] = url
+      return { ...subscription, url: '' }
+    })
+    this.vault.replaceAll(secrets)
     this.data.settings = { ...DEFAULT_SETTINGS, ...payload.settings }
-    this.data.profiles = payload.profiles.map((profile) => ({
-      ...profile,
-      favorite: Boolean(profile.favorite),
-      engine: profile.engine ?? null,
-      geo: profile.geo ?? null,
-      quality: Array.isArray(profile.quality) ? profile.quality.slice(-QUALITY_LIMIT) : []
-    }))
-    this.data.subscriptions = payload.subscriptions
+    this.data.profiles = profiles
+    this.data.subscriptions = subscriptions
     this.data.scenarios = payload.scenarios
     this.save()
   }

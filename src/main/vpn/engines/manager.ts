@@ -1,17 +1,104 @@
 import { spawn, execFile } from 'node:child_process'
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync
+} from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { gunzipSync } from 'node:zlib'
 import { promisify } from 'node:util'
 import { app } from 'electron'
-import type { EngineChoice, EngineId, EngineState, Profile, Settings } from '@shared/types'
+import type { EngineId, EngineState, Profile, Settings } from '@shared/types'
 import { mihomoAdapter } from './mihomo-adapter'
 import { singboxAdapter } from './singbox-adapter'
 import { xrayAdapter } from './xray-adapter'
 import type { EngineAdapter, EngineBuildInput } from './types'
 
 const execFileAsync = promisify(execFile)
+
+/** Pinned digest of wintun-0.14.1.zip from wintun.net. */
+const WINTUN_SHA256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+
+function sha256OfFile(file: string): string {
+  return createHash('sha256').update(readFileSync(file)).digest('hex')
+}
+
+/**
+ * Extracts a SHA-256 digest from a release checksum file. Supports the
+ * `sha256sum` format, `name hash` pairs and Xray's `SHA2-256= <hash>` files.
+ */
+export function parseChecksumDigest(text: string, assetName: string): string | null {
+  for (const line of text.split(/\r?\n/)) {
+    const clean = line.trim()
+    if (!clean) continue
+    const labelled = clean.match(/(?:SHA2-256|SHA-256|SHA256)\s*[=:]\s*([a-f0-9]{64})/i)
+    if (labelled) return labelled[1].toLowerCase()
+    const sums = clean.match(/^([a-f0-9]{64})\s+\*?(.+)$/i)
+    if (sums) {
+      const name = sums[2].trim().replace(/^\.\//, '')
+      if (name === assetName || name.endsWith(`/${assetName}`)) return sums[1].toLowerCase()
+      continue
+    }
+    const named = clean.match(/^(\S+)\s+([a-f0-9]{64})$/i)
+    if (named && named[1].replace(/^\.\//, '') === assetName) return named[2].toLowerCase()
+  }
+  return null
+}
+
+/** Unsigned builds are acceptable; a present but invalid signature is not. */
+export function signatureStatusAllowed(status: string): boolean {
+  return status === 'Valid' || status === 'NotSigned'
+}
+
+function psQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
+}
+
+async function verifyWindowsSignature(file: string, label: string): Promise<void> {
+  if (process.platform !== 'win32') return
+  const script = `$s = Get-AuthenticodeSignature -LiteralPath ${psQuote(file)}; if ($null -eq $s) { 'UnknownError|' } else { "$($s.Status)|$($s.SignerCertificate.Subject)" }`
+  let status = 'UnknownError'
+  try {
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { timeout: 20000, windowsHide: true }
+    )
+    status = stdout.trim().split('|')[0] || 'UnknownError'
+  } catch (error) {
+    throw new Error(`Could not verify the Authenticode signature of ${label}: ${(error as Error).message}`)
+  }
+  if (!signatureStatusAllowed(status)) {
+    throw new Error(`${label} failed Authenticode verification (${status})`)
+  }
+}
+
+interface ReleaseAsset {
+  name: string
+  browser_download_url: string
+  digest?: string | null
+}
+
+interface LatestRelease {
+  version: string | null
+  url: string | null
+  assetName: string | null
+  /** Lower-case hex digest published by the GitHub API, when present. */
+  digest: string | null
+  checksumUrl: string | null
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
 interface EngineEntry {
   adapter: EngineAdapter
@@ -39,10 +126,6 @@ function binaryCandidates(adapter: EngineAdapter): string[] {
   ]
 }
 
-function userDataBinary(adapter: EngineAdapter): string {
-  return join(app.getPath('userData'), 'bin', adapter.binaryName(process.platform))
-}
-
 function resourceBinary(adapter: EngineAdapter): string | null {
   const candidates = binaryCandidates(adapter)
   return candidates.find((candidate) => existsSync(candidate)) ?? null
@@ -65,7 +148,7 @@ function walk(dir: string): string[] {
  */
 export class EngineManager {
   private entries = new Map<EngineId, EngineEntry>()
-  private latestCache = new Map<EngineId, { at: number; version: string | null; url: string | null }>()
+  private latestCache = new Map<EngineId, { at: number } & LatestRelease>()
 
   constructor() {
     for (const adapter of [singboxAdapter, xrayAdapter, mihomoAdapter]) {
@@ -235,6 +318,10 @@ export class EngineManager {
     pipe(child.stderr, 'warn')
 
     let stopped = false
+    const exited = new Promise<void>((resolve) => {
+      if (child.exitCode !== null) resolve()
+      else child.once('exit', () => resolve())
+    })
     child.once('exit', (code) => {
       if (!stopped) onExit(code)
     })
@@ -247,7 +334,10 @@ export class EngineManager {
       stop: async () => {
         stopped = true
         const pid = child.pid
-        if (!pid) return
+        if (!pid || child.exitCode !== null) {
+          await exited
+          return
+        }
         if (process.platform === 'win32') {
           try {
             await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true })
@@ -262,6 +352,17 @@ export class EngineManager {
           }
           child.kill('SIGTERM')
         }
+        // Wait for the OS to release the process (and, in TUN mode, wintun)
+        // before a replacement core is started.
+        await Promise.race([exited, delay(5000)])
+        if (child.exitCode === null) {
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            // Already gone.
+          }
+          await Promise.race([exited, delay(3000)])
+        }
       }
     }
   }
@@ -270,13 +371,10 @@ export class EngineManager {
   /*  Installation                                                      */
   /* ------------------------------------------------------------------ */
 
-  private async latestRelease(adapter: EngineAdapter): Promise<{
-    version: string | null
-    url: string | null
-  }> {
+  private async latestRelease(adapter: EngineAdapter): Promise<LatestRelease> {
     const cached = this.latestCache.get(adapter.id)
     if (cached && Date.now() - cached.at < 10 * 60 * 1000) {
-      return { version: cached.version, url: cached.url }
+      return cached
     }
     const response = await fetch(`https://api.github.com/repos/${adapter.releaseRepo}/releases/latest`, {
       headers: { 'User-Agent': 'Eaglet-VPN' },
@@ -285,7 +383,7 @@ export class EngineManager {
     if (!response.ok) throw new Error(`GitHub release lookup failed (${response.status})`)
     const release = (await response.json()) as {
       tag_name?: string
-      assets?: Array<{ name: string; browser_download_url: string }>
+      assets?: ReleaseAsset[]
     }
     const version = (release.tag_name ?? '').replace(/^v/, '') || null
     const pattern = adapter.assetPattern(process.platform, process.arch)
@@ -296,8 +394,42 @@ export class EngineManager {
       assets[0] ??
       null
     const url = asset?.browser_download_url ?? null
-    this.latestCache.set(adapter.id, { at: Date.now(), version, url })
-    return { version, url }
+    const digest =
+      asset?.digest && /^sha256:[a-f0-9]{64}$/i.test(asset.digest)
+        ? asset.digest.slice('sha256:'.length).toLowerCase()
+        : null
+    const checksumAsset = asset
+      ? (release.assets ?? []).find((candidate) => candidate.name === `${asset.name}.dgst`) ??
+        (release.assets ?? []).find(
+          (candidate) =>
+            /checksums?|sha256sums?|sha256/i.test(candidate.name) &&
+            /\.(txt|sum|sha256|dgst)$/i.test(candidate.name)
+        ) ??
+        null
+      : null
+    const result: LatestRelease = {
+      version,
+      url,
+      assetName: asset?.name ?? null,
+      digest,
+      checksumUrl: checksumAsset?.browser_download_url ?? null
+    }
+    this.latestCache.set(adapter.id, { at: Date.now(), ...result })
+    return result
+  }
+
+  private async fetchChecksum(release: LatestRelease): Promise<string | null> {
+    if (!release.checksumUrl || !release.assetName) return null
+    try {
+      const response = await fetch(release.checksumUrl, {
+        headers: { 'User-Agent': 'Eaglet-VPN' },
+        signal: AbortSignal.timeout(15000)
+      })
+      if (!response.ok) return null
+      return parseChecksumDigest(await response.text(), release.assetName)
+    } catch {
+      return null
+    }
   }
 
   async install(id: EngineId, log: (message: string) => void): Promise<string> {
@@ -341,6 +473,21 @@ export class EngineManager {
       void pump()
     })
 
+    // Verify before anything from the archive is executed or copied.
+    const expected = release.digest ?? (await this.fetchChecksum(release))
+    if (!expected) {
+      rmSync(archive, { force: true })
+      throw new Error(`No SHA-256 checksum was published for ${adapter.name}; refusing to install an unverified core`)
+    }
+    const actual = sha256OfFile(archive)
+    if (actual !== expected.toLowerCase()) {
+      rmSync(archive, { force: true })
+      throw new Error(
+        `${adapter.name} failed SHA-256 verification (expected ${expected.toLowerCase()}, got ${actual})`
+      )
+    }
+    log(`${adapter.name} archive verified · SHA-256 ${actual.slice(0, 16)}…`)
+
     const destination = join(app.getPath('userData'), 'bin')
     mkdirSync(destination, { recursive: true })
     const binaryName = adapter.binaryName(process.platform)
@@ -348,7 +495,16 @@ export class EngineManager {
     if (extension === '.gz') {
       // Single-file gzip build (Mihomo Linux).
       const target = join(destination, binaryName)
-      writeFileSync(target, gunzipSync(readFileSync(archive)))
+      const staged = join(destination, `${binaryName}.download`)
+      writeFileSync(staged, gunzipSync(readFileSync(archive)))
+      try {
+        await verifyWindowsSignature(staged, adapter.name)
+      } catch (error) {
+        rmSync(staged, { force: true })
+        rmSync(archive, { force: true })
+        throw error
+      }
+      renameSync(staged, target)
     } else {
       const extracted = join(tmpdir(), `eaglet-${adapter.id}-${Date.now()}`)
       mkdirSync(extracted, { recursive: true })
@@ -361,12 +517,6 @@ export class EngineManager {
           await execFileAsync('tar', ['-xf', archive, '-C', extracted], { windowsHide: true })
         }
         const files = walk(extracted)
-        for (const file of files) {
-          const name = basename(file)
-          if (name.endsWith('.dll') || name.endsWith('.dat') || name.endsWith('.metadb')) {
-            writeFileSync(join(destination, name), readFileSync(file))
-          }
-        }
         // Release archives do not always name the payload after the binary:
         // Mihomo ships `mihomo-windows-amd64-v1-go120.exe`, for example.
         const executable = process.platform === 'win32' ? /\.exe$/i : /^(?!.*\.(md|txt|json|yaml|yml|dat|dll)$).+$/i
@@ -375,7 +525,15 @@ export class EngineManager {
           candidates.find((file) => basename(file) === binaryName) ??
           candidates.find((file) => basename(file).toLowerCase().startsWith(adapter.id)) ??
           candidates.sort((left, right) => statSync(right).size - statSync(left).size)[0]
-        if (core) writeFileSync(join(destination, binaryName), readFileSync(core))
+        if (!core) throw new Error(`${adapter.name} archive did not contain an executable`)
+        await verifyWindowsSignature(core, adapter.name)
+        for (const file of files) {
+          const name = basename(file)
+          if (name.endsWith('.dll') || name.endsWith('.dat') || name.endsWith('.metadb')) {
+            writeFileSync(join(destination, name), readFileSync(file))
+          }
+        }
+        writeFileSync(join(destination, binaryName), readFileSync(core))
       } finally {
         rmSync(extracted, { recursive: true, force: true })
       }
@@ -413,6 +571,11 @@ export class EngineManager {
       })
       if (!response.ok) throw new Error(`wintun.dll download failed (${response.status})`)
       writeFileSync(archive, Buffer.from(await response.arrayBuffer()))
+      const actual = sha256OfFile(archive)
+      if (actual !== WINTUN_SHA256) {
+        rmSync(archive, { force: true })
+        throw new Error(`wintun.dll archive failed integrity verification (SHA-256 ${actual})`)
+      }
       const extracted = join(tmpdir(), `eaglet-wintun-${Date.now()}`)
       mkdirSync(extracted, { recursive: true })
       try {

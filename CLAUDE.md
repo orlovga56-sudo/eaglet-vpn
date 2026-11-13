@@ -60,9 +60,11 @@ resources/bin/         sing-box.exe + libcronet.dll (git-ignored, npm run core)
 scripts/fetch-core.mjs downloads the bundled sing-box core
 src/
   shared/types.ts      single source of truth for the IPC contract
+  shared/validation.ts IPC payload validators and settings/scenario sanitisers
   main/
     index.ts           window, IPC handlers, tray, subscriptions, QR/backup, shots
     store.ts           JSON settings/profiles/subscriptions/scenarios/sessions
+    secret-vault.ts    safeStorage-encrypted vault for share links/subscription URLs
     vpn/
       engine.ts        state machine, connect/teardown, telemetry, protection,
                        diagnostics, scenarios, engine comparison
@@ -75,7 +77,7 @@ src/
         mihomo-adapter.ts
       firewall/        Windows Firewall, macOS pf, Linux iptables kill switch
       system-proxy/    WinINET, networksetup, GSettings backends
-      dns-guard.ts     local DoH relay + system resolver backup/restore
+      dns-guard.ts     dual-stack DoH relay + IPv4/IPv6 resolver backup/restore
       scenarios.ts     built-in Gaming/Performance/Privacy/Manual presets
       profiles.ts      share-link + base64 subscription parser
       free-sources.ts  public catalogs, TCP probe, live node verification
@@ -165,6 +167,13 @@ Key rules:
   `resources/bin` is only the bundled sing-box fallback. Archives whose payload
   name differs from the binary name (Mihomo) are matched by executable content,
   not by a fixed filename.
+- Before anything is executed or copied, the downloaded archive must match the
+  release’s GitHub `digest` (falling back to a published checksum file). Windows
+  binaries are additionally checked with `Get-AuthenticodeSignature`; unsigned
+  builds are accepted, an invalid or tampered signature aborts the install.
+  `wintun-0.14.1.zip` is matched against a pinned SHA-256.
+- `stop()` waits for the process (and its children) to exit before resolving, so
+  a replacement core can bind the TUN adapter without a conflict.
 - Mihomo config uses explicit private CIDRs and
   `fallback-filter.geoip: false` so validation never downloads a GeoIP database.
 
@@ -175,13 +184,17 @@ Key rules:
 - `connect(profileId?, automatic?)` — probe direct IP → prepare/install core →
   optional TUN staging → build + validate native config → spawn → wait for the
   mixed port → verify exit IP → apply system proxy → arm protection → connected.
+- `applyProtection()` — real kill switch via `firewall/` and real DoH relay via
+  `dns-guard.ts`. Both need elevation; failures are logged, never hidden.
+- `setEngine(choice)` — if the tunnel is live, it disconnects, forces the new
+  engine, reconnects and verifies the chosen core actually runs; on failure it
+  disconnects again, reconnects with the previous engine and restores the
+  setting. A direct profile never gets a kill switch.
 - `disconnect()` / `shutdown()` — one final telemetry sample, stop telemetry,
   kill the process tree, restore proxy, remove kill switch/DNS guard, persist the
   session, emit a disconnected snapshot.
 - `onCoreExit()` — keeps protection armed during a crash, records the session and
   calls `scheduleReconnect()` (three attempts, 2.5 s × n).
-- `applyProtection()` — real kill switch via `firewall/` and real DoH relay via
-  `dns-guard.ts`. Both need elevation; failures are logged, never hidden.
 - `diagnose()` — returns real checks (binary, version, config, proxy, TUN, kill
   switch, DNS, resolution, exit IP, latency, loss, subscriptions, updates,
   platform support).
@@ -210,9 +223,20 @@ Key rules:
 | Layer | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | System proxy | WinINET registry | `networksetup` | GSettings (GNOME) |
-| Kill switch | Firewall default outbound Block + allow rules | `pf` anchor | dedicated `iptables` chain |
-| DNS protection | Local DoH relay on `127.0.0.1:53`, resolver backup/restore | same | same |
+| Kill switch | Firewall default outbound Block + scoped allow rules | `pf` anchor | dedicated `iptables` + `ip6tables` chains |
+| DNS protection | Dual-stack DoH relay on `127.0.0.1:53`/`::1:53`, IPv4+IPv6 resolver backup/restore | same | same |
 | TUN | `wintun.dll` + elevated core | — | — |
+
+Kill-switch rules allow only loopback, DHCP, link-local, the node address and
+port, the pinned DoH resolver/port and the resolvers captured before the tunnel
+started. IPv6 has its own policy and is dropped even for an IPv4-only node. There
+is intentionally no `conntrack`/`ESTABLISHED` shortcut and no “any DNS” rule.
+
+Secrets (share links, subscription URLs) live in `userData/secrets.bin`, written
+atomically and encrypted with Electron `safeStorage`. `config.json` keeps empty
+secret fields; `Store` migrates older configs on launch and hydrates secrets on
+read. The DoH endpoint is resolved before the system resolver is redirected and
+then queried over HTTPS against the pinned IP with the original SNI/Host.
 
 Support is deliberately asymmetric: only Windows is in the verified matrix;
 macOS/Linux backends exist but are marked **experimental**. Never claim a
@@ -236,12 +260,23 @@ defines `EagletApi`). Highlights:
 - data: `exportBackup`, `importBackup`, `exportConfig`
 - settings/window: `updateSettings`, `setMini`, minimize/close/maximize
 
-Do not add `nodeIntegration`; the renderer must stay sandboxed behind preload.
+Do not add `nodeIntegration`; the renderer must stay sandboxed behind preload
+(`sandbox: true`, `contextIsolation: true`, `webviewTag: false`). Navigation and
+`window.open` are denied, external links are limited to `http(s)`, and every IPC
+handler checks that the sender is the main window’s main frame before it runs.
+Payloads are validated in `src/shared/validation.ts` (ids, settings patch,
+scenario input, arrays), unknown settings keys are rejected, and the production
+HTML plus every session response carry a strict CSP. Treat renderer input as
+untrusted even though it is local.
 
 ## Dev harnesses
 
 All harnesses write JSON because Electron’s stdout is invisible on Windows.
 
+- `npm test` (Vitest) — unit tests for firewall rule generation, checksum and
+  Authenticode policy, engine selection, DoH target pinning and secret
+  vault/migration. `electron` is aliased to `test/electron-stub.ts`, so no GUI
+  starts.
 - `electron . --eaglet-engine-test` (`vpn/engine-test.ts`) — installs all three
   cores, validates standard/hardened configs, opens a real tunnel with each
   engine, kills each core to prove auto-reconnect, checks per-profile/global/auto
@@ -256,7 +291,7 @@ All harnesses write JSON because Electron’s stdout is invisible on Windows.
 
 ## Testing checklist
 
-1. `npm run typecheck && npm run build`.
+1. `npm run typecheck && npm run lint && npm test && npm run build`.
 2. Run `electron . --eaglet-engine-test` (elevated when testing kill
    switch/DNS/TUN). All three engines must install, validate, connect, show live
    counters, reconnect after `taskkill`, and restore the proxy.

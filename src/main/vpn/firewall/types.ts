@@ -1,12 +1,24 @@
 import type { Profile } from '@shared/types'
 
+/**
+ * Everything the OS firewall needs to let the tunnel work without opening a
+ * general-purpose hole. Every exception is scoped to an address, a port and
+ * (where the platform supports it) a program.
+ */
 export interface KillSwitchContext {
-  /** IPs the tunnel must be able to reach while the policy is active. */
+  /** IPv4/IPv6 addresses of the selected node. */
   serverIps: string[]
-  /** Core executable that is allowed to reach the network. */
+  /** TCP/UDP ports the node listens on. */
+  serverPorts: number[]
+  /** Core executable that is allowed to dial the node. */
   corePath: string | null
-  /** Eaglet itself reconnects and refreshes subscriptions. */
+  /** Eaglet itself reconnects, refreshes subscriptions and relays DoH. */
   appPath: string
+  /** DoH resolvers the DNS relay must be able to reach. */
+  dohIps: string[]
+  dohPorts: number[]
+  /** Resolvers the core may use while DNS protection is still warming up. */
+  dnsServers: string[]
 }
 
 export interface KillSwitchBackend {
@@ -16,15 +28,30 @@ export interface KillSwitchBackend {
   recover(): void
 }
 
-export async function resolveServerIps(profile: Profile | null): Promise<string[]> {
-  if (!profile || profile.protocol === 'direct' || !profile.host) return []
+export interface ResolvedEndpoint {
+  ips: string[]
+  ports: number[]
+}
+
+/** Resolves a hostname to every address family so IPv6 is never forgotten. */
+export async function resolveHostIps(host: string): Promise<string[]> {
   const { isIP } = await import('node:net')
-  if (isIP(profile.host)) return [profile.host]
+  const clean = host.replace(/^\[|\]$/g, '')
+  if (!clean) return []
+  if (isIP(clean)) return [clean]
   try {
     const { lookup } = await import('node:dns/promises')
-    const results = await lookup(profile.host, { all: true, verbatim: true })
+    const results = await lookup(clean, { all: true, verbatim: true })
     return [...new Set(results.map((item) => item.address))]
   } catch {
     return []
+  }
+}
+
+export async function resolveServer(profile: Profile | null): Promise<ResolvedEndpoint> {
+  if (!profile || profile.protocol === 'direct' || !profile.host) return { ips: [], ports: [] }
+  return {
+    ips: await resolveHostIps(profile.host),
+    ports: profile.port > 0 && profile.port <= 65535 ? [profile.port] : []
   }
 }

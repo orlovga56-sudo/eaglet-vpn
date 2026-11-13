@@ -44,7 +44,7 @@ export interface EngineAdapter {
 }
 
 export function parseSemver(output: string): string | null {
-  const match = output.match(/(\d+\.\d+\.\d+(?:[-+][\w.\-]+)?)/)
+  const match = output.match(/(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)/)
   return match?.[1] ?? null
 }
 

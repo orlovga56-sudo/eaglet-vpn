@@ -53,13 +53,78 @@ function restoreScript(backup: PolicyBackup): string {
 }
 
 /**
- * Windows kill switch.
+ * Builds the Windows rule set used by the kill switch.
  *
  * Windows evaluates explicit block rules before allow rules, so "block all"
- * plus exceptions does not work. Instead we flip the default outbound action to
- * Block and add allow rules for loopback, the core, Eaglet and the node IPs.
- * The previous per-profile policy is backed up and restored on disconnect.
- * Requires an elevated Eaglet process; failures are surfaced to the UI.
+ * plus exceptions does not work. The default outbound action is flipped to
+ * Block and only these scoped rules remain:
+ *  - loopback (local proxy, DoH relay),
+ *  - the core executable → the selected node IPs and ports,
+ *  - Eaglet → DoH endpoints, subscription endpoints (80/443) and DNS,
+ *  - the core → the current DNS servers on port 53 while protection warms up,
+ *  - DHCP so the interface keeps its lease.
+ * No rule allows arbitrary programs, and the node rule is bound to the core
+ * executable and the node port, so ordinary traffic cannot leave around the
+ * tunnel by dialing the node directly.
+ */
+export function windowsKillSwitchScript(context: KillSwitchContext): string {
+  const lines: string[] = []
+  const allow = (name: string, parameters: string): void => {
+    lines.push(
+      `New-NetFirewallRule -DisplayName '${RULE_PREFIX} · ${name}' -Direction Outbound -Action Allow ${parameters} -ErrorAction Stop | Out-Null;`
+    )
+  }
+  const ips = (values: string[]): string => values.map(psQuote).join(',')
+  const ports = (values: number[]): string => values.join(',')
+
+  allow('loopback', `-RemoteAddress '127.0.0.0/8','::1'`)
+
+  const serverIps = context.serverIps.filter(Boolean)
+  const serverPorts = context.serverPorts.filter((port) => Number.isInteger(port) && port > 0 && port <= 65535)
+  if (context.corePath && serverIps.length > 0 && serverPorts.length > 0) {
+    for (const protocol of ['TCP', 'UDP']) {
+      allow(
+        `core ${protocol}`,
+        `-Program ${psQuote(context.corePath)} -RemoteAddress ${ips(serverIps)} -RemotePort ${ports(serverPorts)} -Protocol ${protocol}`
+      )
+    }
+  }
+
+  const dohPorts = context.dohPorts.filter((port) => Number.isInteger(port) && port > 0 && port <= 65535)
+  if (context.dohIps.length > 0 && dohPorts.length > 0) {
+    for (const port of [...new Set(dohPorts)]) {
+      allow(
+        `DoH ${port}`,
+        `-Program ${psQuote(context.appPath)} -RemoteAddress ${ips(context.dohIps)} -RemotePort ${port} -Protocol TCP`
+      )
+    }
+  }
+
+  const dnsServers = context.dnsServers.filter(Boolean)
+  if (dnsServers.length > 0) {
+    // DNS stays usable for every program but only towards the resolvers that
+    // were configured before the tunnel started. That is a narrow, auditable
+    // exception instead of the old "any address, port 53" hole.
+    for (const protocol of ['TCP', 'UDP']) {
+      allow(
+        `DNS ${protocol}`,
+        `-RemoteAddress ${ips(dnsServers)} -RemotePort 53 -Protocol ${protocol}`
+      )
+    }
+  }
+
+  // Subscriptions, update checks and the DoH relay live in the Electron app.
+  allow('app web', `-Program ${psQuote(context.appPath)} -Protocol TCP -RemotePort 80,443`)
+  allow('DHCP', `-Protocol UDP -LocalPort 68 -RemotePort 67`)
+
+  lines.push('Set-NetFirewallProfile -All -DefaultOutboundAction Block -ErrorAction Stop')
+  return lines.join('\n')
+}
+
+/**
+ * Windows kill switch. The previous per-profile policy is backed up and
+ * restored on disconnect. Requires an elevated Eaglet process; failures are
+ * surfaced to the UI and never leave a half-applied policy behind.
  */
 export const windowsKillSwitch: KillSwitchBackend = {
   async enable(context: KillSwitchContext): Promise<void> {
@@ -77,13 +142,7 @@ export const windowsKillSwitch: KillSwitchBackend = {
 
     await removeRules()
     try {
-      await runPowerShell(`
-New-NetFirewallRule -DisplayName '${RULE_PREFIX} · loopback' -Direction Outbound -Action Allow -RemoteAddress '127.0.0.0/8','::1' -ErrorAction Stop | Out-Null;
-${context.corePath ? `New-NetFirewallRule -DisplayName '${RULE_PREFIX} · core' -Direction Outbound -Action Allow -Program ${psQuote(context.corePath)} -ErrorAction Stop | Out-Null;` : ''}
-New-NetFirewallRule -DisplayName '${RULE_PREFIX} · app' -Direction Outbound -Action Allow -Program ${psQuote(context.appPath)} -ErrorAction Stop | Out-Null;
-${context.serverIps.length > 0 ? `New-NetFirewallRule -DisplayName '${RULE_PREFIX} · nodes' -Direction Outbound -Action Allow -RemoteAddress ${context.serverIps.map(psQuote).join(',')} -ErrorAction Stop | Out-Null;` : ''}
-Set-NetFirewallProfile -All -DefaultOutboundAction Block -ErrorAction Stop
-`)
+      await runPowerShell(windowsKillSwitchScript(context))
     } catch (error) {
       // Never leave a half-applied policy behind.
       await removeRules().catch(() => undefined)

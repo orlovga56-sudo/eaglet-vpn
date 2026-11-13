@@ -1,6 +1,6 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, session, shell, Tray } from 'electron'
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import jsQR from 'jsqr'
@@ -10,6 +10,16 @@ import { runEngineTest } from './vpn/engine-test'
 import { isHttpUrl, parseProfileUri, parseProfilesPayload, subscriptionName } from './vpn/profiles'
 import { discoverFreeProfiles } from './vpn/free-sources'
 import { normalizeScenario } from './vpn/scenarios'
+import {
+  requireBoolean,
+  requireEngineChoice,
+  requireEngineId,
+  requireId,
+  requireString,
+  requireStringArray,
+  sanitizeScenarioInput,
+  sanitizeSettingsPatch
+} from '@shared/validation'
 import type {
   BackupPayload,
   EngineChoice,
@@ -72,6 +82,28 @@ function appIcon(): Electron.NativeImage {
   return existsSync(path) ? nativeImage.createFromPath(path) : nativeImage.createEmpty()
 }
 
+/** Only web links may leave the app; `file:`, `javascript:` and shell schemes are rejected. */
+function openExternalSafe(url: string): void {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return
+    void shell.openExternal(parsed.toString())
+  } catch {
+    // Not a URL — ignore.
+  }
+}
+
+function assertTrustedSender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent): void {
+  const contents = mainWindow?.webContents
+  if (!contents || event.sender !== contents) {
+    throw new Error('Blocked IPC from an untrusted sender')
+  }
+  const frame = event.senderFrame
+  if (frame && frame !== contents.mainFrame) {
+    throw new Error('Blocked IPC from a sub-frame')
+  }
+}
+
 function createWindow(): void {
   const icon = appIcon()
   mainWindow = new BrowserWindow({
@@ -86,9 +118,10 @@ function createWindow(): void {
     ...(icon.isEmpty() ? {} : { icon }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      webviewTag: false,
       backgroundThrottling: false
     }
   })
@@ -113,9 +146,14 @@ function createWindow(): void {
   })
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url)
+    openExternalSafe(url)
     return { action: 'deny' }
   })
+
+  // The renderer is a single local document. Any navigation away from it is
+  // either an injection attempt or a link that must open in the browser.
+  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault())
+  mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault())
 
   if (isDev && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
@@ -155,6 +193,35 @@ function applyLoginItem(enabled: boolean): void {
     // Unsupported on some platforms — ignore.
   }
 }
+
+/** Hardens every Chromium session the app creates. */
+function installSessionGuards(): void {
+  const csp = isDev
+    ? "default-src 'self' 'unsafe-inline' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss: http: https:; object-src 'none'; base-uri 'none'; form-action 'none'"
+    : "default-src 'self' file:; script-src 'self' file:; style-src 'self' 'unsafe-inline' file:; img-src 'self' data: blob: file:; font-src 'self' data: file:; connect-src 'self' file:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [csp],
+        'X-Content-Type-Options': ['nosniff']
+      }
+    })
+  })
+  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
+  session.defaultSession.setPermissionCheckHandler(() => false)
+}
+
+// Defence in depth: any web contents created later (including devtools helpers
+// or a future secondary window) inherits the same navigation policy.
+app.on('web-contents-created', (_event, contents) => {
+  contents.setWindowOpenHandler(({ url }) => {
+    openExternalSafe(url)
+    return { action: 'deny' }
+  })
+  contents.on('will-navigate', (event) => event.preventDefault())
+  contents.on('will-attach-webview', (event) => event.preventDefault())
+})
 
 /* ------------------------------------------------------------------ */
 /*  Subscription helpers                                              */
@@ -501,14 +568,33 @@ function notifyState(state: VpnState): void {
 /* ------------------------------------------------------------------ */
 
 function registerIpc(): void {
-  ipcMain.handle('app:snapshot', () => snapshot())
+  const handleIpc = (
+    channel: string,
+    listener: (event: Electron.IpcMainInvokeEvent, ...args: never[]) => unknown
+  ): void => {
+    ipcMain.handle(channel, (event, ...args) => {
+      assertTrustedSender(event)
+      return listener(event, ...(args as never[]))
+    })
+  }
+  const onIpc = (
+    channel: string,
+    listener: (event: Electron.IpcMainEvent, ...args: never[]) => void
+  ): void => {
+    ipcMain.on(channel, (event, ...args) => {
+      assertTrustedSender(event)
+      listener(event, ...(args as never[]))
+    })
+  }
+  handleIpc('app:snapshot', () => snapshot())
 
-  ipcMain.handle('vpn:connect', async (_event, id?: string) => {
-    await engine.connect(id)
+  handleIpc('vpn:connect', async (_event, id?: string) => {
+    const profileId = id === undefined || id === null ? undefined : requireId(id, 'profileId')
+    await engine.connect(profileId)
     broadcast()
   })
 
-  ipcMain.handle('vpn:quick-connect', async () => {
+  handleIpc('vpn:quick-connect', async () => {
     if (engine.getState().status === 'connected' || engine.getState().status === 'connecting') {
       throw new Error('Disconnect before picking a new fastest node')
     }
@@ -528,26 +614,28 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('vpn:disconnect', async () => {
+  handleIpc('vpn:disconnect', async () => {
     await engine.disconnect()
     broadcast()
   })
 
-  ipcMain.handle('vpn:select-profile', (_event, id: string) => {
-    engine.selectProfile(id)
+  handleIpc('vpn:select-profile', (_event, id: string) => {
+    engine.selectProfile(requireId(id, 'profileId'))
     broadcast()
   })
 
-  ipcMain.handle('profiles:favorite', (_event, id: string, favorite: boolean) => {
-    store.setFavorite(id, favorite)
-    engine.pushExternalLog('info', favorite ? 'Pinned node to favourites' : 'Removed node from favourites')
+  handleIpc('profiles:favorite', (_event, id: string, favorite: boolean) => {
+    const profileId = requireId(id, 'profileId')
+    const pinned = requireBoolean(favorite, 'favorite')
+    store.setFavorite(profileId, pinned)
+    engine.pushExternalLog('info', pinned ? 'Pinned node to favourites' : 'Removed node from favourites')
     broadcast()
     return store.getProfiles()
   })
 
-  ipcMain.handle('profiles:import', async (_event, text: string) => {
+  handleIpc('profiles:import', async (_event, text: string) => {
     try {
-      return await importAnything(text)
+      return await importAnything(requireString(text, 'input', 5_000_000))
     } catch (error) {
       engine.pushExternalLog('error', (error as Error).message)
       broadcast()
@@ -555,7 +643,7 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('free:discover', async () => {
+  handleIpc('free:discover', async () => {
     engine.pushExternalLog('info', 'Searching public free-node catalogs…')
     try {
       let corePath: string | null = null
@@ -585,9 +673,9 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('free:add', (_event, links: string[]) => {
+  handleIpc('free:add', (_event, links: string[]) => {
     try {
-      return addFreeProfiles(links)
+      return addFreeProfiles(requireStringArray(links, 'links', 200, 8192))
     } catch (error) {
       engine.pushExternalLog('error', (error as Error).message)
       broadcast()
@@ -595,9 +683,9 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('subscriptions:update', async (_event, id: string) => {
+  handleIpc('subscriptions:update', async (_event, id: string) => {
     try {
-      return await updateSubscriptionById(id)
+      return await updateSubscriptionById(requireId(id, 'subscriptionId'))
     } catch (error) {
       engine.pushExternalLog('error', `Subscription refresh failed: ${(error as Error).message}`)
       broadcast()
@@ -605,7 +693,7 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('subscriptions:update-all', async () => {
+  handleIpc('subscriptions:update-all', async () => {
     try {
       return await updateAllSubscriptions(false)
     } catch (error) {
@@ -614,37 +702,43 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('subscriptions:remove', (_event, id: string) => {
-    const subscription = store.getSubscriptions().find((item) => item.id === id)
-    store.removeProfilesBySource(id)
-    store.removeSubscription(id)
+  handleIpc('subscriptions:remove', (_event, id: string) => {
+    const subscriptionId = requireId(id, 'subscriptionId')
+    const subscription = store.getSubscriptions().find((item) => item.id === subscriptionId)
+    store.removeProfilesBySource(subscriptionId)
+    store.removeSubscription(subscriptionId)
     engine.reconcileProfiles()
     engine.pushExternalLog('info', 'Subscription removed')
-    logProfileEvent('remove', `Subscription ${subscription?.name ?? id} removed`)
+    logProfileEvent('remove', `Subscription ${subscription?.name ?? subscriptionId} removed`)
     broadcast()
   })
 
-  ipcMain.handle('profiles:remove', (_event, id: string) => {
-    const profile = store.getProfile(id)
-    store.removeProfile(id)
+  handleIpc('profiles:remove', (_event, id: string) => {
+    const profileId = requireId(id, 'profileId')
+    const profile = store.getProfile(profileId)
+    store.removeProfile(profileId)
     engine.reconcileProfiles()
     engine.pushExternalLog('info', 'Node removed')
-    logProfileEvent('remove', `Node ${profile?.name ?? id} removed`)
+    logProfileEvent('remove', `Node ${profile?.name ?? profileId} removed`)
     broadcast()
   })
 
-  ipcMain.handle('profiles:test', async (_event, ids?: string[]) => {
-    const profiles = await engine.testProfiles(ids)
+  handleIpc('profiles:test', async (_event, ids?: string[]) => {
+    const profileIds =
+      ids === undefined || ids === null
+        ? undefined
+        : requireStringArray(ids, 'ids', 500, 128).map((id) => requireId(id, 'ids'))
+    const profiles = await engine.testProfiles(profileIds)
     broadcast()
     return profiles
   })
 
-  ipcMain.handle('ip:check', async () => {
+  handleIpc('ip:check', async () => {
     await engine.checkIp()
     broadcast()
   })
 
-  ipcMain.handle('speed:test', async () => {
+  handleIpc('speed:test', async () => {
     try {
       const result = await engine.runSpeedTest()
       broadcast()
@@ -656,20 +750,20 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('sessions:clear', () => {
+  handleIpc('sessions:clear', () => {
     store.clearSessions()
     engine.pushExternalLog('info', 'Session history cleared')
     broadcast()
     return store.getSessions()
   })
 
-  ipcMain.handle('clipboard:write', (_event, text: string) => {
-    clipboard.writeText(String(text ?? ''))
+  handleIpc('clipboard:write', (_event, text: string) => {
+    clipboard.writeText(requireString(text, 'text', 1_000_000))
   })
 
-  ipcMain.handle('clipboard:read', () => clipboard.readText())
+  handleIpc('clipboard:read', () => clipboard.readText())
 
-  ipcMain.handle('core:refresh', async () => {
+  handleIpc('core:refresh', async () => {
     const core = await engine.refreshCore()
     broadcast()
     return core
@@ -679,13 +773,13 @@ function registerIpc(): void {
   /*  Engines                                                          */
   /* ---------------------------------------------------------------- */
 
-  ipcMain.handle('engines:refresh', async () => {
+  handleIpc('engines:refresh', async () => {
     const engines = await engine.refreshEngines(false)
     broadcast()
     return engines
   })
 
-  ipcMain.handle('engines:check-updates', async () => {
+  handleIpc('engines:check-updates', async () => {
     try {
       const engines = await engine.checkEngineUpdates()
       broadcast()
@@ -697,9 +791,9 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('engines:install', async (_event, id: EngineId) => {
+  handleIpc('engines:install', async (_event, id: EngineId) => {
     try {
-      const engines = await engine.installEngine(id)
+      const engines = await engine.installEngine(requireEngineId(id))
       broadcast()
       return engines
     } catch (error) {
@@ -709,9 +803,9 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('engines:remove', async (_event, id: EngineId) => {
+  handleIpc('engines:remove', async (_event, id: EngineId) => {
     try {
-      const engines = await engine.removeEngine(id)
+      const engines = await engine.removeEngine(requireEngineId(id))
       broadcast()
       return engines
     } catch (error) {
@@ -721,19 +815,20 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('engines:set', (_event, choice: EngineChoice) => {
-    const settings = engine.setEngine(choice)
+  handleIpc('engines:set', async (_event, choice: EngineChoice) => {
+    const settings = await engine.setEngine(requireEngineChoice(choice))
     broadcast()
     return settings
   })
 
-  ipcMain.handle('profiles:engine', (_event, profileId: string, id: EngineId | null) => {
-    const profiles = engine.setProfileEngine(profileId, id)
+  handleIpc('profiles:engine', (_event, profileId: string, id: EngineId | null) => {
+    const target = id === null ? null : requireEngineId(id)
+    const profiles = engine.setProfileEngine(requireId(profileId, 'profileId'), target)
     broadcast()
     return profiles
   })
 
-  ipcMain.handle('engine-history:clear', () => {
+  handleIpc('engine-history:clear', () => {
     const history = engine.clearEngineHistory()
     broadcast()
     return history
@@ -743,9 +838,9 @@ function registerIpc(): void {
   /*  Scenarios + diagnostics                                          */
   /* ---------------------------------------------------------------- */
 
-  ipcMain.handle('scenarios:apply', async (_event, id: string) => {
+  handleIpc('scenarios:apply', async (_event, id: string) => {
     try {
-      await engine.applyScenario(id)
+      await engine.applyScenario(requireId(id, 'scenarioId'))
       scheduleSubscriptionUpdates()
       broadcast()
     } catch (error) {
@@ -755,9 +850,9 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('scenarios:save', (_event, input: Partial<Scenario>) => {
+  handleIpc('scenarios:save', (_event, input: Partial<Scenario>) => {
     try {
-      const scenario = normalizeScenario(input)
+      const scenario = normalizeScenario(sanitizeScenarioInput(input))
       const scenarios = engine.saveScenario(scenario)
       broadcast()
       return scenarios
@@ -767,13 +862,13 @@ function registerIpc(): void {
     }
   })
 
-  ipcMain.handle('scenarios:remove', (_event, id: string) => {
-    const scenarios = engine.removeScenario(id)
+  handleIpc('scenarios:remove', (_event, id: string) => {
+    const scenarios = engine.removeScenario(requireId(id, 'scenarioId'))
     broadcast()
     return scenarios
   })
 
-  ipcMain.handle('diagnostics:run', async () => {
+  handleIpc('diagnostics:run', async () => {
     const result = await engine.diagnose()
     broadcast()
     return result
@@ -783,7 +878,7 @@ function registerIpc(): void {
   /*  Backup, config export and QR import                              */
   /* ---------------------------------------------------------------- */
 
-  ipcMain.handle('backup:export', async () => {
+  handleIpc('backup:export', async () => {
     const payload: BackupPayload = {
       format: 'eaglet-backup',
       version: 1,
@@ -805,7 +900,7 @@ function registerIpc(): void {
     return result.filePath
   })
 
-  ipcMain.handle('backup:import', async () => {
+  handleIpc('backup:import', async () => {
     const result = await dialog.showOpenDialog({
       title: 'Import Eaglet backup',
       properties: ['openFile'],
@@ -817,7 +912,7 @@ function registerIpc(): void {
       throw new Error('That file is not an Eaglet backup')
     }
     store.replaceAll({
-      settings: raw.settings,
+      settings: { ...store.getSettings(), ...sanitizeSettingsPatch(raw.settings) },
       profiles: raw.profiles,
       subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : [],
       scenarios: Array.isArray(raw.scenarios) ? raw.scenarios : []
@@ -830,7 +925,7 @@ function registerIpc(): void {
     return snapshot()
   })
 
-  ipcMain.handle('config:export', async () => {
+  handleIpc('config:export', async () => {
     const exported = engine.buildExportConfig()
     const result = await dialog.showSaveDialog({
       title: `Export ${exported.engine} configuration`,
@@ -844,7 +939,7 @@ function registerIpc(): void {
     return result.filePath
   })
 
-  ipcMain.handle('profiles:qr', async (): Promise<QrImportResult> => {
+  handleIpc('profiles:qr', async (): Promise<QrImportResult> => {
     const result = await dialog.showOpenDialog({
       title: 'Import a QR code from an image',
       properties: ['openFile'],
@@ -856,25 +951,26 @@ function registerIpc(): void {
     return { ...imported, codes: 1 }
   })
 
-  ipcMain.handle('settings:update', async (_event, patch: Partial<Settings>) => {
+  handleIpc('settings:update', async (_event, patch: Partial<Settings>) => {
+    const sanitized = sanitizeSettingsPatch(patch)
     const previous = store.getSettings()
-    const settings = store.updateSettings(patch)
-    if (patch.mini !== undefined && mainWindow) setMini(mainWindow, patch.mini)
-    if (patch.launchAtStartup !== undefined) applyLoginItem(patch.launchAtStartup)
-    if (patch.systemProxy !== undefined && patch.systemProxy !== previous.systemProxy) {
-      await engine.setSystemProxy(patch.systemProxy)
+    const settings = store.updateSettings(sanitized)
+    if (sanitized.mini !== undefined && mainWindow) setMini(mainWindow, sanitized.mini)
+    if (sanitized.launchAtStartup !== undefined) applyLoginItem(sanitized.launchAtStartup)
+    if (sanitized.systemProxy !== undefined && sanitized.systemProxy !== previous.systemProxy) {
+      await engine.setSystemProxy(sanitized.systemProxy)
     }
-    if ((patch.routingMode && patch.routingMode !== previous.routingMode) ||
-        (patch.dns && patch.dns !== previous.dns) ||
-        (patch.customDns !== undefined && patch.customDns !== previous.customDns)) {
+    if ((sanitized.routingMode && sanitized.routingMode !== previous.routingMode) ||
+        (sanitized.dns && sanitized.dns !== previous.dns) ||
+        (sanitized.customDns !== undefined && sanitized.customDns !== previous.customDns)) {
       if (engine.getState().status === 'connected') {
         engine.pushExternalLog('warn', 'Routing changes apply on the next connection')
       }
     }
-    if (patch.autoUpdateSubscriptions !== undefined || patch.subscriptionIntervalHours !== undefined) {
+    if (sanitized.autoUpdateSubscriptions !== undefined || sanitized.subscriptionIntervalHours !== undefined) {
       scheduleSubscriptionUpdates()
     }
-    if (patch.tray !== undefined) {
+    if (sanitized.tray !== undefined) {
       if (settings.tray) ensureTray()
       else destroyTray()
     }
@@ -882,14 +978,15 @@ function registerIpc(): void {
     return settings
   })
 
-  ipcMain.handle('window:set-mini', (_event, mini: boolean) => {
-    if (mainWindow) setMini(mainWindow, mini)
+  handleIpc('window:set-mini', (_event, mini: boolean) => {
+    const minimized = requireBoolean(mini, 'mini')
+    if (mainWindow) setMini(mainWindow, minimized)
     broadcast()
   })
 
-  ipcMain.on('window:minimize', () => mainWindow?.minimize())
-  ipcMain.on('window:close', () => mainWindow?.close())
-  ipcMain.on('window:toggle-maximize', () => {
+  onIpc('window:minimize', () => mainWindow?.minimize())
+  onIpc('window:close', () => mainWindow?.close())
+  onIpc('window:toggle-maximize', () => {
     if (!mainWindow) return
     if (mainWindow.isMaximized()) mainWindow.unmaximize()
     else mainWindow.maximize()
@@ -902,6 +999,7 @@ function registerIpc(): void {
 
 app.whenReady().then(async () => {
   app.setAppUserModelId('com.eaglet.vpn')
+  installSessionGuards()
   store = new Store()
   const settings = store.getSettings()
   engine = new VpnEngine(store)

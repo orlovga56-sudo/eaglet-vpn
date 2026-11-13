@@ -20,7 +20,6 @@ import type {
   Metrics,
   Profile,
   Scenario,
-  SessionRecord,
   Settings,
   SpeedTestResult,
   VpnState,
@@ -138,6 +137,8 @@ export class VpnEngine extends EventEmitter {
   private core: CoreState = { available: false, running: false, version: null, path: null }
   private sessionSaved = true
   private runtime: Runtime
+  /** One-shot override used by a live engine switch and its rollback. */
+  private forcedEngine: EngineId | null = null
 
   constructor(store: Store) {
     super()
@@ -267,18 +268,101 @@ export class VpnEngine extends EventEmitter {
     return this.engines
   }
 
-  setEngine(choice: EngineChoice): Settings {
+  /**
+   * Changes the global engine. While a tunnel is live the old core is stopped,
+   * the new one is started, and any failure rolls back to the previous engine
+   * instead of leaving the user disconnected.
+   */
+  async setEngine(choice: EngineChoice): Promise<Settings> {
+    const previousSettings = this.store.getSettings()
+    const previousEngine = this.runtime.engine ?? this.engineId
     const settings = this.store.updateSettings({ engine: choice })
-    const chosen = this.manager.choose(this.activeProfile(), settings).id
-    if (choice !== 'auto' && this.isLive()) {
-      this.pushLog('warn', `${this.manager.adapter(chosen).name} selected · it applies on the next connection`)
-    } else {
-      this.recordEngineSwitch(chosen, 'manual')
-      this.engineId = chosen
+    const target = this.manager.choose(this.activeProfile(), settings).id
+    const targetName = this.manager.adapter(target).name
+
+    if (!this.isLive()) {
+      this.engineId = target
       this.syncCore()
-      this.pushLog('info', `Engine set to ${this.manager.adapter(chosen).name}`)
+      this.recordEngineSwitch(target, 'manual', previousEngine)
+      this.pushLog('info', `Engine set to ${targetName}`)
+      this.emitUpdate()
+      return settings
     }
-    this.emitUpdate()
+
+    if (this.status !== 'connected' || this.runtime.transition) {
+      this.pushLog('warn', `${targetName} selected · it applies on the next connection`)
+      this.emitUpdate()
+      return settings
+    }
+
+    if (this.runtime.engine === target) {
+      this.pushLog('info', `${targetName} is already running`)
+      this.emitUpdate()
+      return settings
+    }
+
+    const profile = this.activeProfile()
+    const revertChoice = (): void => {
+      this.store.updateSettings({ engine: previousSettings.engine })
+      this.engineId = this.manager.choose(this.activeProfile(), this.store.getSettings()).id
+      this.syncCore()
+    }
+    if (!profile) {
+      revertChoice()
+      throw new Error('Select a profile before switching engines')
+    }
+    if (!this.manager.supportsProfile(target, profile)) {
+      revertChoice()
+      throw new Error(
+        `${targetName} cannot carry this ${profile.protocol.toUpperCase()} profile`
+      )
+    }
+    if (settings.tunMode && !this.manager.adapter(target).supportsTun) {
+      revertChoice()
+      throw new Error(`${targetName} does not support TUN mode`)
+    }
+
+    try {
+      await this.manager.ensure(target, (message) => {
+        this.pushLog('info', message)
+        this.emitUpdate()
+      })
+    } catch (error) {
+      revertChoice()
+      throw new Error(`Could not install ${targetName}: ${(error as Error).message}`)
+    }
+
+    const previousName = this.manager.adapter(previousEngine).name
+    this.pushLog('info', `Switching engine · ${previousName} → ${targetName}`)
+    this.forcedEngine = target
+    try {
+      await this.disconnect()
+      await this.connect()
+      if (this.status !== 'connected' || this.runtime.engine !== target) {
+        throw new Error(this.error ?? `${targetName} could not establish a tunnel`)
+      }
+      this.pushLog('success', `Engine switched to ${targetName}`)
+    } catch (error) {
+      const message = (error as Error).message
+      this.pushLog('warn', `Engine switch failed · ${message} · rolling back to ${previousName}`)
+      this.forcedEngine = previousEngine
+      try {
+        if (this.status === 'connected') await this.disconnect()
+        await this.connect()
+        if (this.status === 'connected' && this.runtime.engine === previousEngine) {
+          this.pushLog('info', `Rolled back to ${previousName}`)
+        } else {
+          this.pushLog('error', `Rollback failed: ${this.error ?? 'unknown error'}`)
+        }
+      } catch (rollbackError) {
+        this.pushLog('error', `Rollback failed: ${(rollbackError as Error).message}`)
+      }
+      revertChoice()
+      throw new Error(`Could not switch to ${targetName}: ${message}`)
+    } finally {
+      this.forcedEngine = null
+      this.emitUpdate()
+    }
     return settings
   }
 
@@ -385,9 +469,8 @@ export class VpnEngine extends EventEmitter {
     }
   }
 
-  private recordEngineSwitch(to: EngineId, reason: EngineSwitchRecord['reason']): void {
-    const from = this.runtime.engine ?? this.store.getSettings().engine
-    const previous = typeof from === 'string' && from !== 'auto' ? (from as EngineId) : null
+  private recordEngineSwitch(to: EngineId, reason: EngineSwitchRecord['reason'], from?: EngineId | null): void {
+    const previous = from === undefined ? (this.runtime.engine ?? null) : from
     if (previous === to) return
     this.store.addEngineSwitch({
       id: `${now()}-${to}`,
@@ -486,9 +569,14 @@ export class VpnEngine extends EventEmitter {
     }
 
     const settings = this.store.getSettings()
-    const choice = this.manager.choose(profile, settings)
+    const previousEngine = this.runtime.engine ?? null
+    const forced = this.forcedEngine
+    const choice: { id: EngineId; reason: EngineSwitchRecord['reason'] } =
+      forced && this.manager.supportsProfile(forced, profile)
+        ? { id: forced, reason: 'manual' }
+        : this.manager.choose(profile, settings)
     const preference = profile.engine ?? (settings.engine !== 'auto' ? settings.engine : null)
-    if (preference && preference !== choice.id) {
+    if (!forced && preference && preference !== choice.id) {
       this.pushLog(
         'warn',
         `${this.manager.adapter(preference).name} cannot carry this profile · using ${this.manager.adapter(choice.id).name}`
@@ -524,7 +612,7 @@ export class VpnEngine extends EventEmitter {
           this.emitUpdate()
         })
       }
-      this.recordEngineSwitch(engineId, choice.reason)
+      this.recordEngineSwitch(engineId, choice.reason, previousEngine)
       this.runtime.engine = engineId
       this.runtime.corePath = binary
       this.engineId = engineId
@@ -683,11 +771,13 @@ export class VpnEngine extends EventEmitter {
 
   private async applyProtection(profile: Profile, binary: string, settings: Settings): Promise<void> {
     if (settings.killSwitch || settings.networkProtection) {
-      if (!killSwitchSupported()) {
+      if (profile.protocol === 'direct') {
+        this.pushLog('warn', 'Kill switch skipped · a direct profile is not a tunnel')
+      } else if (!killSwitchSupported()) {
         this.pushLog('warn', 'Kill switch is not implemented on this platform')
       } else {
         try {
-          const ips = await enableKillSwitch(profile, binary)
+          const ips = await enableKillSwitch(profile, binary, settings)
           this.runtime.killSwitchApplied = true
           this.killSwitchActive = true
           this.pushLog(

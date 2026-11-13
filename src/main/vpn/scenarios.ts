@@ -1,4 +1,5 @@
-import type { Scenario, ScenarioIcon } from '@shared/types'
+import type { EngineChoice, Scenario, ScenarioIcon, ServerStrategy } from '@shared/types'
+import { requireEngineChoice } from '@shared/validation'
 
 /**
  * Built-in connection scenarios. Every field is a real setting that the engine
@@ -88,6 +89,15 @@ export const BUILTIN_SCENARIOS: Scenario[] = [
 ]
 
 const ICONS: ScenarioIcon[] = ['game', 'speed', 'shield', 'manual', 'custom']
+const STRATEGIES: ServerStrategy[] = ['fastest', 'favorite', 'selected']
+
+function engineChoice(value: unknown): EngineChoice {
+  try {
+    return requireEngineChoice(value)
+  } catch {
+    return 'auto'
+  }
+}
 
 export function allScenarios(custom: Scenario[]): Scenario[] {
   return [...BUILTIN_SCENARIOS, ...custom.filter((scenario) => !scenario.builtin)]
@@ -105,8 +115,10 @@ export function normalizeScenario(input: Partial<Scenario>): Scenario {
     description: (input.description ?? '').trim().slice(0, 240),
     icon,
     builtin: false,
-    engine: input.engine ?? 'auto',
-    serverStrategy: input.serverStrategy ?? 'selected',
+    engine: engineChoice(input.engine),
+    serverStrategy: STRATEGIES.includes(input.serverStrategy as ServerStrategy)
+      ? (input.serverStrategy as ServerStrategy)
+      : 'selected',
     settings: input.settings ?? {}
   }
 }

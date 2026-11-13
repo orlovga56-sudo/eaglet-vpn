@@ -1,6 +1,6 @@
 import { app } from 'electron'
 import { execFile, execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -82,7 +82,6 @@ ${refreshScript()}
   } catch {
     data = null
   }
-  const escaped = backup.replace(/'/g, "''")
   const enabled = Number(data?.enabled ?? 0) === 1 ? 1 : 0
   const server = String(data?.server ?? '').replace(/'/g, "''")
   const override = String(data?.override ?? '<local>').replace(/'/g, "''")

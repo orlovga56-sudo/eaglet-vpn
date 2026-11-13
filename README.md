@@ -34,13 +34,36 @@ the local inbound and restores every system change on disconnect or crash.
   and GSettings on GNOME. The previous state is backed up and restored on
   disconnect, quit or after a crash. Unsupported desktops fail loudly.
 - **Network Protection** — a real kill switch (Windows Firewall policy, macOS
-  `pf` anchor, Linux `iptables` chain) plus a local DoH relay. Both require an
-  elevated process and report honestly when elevation is missing.
-- **DNS Protection** — a real DNS-over-HTTPS relay on `127.0.0.1:53`; the system
-  resolver is backed up, pointed at the relay and restored afterwards.
+  `pf` anchor, Linux `iptables`/`ip6tables` chains) plus a local DoH relay. The
+  rules whitelist only loopback, DHCP, link-local, the selected node address and
+  port, the pinned DoH resolver and the previously configured DNS resolvers —
+  there is no “any DNS” or “any program” exception. IPv6 is blocked on purpose
+  even for IPv4-only nodes. Both layers require an elevated process and report
+  honestly when elevation is missing.
+- **DNS Protection** — a real dual-stack DNS-over-HTTPS relay on `127.0.0.1:53`
+  and `::1:53`. The DoH endpoint is resolved to an IP *before* the system
+  resolver is redirected, then queried over HTTPS with the original SNI/Host and
+  certificate validation. IPv4 and IPv6 resolvers are backed up together and
+  restored before the relay stops; a failed restore keeps the backup for the
+  next launch.
+- **Secrets stay out of `config.json`** — profile share links and subscription
+  URLs are encrypted with Electron `safeStorage` (DPAPI/Keychain/libsecret) in a
+  separate atomically-written vault. Legacy configs migrate automatically; if
+  no keyring exists, the fallback is explicit and marked in the file.
+- **Hardened Electron shell** — sandboxed renderer, context isolation, no Node
+  integration, no webviews, navigation and `window.open` denied, external links
+  restricted to http(s), a sender/main-frame check on every IPC call, validated
+  IPC payloads and a strict production CSP.
 - **TUN capture** — sing-box and Mihomo can capture the whole device. On Windows
   Eaglet downloads `wintun.dll` once, stages the core next to it and requires an
   administrator session. Xray-core declares that it has no TUN mode.
+- **Verified engine downloads** — every core archive must match the SHA-256
+  digest published by the GitHub release (or its checksum file), and Windows
+  binaries are checked with Authenticode (unsigned builds are accepted, a
+  tampered signature is not). `wintun.dll` is matched against a pinned digest.
+- **Live engine switching** — choosing another engine while connected stops the
+  current core, waits for it to exit (so TUN adapters are released), starts the
+  new one and rolls back to the previous engine if the new tunnel fails.
 - **Real telemetry** — Clash API for sing-box/Mihomo and Xray’s native
   `StatsService` (`xray api statsquery`) for Xray. Latency, jitter, packet loss,
   CPU and RAM of the core process are measured, not drawn.
@@ -165,7 +188,8 @@ npm run build     # production bundles into out/
 npm start         # preview the production build
 ```
 
-Other scripts: `npm run typecheck`, `npm run map` (regenerate the world map),
+Other scripts: `npm run typecheck`, `npm test` (Vitest unit tests),
+`npm run lint` (ESLint), `npm run map` (regenerate the world map),
 `npm run shots` (capture the screenshots), `npm run package` (unpacked build) and
 `npm run dist` (installers).
 
