@@ -232,7 +232,9 @@ DoH IP/port, the resolved subscription/update endpoints on their real ports and 
 only when DNS protection is off — the previous resolvers on port 53. Windows
 rules are bound to the Eaglet/core executable, so there is no broad `80/443` or
 “any program” exception; macOS/Linux are packet-scoped because those backends
-cannot reliably identify a program without extra cgroups/helpers. When DNS
+cannot reliably identify a program without extra cgroups/helpers. Windows also
+keeps stateful permits for connections established before the policy was armed
+(no WFP callout driver), so those flows can outlive the switch until they close. When DNS
 protection is on, all plaintext DNS rules are removed and the loopback relay is
 the only resolver. IPv6 has its own policy and is dropped even for an IPv4-only
 node. On Linux a missing `ip6tables` aborts the whole kill switch (unless the

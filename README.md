@@ -115,7 +115,9 @@ the local inbound and restores every system change on disconnect or crash.
 - **Split tunneling** — an always-direct bypass list of domains, IPs and CIDRs
   that wins in both Smart and Global routing.
 - **Auto-reconnect** — after an unexpected core crash Eaglet retries three times
-  with a growing delay and restores protection and the system proxy.
+  with a growing delay while the kill switch/DNS guard stay armed, then restores
+  the tunnel and the system proxy. If every retry fails, direct access remains
+  blocked until you disconnect.
 - **Backup and export** — settings, profiles, subscriptions and scenarios can be
   exported/imported as JSON; the active core configuration can be exported as a
   native file. The backup dialog explains that share links and subscription URLs
@@ -140,6 +142,15 @@ the local inbound and restores every system change on disconnect or crash.
 > **Public nodes are untrusted.** The finder proves that a node carries HTTP
 > traffic — not that its operator is honest. Never sign in to banking, work or
 > other sensitive accounts through a free public node.
+
+> **Kill-switch scope.** The firewall governs new outbound flows. On Windows an
+> already-established connection may survive until it closes, because the
+> Windows Filtering Platform keeps stateful permits; Eaglet ships no kernel
+> callout driver. Linux and macOS enforce packet-level rules but cannot scope an
+> exception to a single program without extra cgroups/helpers. All three
+> backends need elevation; macOS also expects the default
+> `anchor "com.apple/*"` in `/etc/pf.conf`. Manual disconnects and explicit
+> engine switches restore direct networking by design.
 
 ## Engines
 
