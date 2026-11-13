@@ -297,6 +297,25 @@ export interface DiagnosticsResult {
   summary: string
 }
 
+/** Where connection secrets are currently kept. */
+export type SecretStorageStatus = 'encrypted' | 'unavailable' | 'corrupt'
+
+/**
+ * Honest description of the secret storage state. The renderer must be able to
+ * tell the user when profiles are stored without encryption instead of
+ * presenting a plaintext fallback as if it were protected.
+ */
+export interface SecurityState {
+  secretStorage: SecretStorageStatus
+  /** Profiles whose raw share link is still written to config.json. */
+  plaintextProfiles: number
+  /** Subscriptions whose URL is still written to config.json. */
+  plaintextSubscriptions: number
+  /** True when a legacy vault was rewritten with encryption this launch. */
+  migrated: boolean
+  warnings: string[]
+}
+
 export interface BackupPayload {
   format: 'eaglet-backup'
   version: number
@@ -305,6 +324,11 @@ export interface BackupPayload {
   profiles: Profile[]
   subscriptions: Subscription[]
   scenarios: Scenario[]
+  /**
+   * True when the file contains raw share links / subscription URLs. They are
+   * written in readable form, so the UI must ask the user before exporting.
+   */
+  includesSecrets?: boolean
 }
 
 export interface QrImportResult extends ImportResult {
@@ -344,6 +368,7 @@ export interface Snapshot {
   scenarios: Scenario[]
   profileHistory: ProfileEvent[]
   engineHistory: EngineSwitchRecord[]
+  security: SecurityState
   platform: string
   version: string
 }
@@ -358,7 +383,7 @@ export interface EagletApi {
   importProfiles: (text: string) => Promise<ImportResult>
   importQr: () => Promise<QrImportResult>
   discoverFree: () => Promise<FreeDiscoveryResult>
-  addFreeProfiles: (links: string[]) => Promise<ImportResult>
+  addFreeProfiles: (profileIds: string[]) => Promise<ImportResult>
   updateSubscription: (subscriptionId: string) => Promise<ImportResult>
   updateAllSubscriptions: () => Promise<ImportResult[]>
   removeSubscription: (subscriptionId: string) => Promise<void>
@@ -366,8 +391,10 @@ export interface EagletApi {
   testProfiles: (profileIds?: string[]) => Promise<Profile[]>
   runSpeedTest: () => Promise<SpeedTestResult>
   clearSessions: () => Promise<SessionRecord[]>
-  copyText: (text: string) => Promise<void>
-  readClipboard: () => Promise<string>
+  /** Imports whatever the clipboard contains without exposing the text. */
+  importClipboard: () => Promise<ImportResult>
+  /** Copies a profile's share link without ever handing the link to the renderer. */
+  copyProfileLink: (profileId: string) => Promise<void>
   checkIp: () => Promise<void>
   refreshCore: () => Promise<CoreState>
   refreshEngines: () => Promise<EngineState[]>

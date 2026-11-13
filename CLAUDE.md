@@ -223,20 +223,45 @@ Key rules:
 | Layer | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | System proxy | WinINET registry | `networksetup` | GSettings (GNOME) |
-| Kill switch | Firewall default outbound Block + scoped allow rules | `pf` anchor | dedicated `iptables` + `ip6tables` chains |
+| Kill switch | Firewall default outbound Block + scoped, program-bound allow rules | `pf` anchor (`com.apple/eaglet`) | dedicated `iptables` + `ip6tables` chains |
 | DNS protection | Dual-stack DoH relay on `127.0.0.1:53`/`::1:53`, IPv4+IPv6 resolver backup/restore | same | same |
 | TUN | `wintun.dll` + elevated core | — | — |
 
-Kill-switch rules allow only loopback, DHCP, link-local, the node address and
-port, the pinned DoH resolver/port and the resolvers captured before the tunnel
-started. IPv6 has its own policy and is dropped even for an IPv4-only node. There
-is intentionally no `conntrack`/`ESTABLISHED` shortcut and no “any DNS” rule.
+Kill-switch rules allow only loopback, DHCP/ND, the node IP and port, the pinned
+DoH IP/port, the resolved subscription/update endpoints on their real ports and —
+only when DNS protection is off — the previous resolvers on port 53. Windows
+rules are bound to the Eaglet/core executable, so there is no broad `80/443` or
+“any program” exception; macOS/Linux are packet-scoped because those backends
+cannot reliably identify a program without extra cgroups/helpers. When DNS
+protection is on, all plaintext DNS rules are removed and the loopback relay is
+the only resolver. IPv6 has its own policy and is dropped even for an IPv4-only
+node. On Linux a missing `ip6tables` aborts the whole kill switch (unless the
+kernel has IPv6 disabled); macOS saves/restores the previous `pf` enabled state
+and the contents of Eaglet's own anchor. There is intentionally no
+`conntrack`/`ESTABLISHED` shortcut.
+
+Auto-reconnect preserves the armed policy: `connect(..., automatic)` keeps the
+rules and the relay, the core resolves through them, and `applyProtection()`
+leaves an already-armed policy untouched (re-running `enable()` would overwrite
+the saved pre-arm state on Windows/macOS and make a later disable permanent).
+The policy is rebuilt from a fresh backup on the next manual connection. If the
+three retries fail, protection stays armed and the user must disconnect to
+restore direct access. Linux rebuilds a chain with a trailing `DROP` in place
+first, so the flush/repopulate window cannot leak. Manual disconnects and
+explicit engine switches tear the tunnel down and restore direct networking by
+design.
 
 Secrets (share links, subscription URLs) live in `userData/secrets.bin`, written
-atomically and encrypted with Electron `safeStorage`. `config.json` keeps empty
-secret fields; `Store` migrates older configs on launch and hydrates secrets on
-read. The DoH endpoint is resolved before the system resolver is redirected and
-then queried over HTTPS against the pinned IP with the original SNI/Host.
+atomically and encrypted with Electron `safeStorage`. Base64-only files from old
+builds are migrated once; new plaintext is never written. If the keyring is
+unavailable the vault reports `unavailable` and refuses to write, while `Store`
+keeps the link in `config.json` and `Snapshot.security` warns that it is
+plaintext. A corrupt/undecryptable vault is left untouched and reported as
+`corrupt`, so profile metadata is never lost. `snapshot()` strips `Profile.raw`
+and redacts subscription URLs; `copyProfileLink` and subscription refresh read
+the secret inside the main process. The DoH endpoint is resolved before the
+system resolver is redirected and then queried over HTTPS against the pinned IP
+with the original SNI/Host; `::1` is only advertised when the IPv6 relay bound.
 
 Support is deliberately asymmetric: only Windows is in the verified matrix;
 macOS/Linux backends exist but are marked **experimental**. Never claim a
@@ -247,12 +272,13 @@ platform feature you have not tested.
 All renderer↔main traffic goes through `window.eaglet` (`src/shared/types.ts`
 defines `EagletApi`). Highlights:
 
-- snapshot/state: `snapshot()`, `onState(cb)`
+- snapshot/state: `snapshot()`, `onState(cb)` — profiles have `raw: ''`, URLs are
+  redacted and `security` describes the secret storage honestly
 - tunnel: `connect`, `quickConnect`, `disconnect`, `selectProfile`,
   `checkIp`, `runSpeedTest`
 - profiles: `importProfiles`, `importQr`, `updateSubscription`,
   `updateAllSubscriptions`, `removeSubscription`, `removeProfile`,
-  `setFavorite`, `testProfiles`, `clearSessions`
+  `setFavorite`, `testProfiles`, `clearSessions`, `copyProfileLink`
 - engines: `refreshEngines`, `installEngine`, `removeEngine`,
   `checkEngineUpdates`, `setEngine`, `setProfileEngine`, `clearEngineHistory`
 - scenarios/diagnostics: `applyScenario`, `saveScenario`, `removeScenario`,

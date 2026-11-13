@@ -175,6 +175,21 @@ export function SettingsPage({ snap, onUpdate }: Props): React.JSX.Element {
       </div>
 
       <div className="section-title">Connection</div>
+      {snap.security.warnings.length > 0 && (
+        <div className="free-warning">
+          <strong>
+            Secret storage:{' '}
+            {snap.security.secretStorage === 'encrypted'
+              ? 'encrypted'
+              : snap.security.secretStorage === 'corrupt'
+                ? 'unreadable vault'
+                : 'OS keyring unavailable'}
+          </strong>
+          {snap.security.warnings.map((warning) => (
+            <div key={warning}>{warning}</div>
+          ))}
+        </div>
+      )}
       <div className="settings-cols">
         <div className="rows panel">
           <div className="row">

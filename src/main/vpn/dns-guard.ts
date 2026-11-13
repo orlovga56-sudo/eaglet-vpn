@@ -265,7 +265,8 @@ function readBackup(): DnsBackup {
   }
 }
 
-async function applySystemDns(): Promise<void> {
+async function applySystemDns(includeIpv6: boolean): Promise<void> {
+  const loopback = includeIpv6 ? ['127.0.0.1', '::1'] : ['127.0.0.1']
   if (process.platform === 'win32') {
     const script = `
 $items = @();
@@ -297,10 +298,12 @@ $items | ConvertTo-Json -Compress
 
     writeBackup({ platform: 'win32', at: Date.now(), services })
     const commands = services.map((service) => {
-      const v6 = byFamily(service.servers, 6)
       // A single cmdlet call keeps both families in sync; setting them in two
-      // calls can clear the family that was configured first.
-      const addresses = v6.length > 0 ? ['127.0.0.1', '::1'] : ['127.0.0.1']
+      // calls can clear the family that was configured first. IPv6 loopback is
+      // only advertised when the relay really bound an IPv6 socket *and* this
+      // interface already uses IPv6 resolvers.
+      const addresses =
+        includeIpv6 && byFamily(service.servers, 6).length > 0 ? loopback : ['127.0.0.1']
       return `Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ServerAddresses ${addresses.map(psQuote).join(',')} -ErrorAction Stop;`
     })
     await execFileAsync(
@@ -340,8 +343,8 @@ $items | ConvertTo-Json -Compress
     if (services.length === 0) throw new Error('No network services were found')
     writeBackup({ platform: 'darwin', at: Date.now(), services })
     for (const service of services) {
-      const v6 = byFamily(service.servers, 6)
-      const addresses = v6.length > 0 ? ['127.0.0.1', '::1'] : ['127.0.0.1']
+      const addresses =
+        includeIpv6 && byFamily(service.servers, 6).length > 0 ? loopback : ['127.0.0.1']
       await execFileAsync('networksetup', ['-setdnsservers', service.name, ...addresses])
     }
     return
@@ -359,7 +362,8 @@ $items | ConvertTo-Json -Compress
       .flatMap((line) => line.split(/\s+/).slice(1))
       .filter((value) => isIP(value) !== 0)
     writeBackup({ platform: 'linux', at: Date.now(), services: [{ name: iface, servers }] })
-    await execFileAsync('resolvectl', ['dns', iface, '127.0.0.1', '::1'])
+    const addresses = includeIpv6 && byFamily(servers, 6).length > 0 ? loopback : ['127.0.0.1']
+    await execFileAsync('resolvectl', ['dns', iface, ...addresses])
     await execFileAsync('resolvectl', ['flush-caches']).catch(() => undefined)
     return
   }
@@ -517,7 +521,7 @@ export async function startDnsGuard(settings: Settings): Promise<void> {
 
   state = { udp, tcp, endpoint: target.endpoint, ipv6, requests: 0, failures: 0 }
   try {
-    await applySystemDns()
+    await applySystemDns(ipv6)
   } catch (error) {
     // A partially applied resolver override must never survive a failure.
     try {

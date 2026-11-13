@@ -17,8 +17,26 @@ export interface KillSwitchContext {
   /** DoH resolvers the DNS relay must be able to reach. */
   dohIps: string[]
   dohPorts: number[]
-  /** Resolvers the core may use while DNS protection is still warming up. */
+  /**
+   * Resolvers the core/app may use while DNS protection is off. When
+   * `dnsProtected` is true these rules are omitted entirely: the only resolver
+   * left is the loopback relay, so there is no plaintext DNS escape hatch.
+   */
   dnsServers: string[]
+  /** True when Eaglet's local DoH relay owns the system resolver. */
+  dnsProtected: boolean
+  /**
+   * Resolved addresses of endpoints the Electron app must reach directly
+   * (subscription servers, update checks, free catalogues). Each entry is
+   * scoped to the exact ports used by that service.
+   */
+  appEndpoints: ResolvedEndpoint[]
+}
+
+/** A hostname/port pair that the main process may need to reach while armed. */
+export interface AppEndpointSpec {
+  host: string
+  ports: number[]
 }
 
 export interface KillSwitchBackend {

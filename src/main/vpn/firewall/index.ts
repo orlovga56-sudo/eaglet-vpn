@@ -6,7 +6,14 @@ import type { Profile, Settings } from '@shared/types'
 import { dohEndpoint } from '../engines/types'
 import { linuxKillSwitch } from './linux'
 import { macKillSwitch } from './macos'
-import { resolveHostIps, resolveServer, type KillSwitchBackend, type KillSwitchContext } from './types'
+import {
+  resolveHostIps,
+  resolveServer,
+  type AppEndpointSpec,
+  type KillSwitchBackend,
+  type KillSwitchContext,
+  type ResolvedEndpoint
+} from './types'
 import { windowsKillSwitch } from './windows'
 
 const execFileAsync = promisify(execFile)
@@ -20,6 +27,55 @@ function backend(): KillSwitchBackend | null {
 
 export function killSwitchSupported(): boolean {
   return backend() !== null
+}
+
+/**
+ * Services the Electron main process talks to directly while the tunnel is up.
+ * They are resolved to concrete IPs before the policy is armed; the rules never
+ * allow port 80/443 to arbitrary addresses.
+ */
+const APP_ENDPOINT_HOSTS: AppEndpointSpec[] = [
+  { host: 'ip-api.com', ports: [80] },
+  { host: 'ipapi.co', ports: [443] },
+  { host: 'api.github.com', ports: [443] },
+  { host: 'github.com', ports: [443] },
+  { host: 'objects.githubusercontent.com', ports: [443] },
+  { host: 'raw.githubusercontent.com', ports: [443] },
+  { host: 'www.wintun.net', ports: [443] }
+]
+
+function endpointSpecForUrl(raw: string): AppEndpointSpec | null {
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+    const port = url.port ? Number(url.port) : url.protocol === 'http:' ? 80 : 443
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null
+    const host = url.hostname.replace(/^\[|\]$/g, '')
+    return host ? { host, ports: [port] } : null
+  } catch {
+    return null
+  }
+}
+
+async function resolveAppEndpoints(subscriptionUrls: string[]): Promise<ResolvedEndpoint[]> {
+  const specs = new Map<string, Set<number>>()
+  for (const spec of [...APP_ENDPOINT_HOSTS, ...subscriptionUrls.map(endpointSpecForUrl)]) {
+    if (!spec) continue
+    const ports = specs.get(spec.host) ?? new Set<number>()
+    for (const port of spec.ports) ports.add(port)
+    specs.set(spec.host, ports)
+  }
+
+  const resolved = await Promise.allSettled(
+    [...specs.entries()].map(async ([host, ports]) => ({
+      ips: await resolveHostIps(host),
+      ports: [...ports]
+    }))
+  )
+  return resolved
+    .filter((item): item is PromiseFulfilledResult<ResolvedEndpoint> => item.status === 'fulfilled')
+    .map((item) => item.value)
+    .filter((endpoint) => endpoint.ips.length > 0 && endpoint.ports.length > 0)
 }
 
 async function resolveDoh(settings: Settings): Promise<{ ips: string[]; ports: number[] }> {
@@ -81,7 +137,8 @@ async function resolveDnsServers(): Promise<string[]> {
 export async function enableKillSwitch(
   profile: Profile | null,
   corePath: string | null,
-  settings: Settings
+  settings: Settings,
+  subscriptionUrls: string[] = []
 ): Promise<string[]> {
   const target = backend()
   if (!target) throw new Error('Kill switch is not implemented on this platform')
@@ -92,7 +149,8 @@ export async function enableKillSwitch(
   if (profile && server.ips.length === 0) {
     throw new Error('The node address could not be resolved; the kill switch was not armed')
   }
-  const doh = await resolveDoh(settings)
+  const dnsProtected = settings.dnsProtection || settings.networkProtection
+  const doh = dnsProtected ? await resolveDoh(settings) : { ips: [], ports: [] }
   const context: KillSwitchContext = {
     serverIps: server.ips,
     serverPorts: server.ports,
@@ -100,7 +158,9 @@ export async function enableKillSwitch(
     appPath: process.execPath,
     dohIps: doh.ips,
     dohPorts: doh.ports,
-    dnsServers: await resolveDnsServers()
+    dnsServers: dnsProtected ? [] : await resolveDnsServers(),
+    dnsProtected,
+    appEndpoints: await resolveAppEndpoints(subscriptionUrls)
   }
   await target.enable(context)
   return server.ips

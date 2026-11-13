@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import jsQR from 'jsqr'
 import { Store } from './store'
+import { publicProfile, publicProfiles, publicSubscription } from './privacy'
 import { VpnEngine } from './vpn/engine'
 import { runEngineTest } from './vpn/engine-test'
 import { isHttpUrl, parseProfileUri, parseProfilesPayload, subscriptionName } from './vpn/profiles'
@@ -46,17 +47,21 @@ let normalBounds: Electron.Rectangle | null = null
 let quitting = false
 let subscriptionTimer: NodeJS.Timeout | null = null
 let trayRefreshTimer: NodeJS.Timeout | null = null
+/** Raw links for the current free-node search, kept in the main process only. */
+const freeCandidates = new Map<string, string>()
 
 function snapshot(): Snapshot {
+  const state = engine.getState()
   return {
-    state: engine.getState(),
+    state: { ...state, profile: state.profile ? publicProfile(state.profile) : null },
     settings: store.getSettings(),
-    profiles: store.getProfiles(),
-    subscriptions: store.getSubscriptions(),
+    profiles: publicProfiles(store.getProfiles()),
+    subscriptions: store.getSubscriptions().map(publicSubscription),
     sessions: store.getSessions(),
     scenarios: engine.getScenarios(),
     profileHistory: store.getProfileHistory(),
     engineHistory: store.getEngineHistory(),
+    security: store.getSecretStatus(),
     platform: process.platform,
     version: app.getVersion()
   }
@@ -268,8 +273,8 @@ async function importFromUrl(url: string): Promise<ImportResult> {
   return {
     imported: added,
     updated,
-    subscription,
-    profiles: store.getProfiles()
+    subscription: publicSubscription(subscription),
+    profiles: publicProfiles(store.getProfiles())
   }
 }
 
@@ -281,7 +286,7 @@ function importFromText(text: string): ImportResult {
   engine.pushExternalLog('success', `Imported ${profiles.length} node(s) from a share link`)
   logProfileEvent('import', `Imported ${profiles.length} node(s) from a share link`)
   broadcast()
-  return { imported: added, updated, subscription: null, profiles: store.getProfiles() }
+  return { imported: added, updated, subscription: null, profiles: publicProfiles(store.getProfiles()) }
 }
 
 async function importAnything(input: string): Promise<ImportResult> {
@@ -310,7 +315,12 @@ async function updateSubscriptionById(id: string): Promise<ImportResult> {
   engine.pushExternalLog('success', `Subscription refreshed · ${incoming.length} nodes · ${subscription.name}`)
   logProfileEvent('subscription', `Subscription ${subscription.name} refreshed · ${incoming.length} nodes`)
   broadcast()
-  return { imported: added, updated, subscription: refreshed, profiles: store.getProfiles() }
+  return {
+    imported: added,
+    updated,
+    subscription: publicSubscription(refreshed),
+    profiles: publicProfiles(store.getProfiles())
+  }
 }
 
 async function updateAllSubscriptions(onlyDue = false): Promise<ImportResult[]> {
@@ -371,7 +381,12 @@ function addFreeProfiles(links: string[]): ImportResult {
   engine.pushExternalLog('success', `Added ${added} free node(s) from public catalogs`)
   logProfileEvent('import', `Added ${added} free node(s) from public catalogs`)
   broadcast()
-  return { imported: added, updated, subscription, profiles: store.getProfiles() }
+  return {
+    imported: added,
+    updated,
+    subscription: publicSubscription(subscription),
+    profiles: publicProfiles(store.getProfiles())
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -606,7 +621,7 @@ function registerIpc(): void {
       )
       await engine.connect(fastest.id)
       broadcast()
-      return fastest
+      return publicProfile(fastest)
     } catch (error) {
       engine.pushExternalLog('error', (error as Error).message)
       broadcast()
@@ -630,7 +645,7 @@ function registerIpc(): void {
     store.setFavorite(profileId, pinned)
     engine.pushExternalLog('info', pinned ? 'Pinned node to favourites' : 'Removed node from favourites')
     broadcast()
-    return store.getProfiles()
+    return publicProfiles(store.getProfiles())
   })
 
   handleIpc('profiles:import', async (_event, text: string) => {
@@ -664,8 +679,14 @@ function registerIpc(): void {
         result.profiles.length > 0 ? 'success' : 'warn',
         `Free search · ${result.found} found · ${result.reachable} reachable · ${result.profiles.length} working`
       )
+      // Keep the share links in this process. The renderer only receives
+      // profile metadata and opaque ids, so an XSS cannot harvest credentials.
+      freeCandidates.clear()
+      for (const profile of result.profiles) {
+        if (profile.raw?.trim()) freeCandidates.set(profile.id, profile.raw.trim())
+      }
       broadcast()
-      return result
+      return { ...result, profiles: publicProfiles(result.profiles) }
     } catch (error) {
       engine.pushExternalLog('error', `Free search failed: ${(error as Error).message}`)
       broadcast()
@@ -673,9 +694,14 @@ function registerIpc(): void {
     }
   })
 
-  handleIpc('free:add', (_event, links: string[]) => {
+  handleIpc('free:add', (_event, ids: string[]) => {
     try {
-      return addFreeProfiles(requireStringArray(links, 'links', 200, 8192))
+      const profileIds = requireStringArray(ids, 'ids', 200, 128)
+      const links = profileIds.map((id) => freeCandidates.get(id))
+      if (links.some((link) => !link)) {
+        throw new Error('Some selected free nodes expired; run the search again')
+      }
+      return addFreeProfiles(links as string[])
     } catch (error) {
       engine.pushExternalLog('error', (error as Error).message)
       broadcast()
@@ -730,7 +756,7 @@ function registerIpc(): void {
         : requireStringArray(ids, 'ids', 500, 128).map((id) => requireId(id, 'ids'))
     const profiles = await engine.testProfiles(profileIds)
     broadcast()
-    return profiles
+    return publicProfiles(profiles)
   })
 
   handleIpc('ip:check', async () => {
@@ -757,11 +783,24 @@ function registerIpc(): void {
     return store.getSessions()
   })
 
-  handleIpc('clipboard:write', (_event, text: string) => {
-    clipboard.writeText(requireString(text, 'text', 1_000_000))
+  handleIpc('profiles:import-clipboard', async () => {
+    const text = (await clipboard.readText()).trim()
+    if (!text) throw new Error('The clipboard is empty. Copy a subscription URL or a share link first.')
+    return importAnything(text)
   })
 
-  handleIpc('clipboard:read', () => clipboard.readText())
+  handleIpc('profiles:copy-link', (_event, id: string) => {
+    const profile = store.getProfile(requireId(id, 'profileId'))
+    if (!profile) throw new Error('Profile not found')
+    const link = profile.raw?.trim()
+    if (!link) {
+      throw new Error(
+        'The share link for this profile is unavailable — re-import it or unlock the OS keyring'
+      )
+    }
+    // The link never leaves the main process; only the clipboard receives it.
+    clipboard.writeText(link)
+  })
 
   handleIpc('core:refresh', async () => {
     const core = await engine.refreshCore()
@@ -825,7 +864,7 @@ function registerIpc(): void {
     const target = id === null ? null : requireEngineId(id)
     const profiles = engine.setProfileEngine(requireId(profileId, 'profileId'), target)
     broadcast()
-    return profiles
+    return publicProfiles(profiles)
   })
 
   handleIpc('engine-history:clear', () => {
@@ -879,14 +918,42 @@ function registerIpc(): void {
   /* ---------------------------------------------------------------- */
 
   handleIpc('backup:export', async () => {
+    const security = store.getSecretStatus()
+    const warning = await dialog.showMessageBox({
+      type: 'warning',
+      title: 'Export Eaglet backup',
+      message: 'Backups can contain connection secrets',
+      detail:
+        'Share links and subscription URLs may contain passwords and access tokens. ' +
+        'Exporting them writes those secrets to the chosen file in readable form.\n\n' +
+        'Export without secrets keeps your settings and server list, but the profiles must be re-imported before they can connect.' +
+        (security.secretStorage === 'encrypted'
+          ? ''
+          : '\n\nWarning: the OS keyring is not protecting secrets in this profile; they are already stored in config.json without encryption.'),
+      buttons: ['Export without secrets', 'Export with secrets', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true
+    })
+    if (warning.response === 2) return null
+    const includeSecrets = warning.response === 1
+
+    const profiles = includeSecrets ? store.getProfiles() : publicProfiles(store.getProfiles())
+    const subscriptions = includeSecrets
+      ? store.getSubscriptions()
+      : store.getSubscriptions().map((subscription) => ({ ...subscription, url: '' }))
+    if (!includeSecrets) {
+      for (const profile of profiles) profile.raw = ''
+    }
     const payload: BackupPayload = {
       format: 'eaglet-backup',
       version: 1,
       createdAt: Date.now(),
       settings: store.getSettings(),
-      profiles: store.getProfiles(),
-      subscriptions: store.getSubscriptions(),
-      scenarios: store.getScenarios()
+      profiles,
+      subscriptions,
+      scenarios: store.getScenarios(),
+      includesSecrets: includeSecrets
     }
     const result = await dialog.showSaveDialog({
       title: 'Export Eaglet backup',
@@ -895,7 +962,12 @@ function registerIpc(): void {
     })
     if (result.canceled || !result.filePath) return null
     writeFileSync(result.filePath, JSON.stringify(payload, null, 2), 'utf-8')
-    engine.pushExternalLog('success', `Backup exported · ${payload.profiles.length} profiles`)
+    engine.pushExternalLog(
+      includeSecrets ? 'warn' : 'success',
+      includeSecrets
+        ? `Backup exported with plaintext secrets · ${payload.profiles.length} profiles`
+        : `Backup exported without secrets · ${payload.profiles.length} profiles`
+    )
     broadcast()
     return result.filePath
   })
@@ -920,6 +992,15 @@ function registerIpc(): void {
     engine.reconcileProfiles()
     scheduleSubscriptionUpdates()
     engine.pushExternalLog('success', `Backup imported · ${raw.profiles.length} profiles`)
+    if (raw.includesSecrets) {
+      const security = store.getSecretStatus()
+      engine.pushExternalLog(
+        security.secretStorage === 'encrypted' ? 'info' : 'warn',
+        security.secretStorage === 'encrypted'
+          ? 'Backup contained plaintext secrets; they were moved into the encrypted vault'
+          : 'Backup contained plaintext secrets and the OS keyring is unavailable; they remain in config.json without encryption'
+      )
+    }
     logProfileEvent('import', 'Configuration restored from a backup')
     broadcast()
     return snapshot()
@@ -927,6 +1008,19 @@ function registerIpc(): void {
 
   handleIpc('config:export', async () => {
     const exported = engine.buildExportConfig()
+    const warning = await dialog.showMessageBox({
+      type: 'warning',
+      title: 'Export core configuration',
+      message: 'This configuration contains credentials in plaintext',
+      detail:
+        'The native core configuration includes the node UUID/password and any TLS secrets needed to connect. ' +
+        'Anyone who can read the exported file can use those credentials. Store it securely and delete it when it is no longer needed.',
+      buttons: ['Export configuration', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true
+    })
+    if (warning.response !== 0) return null
     const result = await dialog.showSaveDialog({
       title: `Export ${exported.engine} configuration`,
       defaultPath: `eaglet-${exported.engine}-config.${exported.extension}`,

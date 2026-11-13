@@ -8,6 +8,7 @@ import type {
   Profile,
   ProfileEvent,
   Scenario,
+  SecurityState,
   SessionRecord,
   Settings,
   Subscription
@@ -271,14 +272,25 @@ export class Store {
     if (this.data.settings.activeProfileId === id) {
       this.data.settings.activeProfileId = this.data.profiles[0]?.id ?? null
     }
-    this.vault.delete(profileSecretKey(id))
+    try {
+      this.vault.delete(profileSecretKey(id))
+    } catch {
+      // The keyring may be unavailable; the orphaned vault entry is harmless
+      // and removing the profile itself must still succeed.
+    }
     this.save()
   }
 
   removeProfilesBySource(sourceId: string): void {
     const removed = this.data.profiles.filter((profile) => profile.sourceId === sourceId)
     this.data.profiles = this.data.profiles.filter((profile) => profile.sourceId !== sourceId)
-    for (const profile of removed) this.vault.delete(profileSecretKey(profile.id))
+    for (const profile of removed) {
+      try {
+        this.vault.delete(profileSecretKey(profile.id))
+      } catch {
+        // Keep going when the keyring is unavailable.
+      }
+    }
     const active = this.data.settings.activeProfileId
     if (active && !this.data.profiles.some((profile) => profile.id === active)) {
       this.data.settings.activeProfileId = this.data.profiles[0]?.id ?? null
@@ -303,6 +315,45 @@ export class Store {
     })
   }
 
+  /**
+   * Describes where secrets really live. The renderer shows this so a missing
+   * OS keyring (or an unreadable vault) is never presented as encrypted storage.
+   */
+  getSecretStatus(): SecurityState {
+    const plaintextProfiles = this.data.profiles.filter((profile) => Boolean(profile.raw?.trim())).length
+    const plaintextSubscriptions = this.data.subscriptions.filter((subscription) =>
+      Boolean(subscription.url?.trim())
+    ).length
+    const warnings: string[] = []
+    const status = this.vault.status()
+
+    if (status === 'unavailable') {
+      warnings.push(
+        'The OS keyring is unavailable. Connection links are kept in config.json without encryption until a keyring is available.'
+      )
+    } else if (status === 'corrupt') {
+      warnings.push(
+        'The encrypted secret vault could not be decrypted. Profiles are preserved, but their share links must be re-imported. The vault file was not modified.'
+      )
+    }
+    if (this.vault.error() && !warnings.includes(this.vault.error() as string)) {
+      warnings.push(this.vault.error() as string)
+    }
+    if (plaintextProfiles > 0 || plaintextSubscriptions > 0) {
+      warnings.push(
+        `${plaintextProfiles + plaintextSubscriptions} connection secret(s) are written to config.json in plaintext.`
+      )
+    }
+
+    return {
+      secretStorage: status,
+      plaintextProfiles,
+      plaintextSubscriptions,
+      migrated: this.vault.wasMigrated(),
+      warnings
+    }
+  }
+
   upsertSubscription(subscription: Subscription): void {
     const index = this.data.subscriptions.findIndex((item) => item.id === subscription.id)
     const stored = this.stashSubscription(subscription)
@@ -314,7 +365,11 @@ export class Store {
 
   removeSubscription(id: string): void {
     this.data.subscriptions = this.data.subscriptions.filter((item) => item.id !== id)
-    this.vault.delete(subscriptionSecretKey(id))
+    try {
+      this.vault.delete(subscriptionSecretKey(id))
+    } catch {
+      // The keyring may be unavailable; the subscription itself is still gone.
+    }
     this.save()
   }
 
@@ -386,24 +441,41 @@ export class Store {
     scenarios: Scenario[]
   }): void {
     const secrets: Record<string, string> = {}
-    const profiles = payload.profiles.map((profile) => {
-      const raw = profile.raw?.trim()
+    for (const profile of payload.profiles) {
+      const raw = typeof profile.raw === 'string' ? profile.raw.trim() : ''
       if (raw) secrets[profileSecretKey(profile.id)] = raw
-      return {
-        ...profile,
-        raw: '',
-        favorite: Boolean(profile.favorite),
-        engine: profile.engine ?? null,
-        geo: profile.geo ?? null,
-        quality: Array.isArray(profile.quality) ? profile.quality.slice(-QUALITY_LIMIT) : []
-      }
-    })
-    const subscriptions = payload.subscriptions.map((subscription) => {
-      const url = subscription.url?.trim()
+    }
+    for (const subscription of payload.subscriptions) {
+      const url = typeof subscription.url === 'string' ? subscription.url.trim() : ''
       if (url) secrets[subscriptionSecretKey(subscription.id)] = url
-      return { ...subscription, url: '' }
-    })
-    this.vault.replaceAll(secrets)
+    }
+
+    // If the keyring is unavailable the import still succeeds; the secrets are
+    // kept in config.json, and getSecretStatus() tells the user they are not
+    // encrypted. Losing the whole backup would be worse than a clear warning.
+    // The vault is replaced even when the backup has no secrets, so a
+    // secrets-free import cannot resurrect old entries with the same ids.
+    let storedInVault = false
+    try {
+      this.vault.replaceAll(secrets)
+      storedInVault = true
+    } catch {
+      storedInVault = Object.keys(secrets).length === 0
+    }
+
+    const profiles = payload.profiles.map((profile) => ({
+      ...profile,
+      raw: storedInVault ? '' : typeof profile.raw === 'string' ? profile.raw.trim() : '',
+      favorite: Boolean(profile.favorite),
+      engine: profile.engine ?? null,
+      geo: profile.geo ?? null,
+      quality: Array.isArray(profile.quality) ? profile.quality.slice(-QUALITY_LIMIT) : []
+    }))
+    const subscriptions = payload.subscriptions.map((subscription) => ({
+      ...subscription,
+      url: storedInVault ? '' : typeof subscription.url === 'string' ? subscription.url.trim() : ''
+    }))
+
     this.data.settings = { ...DEFAULT_SETTINGS, ...payload.settings }
     this.data.profiles = profiles
     this.data.subscriptions = subscriptions

@@ -35,21 +35,43 @@ the local inbound and restores every system change on disconnect or crash.
   disconnect, quit or after a crash. Unsupported desktops fail loudly.
 - **Network Protection** — a real kill switch (Windows Firewall policy, macOS
   `pf` anchor, Linux `iptables`/`ip6tables` chains) plus a local DoH relay. The
-  rules whitelist only loopback, DHCP, link-local, the selected node address and
-  port, the pinned DoH resolver and the previously configured DNS resolvers —
-  there is no “any DNS” or “any program” exception. IPv6 is blocked on purpose
-  even for IPv4-only nodes. Both layers require an elevated process and report
-  honestly when elevation is missing.
+  rules whitelist only loopback, DHCP/ND, the selected node IP and port, the
+  pinned DoH IP/port, the resolved subscription/update endpoints on their real
+  ports and — only when DNS protection is **off** — the previous resolvers on
+  port 53. Windows rules are also bound to the Eaglet/core executable; there is
+  no broad `80/443` or “any program” exception. When DNS protection is on, every
+  plaintext DNS rule is removed and the loopback relay is the only resolver.
+  Auto-reconnect keeps the rules armed: the core resolves through the relay (or
+  the already-allowed resolvers), and the existing policy — which already
+  permits the same node — is left untouched until the tunnel is confirmed. The
+  rules are rebuilt from a fresh backup on the next manual connection. If all
+  retries fail the rules stay armed until the user disconnects.
+- **IPv6 fails closed** — IPv6 is blocked even for IPv4-only nodes. On Linux a
+  missing/unusable `ip6tables` aborts the whole kill switch (and removes the
+  IPv4 chain) unless the kernel really has IPv6 disabled. macOS saves the
+  previous `pf` enabled state and the rules inside Eaglet's own anchor, then
+  restores both on disconnect or crash; the user's main ruleset is never
+  replaced.
+- **Crash recovery** — Windows leaves a policy backup, Linux an `iptables`
+  marker and macOS a `pf` backup. The next launch removes stale rules and
+  restores the original outbound/resolver state before connecting.
 - **DNS Protection** — a real dual-stack DNS-over-HTTPS relay on `127.0.0.1:53`
-  and `::1:53`. The DoH endpoint is resolved to an IP *before* the system
-  resolver is redirected, then queried over HTTPS with the original SNI/Host and
-  certificate validation. IPv4 and IPv6 resolvers are backed up together and
-  restored before the relay stops; a failed restore keeps the backup for the
-  next launch.
+  and, when it binds successfully, `::1:53`. The DoH endpoint is resolved to an
+  IP *before* the system resolver is redirected, then queried over HTTPS with
+  the original SNI/Host and certificate validation. IPv4 and IPv6 resolvers are
+  backed up together and restored before the relay stops; a failed restore keeps
+  the backup for the next launch, and IPv6 loopback is only advertised when the
+  IPv6 listener actually exists.
 - **Secrets stay out of `config.json`** — profile share links and subscription
   URLs are encrypted with Electron `safeStorage` (DPAPI/Keychain/libsecret) in a
-  separate atomically-written vault. Legacy configs migrate automatically; if
-  no keyring exists, the fallback is explicit and marked in the file.
+  separate atomically-written vault. Base64 is **not** treated as encryption: if
+  the OS keyring is unavailable the vault refuses to write and the UI reports
+  `unavailable`; the profile stays usable because its link is kept in
+  `config.json` with an explicit plaintext warning. A vault that cannot be
+  decrypted is never renamed, overwritten or discarded, so profiles and their
+  metadata survive until the keyring is fixed. Snapshot IPC never includes raw
+  links or subscription tokens; copying a link and refreshing a subscription are
+  main-process operations.
 - **Hardened Electron shell** — sandboxed renderer, context isolation, no Node
   integration, no webviews, navigation and `window.open` denied, external links
   restricted to http(s), a sender/main-frame check on every IPC call, validated
@@ -83,7 +105,8 @@ the local inbound and restores every system change on disconnect or crash.
 - **Quick connect** — pings a bounded sample of nodes in parallel and connects to
   the fastest one, preferring nodes you starred.
 - **Favourites and clipboard** — pin any node with a star, copy its share link,
-  and paste a link or subscription URL straight from the clipboard.
+  and import a link or subscription URL straight from the clipboard. Both
+  operations happen in the main process, so the renderer never sees the secret.
 - **Real speed test** — downloads 10 MB through the live tunnel and reports the
   measured Mbps; nothing is simulated.
 - **Session history** — every finished session is persisted with duration,
@@ -95,7 +118,9 @@ the local inbound and restores every system change on disconnect or crash.
   with a growing delay and restores protection and the system proxy.
 - **Backup and export** — settings, profiles, subscriptions and scenarios can be
   exported/imported as JSON; the active core configuration can be exported as a
-  native file.
+  native file. The backup dialog explains that share links and subscription URLs
+  may contain credentials and offers an export **without secrets**. Exporting a
+  core configuration always warns that the file contains plaintext credentials.
 - **QR import** — decodes one or more QR payloads from an image with `jsqr`.
 - **Desktop notifications and tray** — connect, disconnect, drop and
   exit-IP-change events reach the OS notification centre.

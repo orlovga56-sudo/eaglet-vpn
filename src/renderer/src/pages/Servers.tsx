@@ -171,7 +171,7 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
 
   const copyLink = async (profile: Profile): Promise<void> => {
     try {
-      await window.eaglet.copyText(profile.raw)
+      await window.eaglet.copyProfileLink(profile.id)
       setCopied(profile.id)
       window.setTimeout(() => setCopied((current) => (current === profile.id ? null : current)), 1400)
     } catch (error) {
@@ -181,13 +181,14 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
 
   const pasteFromClipboard = async (): Promise<void> => {
     try {
-      const text = (await window.eaglet.readClipboard()).trim()
-      if (!text) {
-        setMessage({ tone: 'err', text: 'The clipboard is empty. Copy a subscription URL or a share link first.' })
-        return
-      }
-      setInput(text)
-      setMessage({ tone: 'ok', text: 'Pasted from the clipboard — press Import to add it.' })
+      // The main process reads and validates the clipboard itself; share links
+      // (and their passwords/tokens) never enter the renderer.
+      const result = await window.eaglet.importClipboard()
+      const total = result.imported + result.updated
+      setMessage({
+        tone: 'ok',
+        text: total > 0 ? `Imported ${total} node(s) from the clipboard.` : 'Nothing new was imported.'
+      })
     } catch (error) {
       setMessage({ tone: 'err', text: cleanError(error) })
     }
@@ -220,9 +221,8 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
 
   const addSelectedFree = async (): Promise<void> => {
     if (!free || selectedFree.size === 0) return
-    const links = free.profiles.filter((profile) => selectedFree.has(profile.id)).map((profile) => profile.raw)
     try {
-      const result = await window.eaglet.addFreeProfiles(links)
+      const result = await window.eaglet.addFreeProfiles([...selectedFree])
       setFree(null)
       setSelectedFree(new Set())
       setMessage({
@@ -275,9 +275,13 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
             placeholder="https://provider.example/sub/abc  ·  vless://…  ·  ss://…"
             spellCheck={false}
           />
-          <button className="btn" onClick={() => void pasteFromClipboard()} title="Paste from the clipboard">
+          <button
+            className="btn"
+            onClick={() => void pasteFromClipboard()}
+            title="Read the clipboard in the main process and import it"
+          >
             <ClipboardIcon />
-            Paste
+            Paste &amp; import
           </button>
           <button className="btn primary" onClick={() => void runImport()} disabled={busy || !input.trim()}>
             {busy ? 'Importing…' : 'Import'}

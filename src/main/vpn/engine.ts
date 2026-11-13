@@ -569,6 +569,14 @@ export class VpnEngine extends EventEmitter {
     }
 
     const settings = this.store.getSettings()
+    // Protection that survived a crash stays armed while the automatic
+    // reconnect retries. The core keeps resolving through the running relay
+    // (or the already-allowed resolvers) and the previous node rule still
+    // matches, so ordinary traffic cannot leak during the retry loop.
+    const preserveProtection =
+      automatic &&
+      (settings.killSwitch || settings.networkProtection) &&
+      (this.runtime.killSwitchApplied || this.runtime.dnsGuardApplied)
     const previousEngine = this.runtime.engine ?? null
     const forced = this.forcedEngine
     const choice: { id: EngineId; reason: EngineSwitchRecord['reason'] } =
@@ -582,7 +590,7 @@ export class VpnEngine extends EventEmitter {
         `${this.manager.adapter(preference).name} cannot carry this profile · using ${this.manager.adapter(choice.id).name}`
       )
     }
-    await this.clearStaleProtection()
+    await this.clearStaleProtection(preserveProtection)
     this.runtime.transition = true
     this.status = 'connecting'
     this.error = null
@@ -683,6 +691,15 @@ export class VpnEngine extends EventEmitter {
         }
       } else if (settings.tunMode) {
         this.pushLog('info', 'TUN mode active · traffic captured at the adapter level')
+      } else if (this.runtime.proxyApplied) {
+        // The setting was turned off while protection stayed armed across a
+        // reconnect; remove the stale proxy configuration.
+        try {
+          await disableSystemProxy()
+        } catch {
+          // Ignore — a missing backup simply disables the proxy.
+        }
+        this.runtime.proxyApplied = false
       }
 
       await this.applyProtection(profile, binary, settings)
@@ -699,7 +716,10 @@ export class VpnEngine extends EventEmitter {
       const message = (error as Error).message || 'Unknown connection error'
       this.pushLog('error', message)
       this.error = message
-      await this.teardown(false)
+      await this.teardown(preserveProtection)
+      if (preserveProtection) {
+        this.pushLog('warn', 'Kill switch stays armed · direct traffic is still blocked')
+      }
       this.status = 'error'
       this.stage = null
       this.progress = 0
@@ -713,7 +733,8 @@ export class VpnEngine extends EventEmitter {
    * Removes protection layers left over from a crashed session before a new
    * handshake. They are re-armed as soon as the tunnel is verified.
    */
-  private async clearStaleProtection(): Promise<void> {
+  private async clearStaleProtection(preserve = false): Promise<void> {
+    if (preserve) return
     if (this.runtime.killSwitchApplied) {
       try {
         await disableKillSwitch()
@@ -775,9 +796,19 @@ export class VpnEngine extends EventEmitter {
         this.pushLog('warn', 'Kill switch skipped · a direct profile is not a tunnel')
       } else if (!killSwitchSupported()) {
         this.pushLog('warn', 'Kill switch is not implemented on this platform')
+      } else if (this.runtime.killSwitchApplied) {
+        // The policy survived the crash and already permits this node. Calling
+        // enable() again would overwrite the saved pre-arm state with the
+        // already-blocked state (Windows) or with our own anchor rules (macOS),
+        // which would make a later disable() permanent. Leave it untouched.
+        this.pushLog('info', 'Kill switch already armed for this node · policy kept')
       } else {
         try {
-          const ips = await enableKillSwitch(profile, binary, settings)
+          const subscriptionUrls = this.store
+            .getSubscriptions()
+            .map((subscription) => subscription.url)
+            .filter((url) => /^https?:\/\//i.test(url))
+          const ips = await enableKillSwitch(profile, binary, settings, subscriptionUrls)
           this.runtime.killSwitchApplied = true
           this.killSwitchActive = true
           this.pushLog(
@@ -799,6 +830,12 @@ export class VpnEngine extends EventEmitter {
         this.pushLog('success', `DNS protection active · DoH relay ${stats.endpoint ?? 'configured'}`)
       } catch (error) {
         this.pushLog('warn', `DNS protection could not start: ${(error as Error).message}`)
+        if (this.runtime.killSwitchApplied && (settings.dnsProtection || settings.networkProtection)) {
+          this.pushLog(
+            'error',
+            'Kill switch is armed without the DNS relay · plaintext DNS is blocked until you disconnect'
+          )
+        }
       }
     }
   }
@@ -951,6 +988,12 @@ export class VpnEngine extends EventEmitter {
     if (!this.store.getSettings().autoReconnect) return
     if (this.runtime.reconnectAttempts >= 3) {
       this.pushLog('error', 'Auto-reconnect gave up after 3 attempts')
+      if (this.runtime.killSwitchApplied || this.runtime.dnsGuardApplied) {
+        this.pushLog(
+          'warn',
+          'Protection stays armed after the failed reconnects · disconnect to restore direct access'
+        )
+      }
       this.emitUpdate()
       return
     }
@@ -966,30 +1009,10 @@ export class VpnEngine extends EventEmitter {
       this.runtime.reconnectTimer = null
       void (async () => {
         if (this.runtime.userStop) return
-        // Protection layers are removed just before reconnecting so the core can
-        // resolve its node again; they are re-armed right after the handshake.
-        if (this.runtime.killSwitchApplied) {
-          try {
-            await disableKillSwitch()
-          } catch {
-            // Ignore — the restore path also clears partial rules.
-          }
-          this.runtime.killSwitchApplied = false
-          this.killSwitchActive = false
-        }
-        if (this.runtime.dnsGuardApplied) {
-          await stopDnsGuard()
-          this.runtime.dnsGuardApplied = false
-          this.dnsProtectionActive = false
-        }
-        if (this.runtime.proxyApplied) {
-          try {
-            await disableSystemProxy()
-          } catch {
-            // Ignore — a missing backup simply disables the proxy.
-          }
-          this.runtime.proxyApplied = false
-        }
+        // The kill switch and DNS relay stay armed on purpose: connect() with
+        // `automatic` keeps them, and the existing policy already permits the
+        // same node. Dropping them here would reopen direct access for the
+        // whole retry loop.
         await this.connect(this.profileId ?? undefined, true)
         if (this.status === 'connected') {
           this.runtime.reconnectAttempts = 0
@@ -1064,6 +1087,18 @@ export class VpnEngine extends EventEmitter {
   /* ------------------------------------------------------------------ */
 
   async testProfiles(ids?: string[]): Promise<Profile[]> {
+    if (this.killSwitchActive) {
+      // A latency probe opens a direct TCP connection to every node. The kill
+      // switch deliberately does not allow the app to reach arbitrary node
+      // addresses, so report the limitation instead of appearing to "test"
+      // through a blocked path.
+      this.pushLog(
+        'warn',
+        'Latency tests are unavailable while the kill switch is armed — disconnect to measure nodes'
+      )
+      this.emitUpdate()
+      return this.store.getProfiles()
+    }
     const targets = this.store
       .getProfiles()
       .filter((profile) => !ids || ids.length === 0 || ids.includes(profile.id))

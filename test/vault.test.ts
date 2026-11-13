@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -34,6 +34,7 @@ describe('SecretVault', () => {
     expect(JSON.parse(raw)).toMatchObject({ version: 1, encrypted: true })
     expect(vault.get('profile:a')).toBe(LINK)
     expect(vault.has('profile:a')).toBe(true)
+    expect(vault.status()).toBe('encrypted')
   })
 
   it('reloads, overwrites and deletes entries', () => {
@@ -49,16 +50,66 @@ describe('SecretVault', () => {
     expect(new SecretVault(file).get('profile:a')).toBeNull()
   })
 
-  it('marks the fallback when no OS keyring is available', () => {
+  it('refuses to write plaintext when the OS keyring is unavailable', () => {
     vi.spyOn(safeStorage, 'isEncryptionAvailable').mockReturnValue(false)
     const file = join(tempDir(), 'secrets.bin')
     const vault = new SecretVault(file)
-    vault.set('profile:a', LINK)
 
-    const payload = JSON.parse(readFileSync(file, 'utf-8')) as { encrypted: boolean; data: string }
-    expect(payload.encrypted).toBe(false)
-    expect(Buffer.from(payload.data, 'base64').toString('utf-8')).toContain('vless://')
+    expect(vault.status()).toBe('unavailable')
+    expect(() => vault.set('profile:a', LINK)).toThrow(/encrypt|keyring/i)
+    expect(existsSync(file)).toBe(false)
+    expect(vault.get('profile:a')).toBeNull()
+  })
+
+  it('never overwrites a vault it cannot decrypt', () => {
+    const dir = tempDir()
+    const file = join(dir, 'secrets.bin')
+    const corrupt = {
+      version: 1,
+      encrypted: true,
+      data: Buffer.from('not-json-at-all', 'utf-8').toString('base64')
+    }
+    writeFileSync(file, JSON.stringify(corrupt), 'utf-8')
+
+    const vault = new SecretVault(file)
+    expect(vault.status()).toBe('corrupt')
+    expect(() => vault.set('profile:a', LINK)).toThrow(/overwrite|read/i)
+    expect(readFileSync(file, 'utf-8')).toBe(JSON.stringify(corrupt))
+    expect(readdirSync(dir).filter((name) => name.includes('.corrupt-'))).toHaveLength(0)
+  })
+
+  it('keeps an encrypted vault locked when this launch has no keyring', () => {
+    const file = join(tempDir(), 'secrets.bin')
+    const original = new SecretVault(file)
+    original.set('profile:a', LINK)
+    const before = readFileSync(file, 'utf-8')
+
+    vi.spyOn(safeStorage, 'isEncryptionAvailable').mockReturnValue(false)
+    const locked = new SecretVault(file)
+    expect(locked.status()).toBe('unavailable')
+    expect(locked.get('profile:a')).toBeNull()
+    expect(() => locked.set('profile:b', LINK)).toThrow(/overwrite|keyring/i)
+    expect(readFileSync(file, 'utf-8')).toBe(before)
+  })
+
+  it('reads a legacy base64 vault once and re-encrypts it', () => {
+    const dir = tempDir()
+    const file = join(dir, 'secrets.bin')
+    const legacy = {
+      version: 1,
+      encrypted: false,
+      data: Buffer.from(JSON.stringify({ 'profile:a': LINK }), 'utf-8').toString('base64')
+    }
+    writeFileSync(file, JSON.stringify(legacy), 'utf-8')
+
+    const vault = new SecretVault(file)
     expect(vault.get('profile:a')).toBe(LINK)
+    expect(vault.status()).toBe('encrypted')
+    expect(vault.wasMigrated()).toBe(true)
+
+    const rewritten = JSON.parse(readFileSync(file, 'utf-8')) as { encrypted: boolean; data: string }
+    expect(rewritten.encrypted).toBe(true)
+    expect(readFileSync(file, 'utf-8')).not.toContain('vless://')
   })
 
   it('replaces the whole set and ignores blank values', () => {
@@ -98,6 +149,11 @@ describe('Store secret migration', () => {
     expect(store.getProfiles()[0].raw).toBe(LINK)
     expect(store.getSubscriptions()[0].url).toBe(SUBSCRIPTION_URL)
     expect(store.getSettings().theme).toBe('minimal')
+    expect(store.getSecretStatus()).toMatchObject({
+      secretStorage: 'encrypted',
+      plaintextProfiles: 0,
+      plaintextSubscriptions: 0
+    })
 
     const config = readFileSync(file, 'utf-8')
     expect(config).not.toContain('vless://')
@@ -133,6 +189,38 @@ describe('Store secret migration', () => {
     const store = new Store(file, vault)
     expect(store.getProfiles()[0].raw).toBe(LINK)
     expect(readFileSync(file, 'utf-8')).toContain('vless://')
+    expect(store.getSecretStatus().plaintextProfiles).toBe(1)
+  })
+
+  it('preserves profile metadata when the vault cannot be decrypted', () => {
+    const dir = tempDir()
+    const file = join(dir, 'config.json')
+    writeFileSync(
+      file,
+      JSON.stringify({
+        settings: makeSettings(),
+        profiles: [makeProfile({ id: 'p1', raw: '' })],
+        subscriptions: []
+      }),
+      'utf-8'
+    )
+    writeFileSync(
+      join(dir, 'secrets.bin'),
+      JSON.stringify({
+        version: 1,
+        encrypted: true,
+        data: Buffer.from('broken', 'utf-8').toString('base64')
+      }),
+      'utf-8'
+    )
+
+    const store = new Store(file, new SecretVault(join(dir, 'secrets.bin')))
+    expect(store.getProfiles()).toHaveLength(1)
+    expect(store.getProfiles()[0].name).toBe('Test node')
+    const security = store.getSecretStatus()
+    expect(security.secretStorage).toBe('corrupt')
+    expect(security.warnings.join(' ')).toMatch(/could not be decrypted/i)
+    expect(existsSync(join(dir, 'secrets.bin'))).toBe(true)
   })
 
   it('stashes newly imported profiles and removes secrets with the profile', () => {
@@ -167,5 +255,31 @@ describe('Store secret migration', () => {
     const config = readFileSync(file, 'utf-8')
     expect(config).not.toContain('vless://')
     expect(config).not.toContain('topsecret')
+  })
+
+  it('keeps backup secrets usable in config when the vault is unavailable', () => {
+    const dir = tempDir()
+    const file = join(dir, 'config.json')
+    const vault = new SecretVault(join(dir, 'secrets.bin'))
+    vi.spyOn(vault, 'replaceAll').mockImplementation(() => {
+      throw new Error('keyring unavailable')
+    })
+    const store = new Store(file, vault)
+    store.replaceAll({
+      settings: makeSettings(),
+      profiles: [makeProfile({ id: 'fallback', raw: LINK })],
+      subscriptions: [
+        { id: 'sub2', name: 'Backup', url: SUBSCRIPTION_URL, updatedAt: 1, count: 1 }
+      ],
+      scenarios: []
+    })
+
+    expect(store.getProfile('fallback')?.raw).toBe(LINK)
+    expect(store.getSubscriptions()[0].url).toBe(SUBSCRIPTION_URL)
+    const config = readFileSync(file, 'utf-8')
+    expect(config).toContain('vless://')
+    expect(config).toContain('topsecret')
+    expect(store.getSecretStatus().plaintextProfiles).toBe(1)
+    expect(store.getSecretStatus().plaintextSubscriptions).toBe(1)
   })
 })

@@ -60,12 +60,15 @@ function restoreScript(backup: PolicyBackup): string {
  * Block and only these scoped rules remain:
  *  - loopback (local proxy, DoH relay),
  *  - the core executable → the selected node IPs and ports,
- *  - Eaglet → DoH endpoints, subscription endpoints (80/443) and DNS,
- *  - the core → the current DNS servers on port 53 while protection warms up,
+ *  - core/app → the current DNS servers on port 53 *only when DNS protection
+ *    is off*; with the loopback DoH relay active there is no plaintext DNS
+ *    exception at all,
+ *  - Eaglet → the exact DoH IP/port and the resolved subscription/update
+ *    endpoints on their real ports,
  *  - DHCP so the interface keeps its lease.
- * No rule allows arbitrary programs, and the node rule is bound to the core
- * executable and the node port, so ordinary traffic cannot leave around the
- * tunnel by dialing the node directly.
+ * No rule allows arbitrary programs or arbitrary port 80/443 destinations,
+ * and the node rule is bound to the core executable and node port, so ordinary
+ * traffic cannot leave around the tunnel by dialing the node directly.
  */
 export function windowsKillSwitchScript(context: KillSwitchContext): string {
   const lines: string[] = []
@@ -76,11 +79,13 @@ export function windowsKillSwitchScript(context: KillSwitchContext): string {
   }
   const ips = (values: string[]): string => values.map(psQuote).join(',')
   const ports = (values: number[]): string => values.join(',')
+  const validPorts = (values: number[]): number[] =>
+    [...new Set(values.filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))]
 
   allow('loopback', `-RemoteAddress '127.0.0.0/8','::1'`)
 
   const serverIps = context.serverIps.filter(Boolean)
-  const serverPorts = context.serverPorts.filter((port) => Number.isInteger(port) && port > 0 && port <= 65535)
+  const serverPorts = validPorts(context.serverPorts)
   if (context.corePath && serverIps.length > 0 && serverPorts.length > 0) {
     for (const protocol of ['TCP', 'UDP']) {
       allow(
@@ -90,31 +95,59 @@ export function windowsKillSwitchScript(context: KillSwitchContext): string {
     }
   }
 
-  const dohPorts = context.dohPorts.filter((port) => Number.isInteger(port) && port > 0 && port <= 65535)
-  if (context.dohIps.length > 0 && dohPorts.length > 0) {
-    for (const port of [...new Set(dohPorts)]) {
-      allow(
-        `DoH ${port}`,
-        `-Program ${psQuote(context.appPath)} -RemoteAddress ${ips(context.dohIps)} -RemotePort ${port} -Protocol TCP`
-      )
+  // The DoH relay only exists while DNS protection is active. Allow it only
+  // then, and only towards the pinned resolver address and port.
+  if (context.dnsProtected) {
+    const dohPorts = validPorts(context.dohPorts)
+    if (context.dohIps.length > 0 && dohPorts.length > 0) {
+      for (const port of dohPorts) {
+        allow(
+          `DoH app ${port}`,
+          `-Program ${psQuote(context.appPath)} -RemoteAddress ${ips(context.dohIps)} -RemotePort ${port} -Protocol TCP`
+        )
+        if (context.corePath) {
+          allow(
+            `DoH core ${port}`,
+            `-Program ${psQuote(context.corePath)} -RemoteAddress ${ips(context.dohIps)} -RemotePort ${port} -Protocol TCP`
+          )
+        }
+      }
     }
   }
 
   const dnsServers = context.dnsServers.filter(Boolean)
-  if (dnsServers.length > 0) {
-    // DNS stays usable for every program but only towards the resolvers that
-    // were configured before the tunnel started. That is a narrow, auditable
-    // exception instead of the old "any address, port 53" hole.
+  if (!context.dnsProtected && dnsServers.length > 0) {
+    // Without the loopback relay the core and Eaglet still need the system
+    // resolvers. Scope them to those two executables; other programs get no
+    // DNS exception and must use the tunnel.
     for (const protocol of ['TCP', 'UDP']) {
       allow(
-        `DNS ${protocol}`,
-        `-RemoteAddress ${ips(dnsServers)} -RemotePort 53 -Protocol ${protocol}`
+        `DNS core ${protocol}`,
+        `-Program ${psQuote(context.corePath ?? context.appPath)} -RemoteAddress ${ips(dnsServers)} -RemotePort 53 -Protocol ${protocol}`
+      )
+      if (context.corePath) {
+        allow(
+          `DNS app ${protocol}`,
+          `-Program ${psQuote(context.appPath)} -RemoteAddress ${ips(dnsServers)} -RemotePort 53 -Protocol ${protocol}`
+        )
+      }
+    }
+  }
+
+  // Resolved subscription servers, update checks and the IP probe. Every rule
+  // names one executable, one concrete address and one concrete port.
+  for (const endpoint of context.appEndpoints) {
+    const endpointIps = endpoint.ips.filter(Boolean)
+    const endpointPorts = validPorts(endpoint.ports)
+    if (endpointIps.length === 0 || endpointPorts.length === 0) continue
+    for (const port of endpointPorts) {
+      allow(
+        `app endpoint ${port}`,
+        `-Program ${psQuote(context.appPath)} -RemoteAddress ${ips(endpointIps)} -RemotePort ${port} -Protocol TCP`
       )
     }
   }
 
-  // Subscriptions, update checks and the DoH relay live in the Electron app.
-  allow('app web', `-Program ${psQuote(context.appPath)} -Protocol TCP -RemotePort 80,443`)
   allow('DHCP', `-Protocol UDP -LocalPort 68 -RemotePort 67`)
 
   lines.push('Set-NetFirewallProfile -All -DefaultOutboundAction Block -ErrorAction Stop')
