@@ -191,11 +191,28 @@ export const windowsKillSwitch: KillSwitchBackend = {
 
   async disable(): Promise<void> {
     const backup = loadBackup()
-    await removeRules().catch(() => undefined)
     if (backup) {
-      await runPowerShell(restoreScript(backup)).catch(() => undefined)
-      rmSync(backupPath(), { force: true })
+      try {
+        await runPowerShell(restoreScript(backup))
+        const current = await runPowerShell(
+          `Get-NetFirewallProfile | ForEach-Object { "$($_.Name)=$($_.DefaultOutboundAction)" }`
+        )
+        const currentProfiles: Record<string, string> = {}
+        for (const line of current.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+          const [name, action] = line.split('=')
+          if (name) currentProfiles[name] = action === 'Block' ? 'Block' : 'Allow'
+        }
+        for (const [profile, action] of Object.entries(backup.profiles)) {
+          if (currentProfiles[profile] !== action) {
+            throw new Error(`Firewall restoration verification failed for ${profile}: expected ${action}, got ${currentProfiles[profile]}`)
+          }
+        }
+        rmSync(backupPath(), { force: true })
+      } catch (error) {
+        throw new Error(`Failed to restore firewall: ${(error as Error).message}`)
+      }
     }
+    await removeRules()
   },
 
   disableSync(): void {

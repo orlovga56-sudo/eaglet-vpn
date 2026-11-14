@@ -183,9 +183,11 @@ Key rules:
 
 - `connect(profileId?, automatic?)` — probe direct IP → prepare/install core →
   optional TUN staging → build + validate native config → spawn → wait for the
-  mixed port → verify exit IP → apply system proxy → arm protection → connected.
+  mixed port → verify exit IP → apply system proxy → arm protection (fail-closed)
+  → connected.
 - `applyProtection()` — real kill switch via `firewall/` and real DoH relay via
-  `dns-guard.ts`. Both need elevation; failures are logged, never hidden.
+  `dns-guard.ts`. Both need elevation; failures are logged and a requested but
+  unarmed layer aborts the connect (see Protection layers), never hidden.
 - `setEngine(choice)` — if the tunnel is live, it disconnects, forces the new
   engine, reconnects and verifies the chosen core actually runs; on failure it
   disconnects again, reconnects with the previous engine and restores the
@@ -253,6 +255,17 @@ first, so the flush/repopulate window cannot leak. Manual disconnects and
 explicit engine switches tear the tunnel down and restore direct networking by
 design.
 
+Protection is **fail-closed**. `connect()` arms the kill switch and DNS relay and
+then checks the state it recorded: if `killSwitch`/`networkProtection` was
+requested (the profile is not `direct` and the platform supports it) but the
+policy did not arm, or if `dnsProtection`/`networkProtection` was requested but
+the relay did not start, the connection is torn down and reported as an error
+instead of claiming `connected` on an unprotected tunnel. Windows
+`windowsKillSwitch.disable()` additionally reads the per-profile outbound
+actions back after restoring them and throws if any value differs from the
+backup, so a failed restore is surfaced and retried on the next attempt (or
+launch) rather than silently leaving the machine blocked.
+
 Secrets (share links, subscription URLs) live in `userData/secrets.bin`, written
 atomically and encrypted with Electron `safeStorage`. Base64-only files from old
 builds are migrated once; new plaintext is never written. If the keyring is
@@ -315,7 +328,7 @@ All harnesses write JSON because Electron’s stdout is invisible on Windows.
 - `--eaglet-free-test` / `--eaglet-free-connect-test` — free-server catalogs and
   a real connection to a discovered node.
 - `--eaglet-feature-test` — favourites, bypass rules, speed test, forced core
-  kill and session persistence.
+  kill, session persistence and a stale-proxy recovery check.
 
 ## Testing checklist
 

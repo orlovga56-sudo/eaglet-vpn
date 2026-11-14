@@ -45,7 +45,10 @@ the local inbound and restores every system change on disconnect or crash.
   the already-allowed resolvers), and the existing policy — which already
   permits the same node — is left untouched until the tunnel is confirmed. The
   rules are rebuilt from a fresh backup on the next manual connection. If all
-  retries fail the rules stay armed until the user disconnects.
+  retries fail the rules stay armed until the user disconnects. Protection is
+  **fail-closed**: if the kill switch or the DoH relay is enabled but cannot be
+  armed (for example without elevation), the connection is aborted instead of
+  coming up unprotected.
 - **IPv6 fails closed** — IPv6 is blocked even for IPv4-only nodes. On Linux a
   missing/unusable `ip6tables` aborts the whole kill switch (and removes the
   IPv4 chain) unless the kernel really has IPv6 disabled. macOS saves the

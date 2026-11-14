@@ -11,6 +11,7 @@ import { runEngineTest } from './vpn/engine-test'
 import { isHttpUrl, parseProfileUri, parseProfilesPayload, subscriptionName } from './vpn/profiles'
 import { discoverFreeProfiles } from './vpn/free-sources'
 import { normalizeScenario } from './vpn/scenarios'
+import { recoverStaleProxy } from './vpn/system-proxy'
 import {
   requireBoolean,
   requireEngineChoice,
@@ -1288,7 +1289,13 @@ app.whenReady().then(async () => {
       const sessions = store.getSessions()
       report.sessions = sessions.length
       report.lastSession = sessions[0] ?? null
-      report.proxyRestored = true
+      try {
+        recoverStaleProxy()
+        report.proxyRestored = true
+      } catch (error) {
+        report.proxyRestored = false
+        report.proxyRestoreError = (error as Error).message
+      }
     } catch (error) {
       report.error = (error as Error).message
     }

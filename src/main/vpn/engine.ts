@@ -704,6 +704,20 @@ export class VpnEngine extends EventEmitter {
 
       await this.applyProtection(profile, binary, settings)
 
+      // Fail closed: if protection was requested but could not be armed, do not
+      // leave the user on an unprotected tunnel. A direct profile and an
+      // unsupported platform are deliberate skips, not failures.
+      const killSwitchExpected =
+        (settings.killSwitch || settings.networkProtection) &&
+        profile.protocol !== 'direct' &&
+        killSwitchSupported()
+      if (killSwitchExpected && !this.killSwitchActive) {
+        throw new Error('Kill switch was enabled but could not be armed · connection aborted to avoid a leak')
+      }
+      if ((settings.dnsProtection || settings.networkProtection) && !this.dnsProtectionActive) {
+        throw new Error('DNS protection was enabled but the relay did not start · connection aborted to avoid a leak')
+      }
+
       this.status = 'connected'
       this.connectedSince = now()
       this.sessionSaved = false
