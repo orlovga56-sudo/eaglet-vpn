@@ -3,6 +3,7 @@ import { PowerDial } from '../components/PowerDial'
 import { Sparkline } from '../components/Sparkline'
 import { ExpandIcon } from '../components/Icons'
 import { formatDuration } from '../format'
+import { t } from '../i18n'
 
 interface Props {
   snap: Snapshot
@@ -17,14 +18,14 @@ export function MiniView({ snap, onToggle, onManageServers, onExpand }: Props): 
   const profile = state.profile
   const label =
     state.status === 'connected'
-      ? 'Connected'
+      ? t('Connected')
       : state.status === 'connecting'
-        ? 'Connecting'
+        ? t('Connecting')
         : state.status === 'disconnecting'
-          ? 'Closing'
+          ? t('Closing')
           : state.status === 'error'
-            ? 'Error'
-            : 'Disconnected'
+            ? t('Error')
+            : t('Disconnected')
 
   const place = [state.ip.exit?.city, state.ip.exit?.country].filter(Boolean).join(', ')
 
@@ -43,24 +44,26 @@ export function MiniView({ snap, onToggle, onManageServers, onExpand }: Props): 
               <strong>{profile.name}</strong>
             </>
           ) : (
-            'No profile selected'
+            t('No profile selected')
           )}
         </div>
         <div className="status-meta">
-          {connected ? formatDuration(state.metrics.sessionSeconds) : (profile?.protocol.toUpperCase() ?? 'No tunnel')}
+          {connected
+            ? formatDuration(state.metrics.sessionSeconds)
+            : (profile?.protocol.toUpperCase() ?? t('No tunnel'))}
         </div>
       </div>
 
       <div className="mini-card panel">
         <div className="mini-metric">
-          <span>Ping</span>
+          <span>{t('Ping')}</span>
           <strong>
             {connected ? Math.round(state.metrics.ping) : '—'}
             <em>ms</em>
           </strong>
         </div>
         <div className="mini-metric">
-          <span>Down</span>
+          <span>{t('Down')}</span>
           <strong>
             {connected ? Math.round(state.metrics.down) : '—'}
             <em>mbps</em>
@@ -77,27 +80,31 @@ export function MiniView({ snap, onToggle, onManageServers, onExpand }: Props): 
 
       <div className={`mini-ip panel ${state.ip.changed ? 'is-changed' : ''}`}>
         <div>
-          <span>Exit IP</span>
+          <span>{t('Exit IP')}</span>
           <strong>{state.ip.exit?.ip ?? '—'}</strong>
         </div>
         <span className={`ip-badge ${state.ip.changed ? 'ok' : 'idle'}`}>
-          {state.ip.changed ? 'Changed' : connected ? 'No change' : 'Standby'}
+          {state.ip.changed ? t('Changed') : connected ? t('No change') : t('Standby')}
         </span>
-        <div className="mini-ip-place">{place || 'No probe yet'}</div>
+        <div className="mini-ip-place">{place || t('No probe yet')}</div>
       </div>
 
       <button className="mini-server panel" onClick={onManageServers}>
         <span className="server-code">{state.ip.exit?.countryCode ?? profile?.protocol.slice(0, 2).toUpperCase() ?? '··'}</span>
         <span className="mini-server-info">
-          <strong>{profile?.name ?? 'No profile'}</strong>
-          <span>{profile ? `${state.metrics.connections} connections` : 'Import a subscription'}</span>
+          <strong>{profile?.name ?? t('No profile')}</strong>
+          <span>
+            {profile
+              ? t('{count} connections', { count: state.metrics.connections })
+              : t('Import a subscription')}
+          </span>
         </span>
         <span style={{ color: 'var(--dim)' }}>›</span>
       </button>
 
       <button className="mini-expand" onClick={onExpand}>
         <ExpandIcon />
-        Open dashboard
+        {t('Open dashboard')}
       </button>
     </div>
   )

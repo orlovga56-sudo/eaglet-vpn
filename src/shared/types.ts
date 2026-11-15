@@ -7,6 +7,9 @@ export type VpnStatus = 'disconnected' | 'connecting' | 'connected' | 'disconnec
 
 export type ThemeId = 'cyber' | 'glass' | 'minimal' | 'hud' | 'neon' | 'aurora'
 
+/** Interface language. `en` is the source language; `ru` is the default UI. */
+export type Language = 'en' | 'ru'
+
 export type ProtocolId =
   | 'vless'
   | 'vmess'
@@ -198,11 +201,24 @@ export interface VpnState {
   usage: EngineUsage
   killSwitchActive: boolean
   dnsProtectionActive: boolean
+  /** Honest per-layer status: a requested layer is never assumed to be armed. */
+  protection: ProtectionState
   comparison: EngineComparison[]
+}
+
+export type ProtectionLayerState = 'active' | 'off' | 'unsupported' | 'error'
+
+export interface ProtectionState {
+  killSwitch: ProtectionLayerState
+  dns: ProtectionLayerState
+  /** Human-readable reason when a layer failed or could not be removed. */
+  error: string | null
 }
 
 export interface Settings {
   theme: ThemeId
+  /** Interface language. Russian is the default; English stays fully supported. */
+  language: Language
   systemProxy: boolean
   tunMode: boolean
   killSwitch: boolean

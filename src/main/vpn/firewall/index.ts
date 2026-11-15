@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { isIP } from 'node:net'
 import { promisify } from 'node:util'
 import type { Profile, Settings } from '@shared/types'
+import { t } from '../../i18n'
 import { dohEndpoint } from '../engines/types'
 import { linuxKillSwitch } from './linux'
 import { macKillSwitch } from './macos'
@@ -141,13 +142,13 @@ export async function enableKillSwitch(
   subscriptionUrls: string[] = []
 ): Promise<string[]> {
   const target = backend()
-  if (!target) throw new Error('Kill switch is not implemented on this platform')
+  if (!target) throw new Error(t('Kill switch is not implemented on this platform'))
   if (profile?.protocol === 'direct') {
-    throw new Error('A kill switch cannot protect a direct connection')
+    throw new Error(t('A kill switch cannot protect a direct connection'))
   }
   const server = await resolveServer(profile)
   if (profile && server.ips.length === 0) {
-    throw new Error('The node address could not be resolved; the kill switch was not armed')
+    throw new Error(t('The node address could not be resolved; the kill switch was not armed'))
   }
   const dnsProtected = settings.dnsProtection || settings.networkProtection
   const doh = dnsProtected ? await resolveDoh(settings) : { ips: [], ports: [] }

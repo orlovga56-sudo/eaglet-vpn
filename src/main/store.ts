@@ -13,10 +13,12 @@ import type {
   Settings,
   Subscription
 } from '@shared/types'
+import { t } from './i18n'
 import { profileSecretKey, SecretVault, subscriptionSecretKey } from './secret-vault'
 
 const DEFAULT_SETTINGS: Settings = {
   theme: 'cyber',
+  language: 'ru',
   systemProxy: true,
   tunMode: false,
   killSwitch: false,
@@ -329,11 +331,15 @@ export class Store {
 
     if (status === 'unavailable') {
       warnings.push(
-        'The OS keyring is unavailable. Connection links are kept in config.json without encryption until a keyring is available.'
+        t(
+          'The OS keyring is unavailable. Connection links are kept in config.json without encryption until a keyring is available.'
+        )
       )
     } else if (status === 'corrupt') {
       warnings.push(
-        'The encrypted secret vault could not be decrypted. Profiles are preserved, but their share links must be re-imported. The vault file was not modified.'
+        t(
+          'The encrypted secret vault could not be decrypted. Profiles are preserved, but their share links must be re-imported. The vault file was not modified.'
+        )
       )
     }
     if (this.vault.error() && !warnings.includes(this.vault.error() as string)) {
@@ -341,7 +347,9 @@ export class Store {
     }
     if (plaintextProfiles > 0 || plaintextSubscriptions > 0) {
       warnings.push(
-        `${plaintextProfiles + plaintextSubscriptions} connection secret(s) are written to config.json in plaintext.`
+        t('{count} connection secret(s) are written to config.json in plaintext.', {
+          count: plaintextProfiles + plaintextSubscriptions
+        })
       )
     }
 

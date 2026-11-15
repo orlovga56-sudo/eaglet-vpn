@@ -2,6 +2,7 @@ import { safeStorage } from 'electron'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { SecretStorageStatus } from '@shared/types'
+import { t } from './i18n'
 
 interface VaultFile {
   version: number
@@ -53,7 +54,9 @@ export class SecretVault {
       payload = JSON.parse(readFileSync(this.file, 'utf-8')) as VaultFile
     } catch (error) {
       this.statusValue = 'corrupt'
-      this.lastError = `The secret vault is not valid JSON: ${(error as Error).message}`
+      this.lastError = t('The secret vault is not valid JSON: {error}', {
+        error: (error as Error).message
+      })
       return
     }
 
@@ -64,7 +67,7 @@ export class SecretVault {
         if (!safeStorage.isEncryptionAvailable()) {
           this.statusValue = 'unavailable'
           this.locked = true
-          this.lastError = 'The OS keyring is unavailable, so the encrypted vault cannot be opened'
+          this.lastError = t('The OS keyring is unavailable, so the encrypted vault cannot be opened')
           return
         }
         json = safeStorage.decryptString(buffer)
@@ -73,7 +76,7 @@ export class SecretVault {
         // once so profiles keep working, then rewrite it with real encryption.
         json = buffer.toString('utf-8')
         this.statusValue = 'unavailable'
-        this.lastError = 'The secret vault uses the legacy base64 format and is not encrypted'
+        this.lastError = t('The secret vault uses the legacy base64 format and is not encrypted')
       }
 
       const parsed = JSON.parse(json) as Record<string, unknown>
@@ -84,7 +87,9 @@ export class SecretVault {
     } catch (error) {
       this.secrets = {}
       this.statusValue = 'corrupt'
-      this.lastError = `The secret vault could not be decrypted: ${(error as Error).message}`
+      this.lastError = t('The secret vault could not be decrypted: {error}', {
+        error: (error as Error).message
+      })
       return
     }
 
@@ -95,7 +100,9 @@ export class SecretVault {
       } catch (error) {
         // Keep the original file and the values in memory; a later launch can
         // retry the migration.
-        this.lastError = `The legacy vault could not be re-encrypted: ${(error as Error).message}`
+        this.lastError = t('The legacy vault could not be re-encrypted: {error}', {
+          error: (error as Error).message
+        })
       }
     }
   }
@@ -103,17 +110,17 @@ export class SecretVault {
   private write(): void {
     if (this.locked) {
       throw new SecretVaultError(
-        'The encrypted secret vault could not be opened this launch; refusing to overwrite it'
+        t('The encrypted secret vault could not be opened this launch; refusing to overwrite it')
       )
     }
     if (this.statusValue === 'corrupt') {
       throw new SecretVaultError(
-        'The encrypted secret vault could not be read; refusing to overwrite it'
+        t('The encrypted secret vault could not be read; refusing to overwrite it')
       )
     }
     if (!safeStorage.isEncryptionAvailable()) {
       this.statusValue = 'unavailable'
-      this.lastError = 'No OS keyring is available; refusing to store secrets without encryption'
+      this.lastError = t('No OS keyring is available; refusing to store secrets without encryption')
       throw new SecretVaultError(this.lastError)
     }
 
@@ -123,7 +130,9 @@ export class SecretVault {
       buffer = safeStorage.encryptString(json)
     } catch (error) {
       this.statusValue = 'unavailable'
-      this.lastError = `The OS keyring rejected the encryption request: ${(error as Error).message}`
+      this.lastError = t('The OS keyring rejected the encryption request: {error}', {
+        error: (error as Error).message
+      })
       throw new SecretVaultError(this.lastError)
     }
 

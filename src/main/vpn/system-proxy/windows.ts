@@ -140,3 +140,28 @@ ${refreshScript()}
 export function recoverStaleProxy(): void {
   if (existsSync(backupPath())) disableSystemProxySync()
 }
+
+/** Reads the live WinINET proxy configuration so a restore can be verified. */
+export async function readSystemProxy(): Promise<Record<string, string> | null> {
+  try {
+    const script = `
+$ErrorActionPreference = 'Stop'
+$key = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
+$current = Get-ItemProperty -Path $key
+@{ ProxyEnable = [int]$current.ProxyEnable; ProxyServer = [string]$current.ProxyServer; ProxyOverride = [string]$current.ProxyOverride } | ConvertTo-Json -Compress
+`.trim()
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { timeout: 12000, windowsHide: true }
+    )
+    const parsed = JSON.parse(stdout) as { ProxyEnable?: number; ProxyServer?: string; ProxyOverride?: string }
+    return {
+      ProxyEnable: String(Number(parsed.ProxyEnable) === 1 ? 1 : 0),
+      ProxyServer: String(parsed.ProxyServer ?? ''),
+      ProxyOverride: String(parsed.ProxyOverride ?? '')
+    }
+  } catch {
+    return null
+  }
+}

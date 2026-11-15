@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { promisify } from 'node:util'
 import type { EngineId, Profile, Settings } from '@shared/types'
+import { t } from '../i18n'
 import type { Store } from '../store'
 import type { VpnEngine } from './engine'
 import { parseProfilesPayload } from './profiles'
@@ -96,7 +97,7 @@ async function firewallRules(): Promise<string> {
 }
 
 async function systemDns(): Promise<string> {
-  if (process.platform !== 'win32') return 'not probed on this platform'
+  if (process.platform !== 'win32') return t('not probed on this platform')
   const output = await run('powershell.exe', [
     '-NoProfile',
     '-NonInteractive',
@@ -189,7 +190,7 @@ export async function runEngineTest(store: Store, engine: VpnEngine): Promise<Re
     // The harness must not pollute the user's real history with test entries.
     engine.clearEngineHistory()
     const remote = store.getProfiles().find((profile) => profile.protocol !== 'direct')
-    if (!remote) throw new Error('No remote profile is configured — import a node before running the engine test')
+    if (!remote) throw new Error(t('No remote profile is configured — import a node before running the engine test'))
     remoteId = remote.id
     report.profile = {
       id: remote.id,
@@ -206,7 +207,7 @@ export async function runEngineTest(store: Store, engine: VpnEngine): Promise<Re
       const existing = store.getProfiles().find((profile) => profile.protocol === 'direct')
       if (existing) return existing
       const [parsed] = parseProfilesPayload('direct://Engine%20test%20route')
-      if (!parsed) throw new Error('Could not create a direct profile for the engine test')
+      if (!parsed) throw new Error(t('Could not create a direct profile for the engine test'))
       store.addProfiles([parsed])
       engine.reconcileProfiles()
       addedDirectId = parsed.id
@@ -238,7 +239,7 @@ export async function runEngineTest(store: Store, engine: VpnEngine): Promise<Re
     for (const id of ENGINES) {
       const installed = engine.getEngineStates().find((item) => item.id === id)?.installed
       if (!installed) {
-        configs.push({ engine: id, variant: 'all', valid: false, detail: 'not installed' })
+        configs.push({ engine: id, variant: 'all', valid: false, detail: t('not installed') })
         continue
       }
       const target = engine.supportsProfile(id, remote.id) ? remote : ensureDirect()
@@ -295,7 +296,7 @@ export async function runEngineTest(store: Store, engine: VpnEngine): Promise<Re
       const installed = engine.getEngineStates().find((item) => item.id === id)?.installed
       const entry: Record<string, unknown> = { engine: id }
       if (!installed) {
-        entry.skipped = 'engine is not installed'
+        entry.skipped = t('engine is not installed')
         results.push(entry)
         continue
       }
@@ -397,7 +398,7 @@ export async function runEngineTest(store: Store, engine: VpnEngine): Promise<Re
         await waitFor(() => engine.getState().status === 'disconnected', 40000)
       }
     } else {
-      override.skipped = 'No alternative engine is installed'
+      override.skipped = t('No alternative engine is installed')
     }
     report.profileOverride = override
 
@@ -422,7 +423,7 @@ export async function runEngineTest(store: Store, engine: VpnEngine): Promise<Re
         await waitFor(() => engine.getState().status === 'disconnected', 40000)
       }
     } else {
-      global.skipped = 'No alternative engine is installed'
+      global.skipped = t('No alternative engine is installed')
     }
     report.globalEngine = global
 
@@ -476,7 +477,7 @@ export async function runEngineTest(store: Store, engine: VpnEngine): Promise<Re
         engine: prepared.engine,
         path: prepared.path,
         wintun: prepared.wintun,
-        note: 'TUN adapter capture itself requires an elevated process'
+        note: t('TUN adapter capture itself requires an elevated process')
       }
     } catch (error) {
       report.tunPreparation = { error: (error as Error).message }
@@ -517,7 +518,7 @@ export async function runEngineTest(store: Store, engine: VpnEngine): Promise<Re
       protection.rulesAfter = await firewallRules()
     } else {
       report.protection = {
-        skipped: 'requires an elevated process: firewall policy, system DNS override and TUN capture were not exercised'
+        skipped: t('requires an elevated process: firewall policy, system DNS override and TUN capture were not exercised')
       }
     }
 

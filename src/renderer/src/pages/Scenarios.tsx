@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { EngineChoice, RoutingMode, Scenario, ServerStrategy, Snapshot } from '@shared/types'
 import { BoltIcon, CheckIcon, GearIcon, RouteIcon, ShieldIcon, SignalIcon, SparkIcon } from '../components/Icons'
+import { t } from '../i18n'
 
 interface Props {
   snap: Snapshot
@@ -14,35 +15,46 @@ const ICON: Record<Scenario['icon'], React.JSX.Element> = {
   custom: <SparkIcon />
 }
 
-const ENGINE_LABEL: Record<EngineChoice, string> = {
-  auto: 'Auto engine',
-  'sing-box': 'sing-box',
-  xray: 'Xray-core',
-  mihomo: 'Mihomo'
+function engineLabel(): Record<EngineChoice, string> {
+  return {
+    auto: t('Auto engine'),
+    'sing-box': 'sing-box',
+    xray: 'Xray-core',
+    mihomo: 'Mihomo'
+  }
 }
 
-const STRATEGY_LABEL: Record<ServerStrategy, string> = {
-  fastest: 'Fastest node',
-  favorite: 'Favourite node',
-  selected: 'Keep selection'
+function strategyLabel(): Record<ServerStrategy, string> {
+  return {
+    fastest: t('Fastest node'),
+    favorite: t('Favourite node'),
+    selected: t('Keep selection')
+  }
 }
 
-const ROUTING: Array<{ id: RoutingMode; label: string }> = [
-  { id: 'global', label: 'Global' },
-  { id: 'smart', label: 'Smart' },
-  { id: 'direct', label: 'Direct' }
-]
+function routingModes(): Array<{ id: RoutingMode; label: string }> {
+  return [
+    { id: 'global', label: t('Global') },
+    { id: 'smart', label: t('Smart') },
+    { id: 'direct', label: t('Direct') }
+  ]
+}
+
+function routingLabel(mode: RoutingMode): string {
+  return routingModes().find((item) => item.id === mode)?.label ?? mode
+}
 
 function summarize(scenario: Scenario): string[] {
   const settings = scenario.settings
-  const chips: string[] = [STRATEGY_LABEL[scenario.serverStrategy]]
+  const chips: string[] = [strategyLabel()[scenario.serverStrategy]]
   if (settings.tunMode) chips.push('TUN')
-  else if (settings.systemProxy) chips.push('System proxy')
-  if (settings.killSwitch || settings.networkProtection) chips.push('Kill switch')
-  if (settings.dnsProtection || settings.networkProtection) chips.push('Encrypted DNS')
+  else if (settings.systemProxy) chips.push(t('System proxy'))
+  if (settings.killSwitch || settings.networkProtection) chips.push(t('Kill switch'))
+  if (settings.dnsProtection || settings.networkProtection) chips.push(t('Encrypted DNS'))
   if (settings.ipv6) chips.push('IPv6')
-  else chips.push('IPv4 only')
-  if (settings.routingMode) chips.push(`${settings.routingMode} routing`)
+  else chips.push(t('IPv4 only'))
+  if (settings.routingMode)
+    chips.push(t('{mode} routing', { mode: routingLabel(settings.routingMode) }))
   return chips
 }
 
@@ -63,9 +75,9 @@ function ScenarioCard({
         <span className="scenario-icon">{ICON[scenario.icon]}</span>
         <div className="scenario-title">
           <strong>{scenario.name}</strong>
-          <span>{scenario.builtin ? 'Built-in' : 'Custom'}</span>
+          <span>{scenario.builtin ? t('Built-in') : t('Custom')}</span>
         </div>
-        <span className="scenario-engine">{ENGINE_LABEL[scenario.engine]}</span>
+        <span className="scenario-engine">{engineLabel()[scenario.engine]}</span>
       </div>
       <p className="scenario-text">{scenario.description}</p>
       <div className="scenario-chips">
@@ -77,11 +89,11 @@ function ScenarioCard({
       </div>
       <div className="scenario-actions">
         <button className="btn small primary" onClick={() => onApply(scenario.id)} disabled={busy !== null}>
-          {busy === scenario.id ? 'Applying…' : 'Apply scenario'}
+          {busy === scenario.id ? t('Applying…') : t('Apply scenario')}
         </button>
         {!scenario.builtin && (
           <button className="btn small danger" onClick={() => onRemove(scenario.id)} disabled={busy !== null}>
-            Delete
+            {t('Delete')}
           </button>
         )}
       </div>
@@ -115,7 +127,9 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
     setNotice(null)
     try {
       await window.eaglet.applyScenario(id)
-      setNotice('Scenario applied. Reconnect if a tunnel is already running so the new engine and routing take effect.')
+      setNotice(
+        t('Scenario applied. Reconnect if a tunnel is already running so the new engine and routing take effect.')
+      )
     } catch (caught) {
       setError((caught as Error).message.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, ''))
     } finally {
@@ -124,7 +138,7 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
   }
 
   const remove = async (id: string): Promise<void> => {
-    if (!window.confirm('Delete this custom scenario?')) return
+    if (!window.confirm(t('Delete this custom scenario?'))) return
     setBusy(id)
     try {
       await window.eaglet.removeScenario(id)
@@ -137,7 +151,7 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
 
   const save = async (): Promise<void> => {
     if (!custom.name.trim()) {
-      setError('Give the scenario a name first.')
+      setError(t('Give the scenario a name first.'))
       return
     }
     setBusy('new')
@@ -162,7 +176,7 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
         }
       })
       setCustom({ ...custom, name: '', description: '' })
-      setNotice('Custom scenario saved.')
+      setNotice(t('Custom scenario saved.'))
     } catch (caught) {
       setError((caught as Error).message)
     } finally {
@@ -174,14 +188,17 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
     <div className="page">
       <header className="page-head">
         <div>
-          <p className="page-eyebrow">Profiles of behaviour</p>
-          <h1 className="page-title">Scenarios</h1>
+          <p className="page-eyebrow">{t('Profiles of behaviour')}</p>
+          <h1 className="page-title">{t('Scenarios')}</h1>
           <p className="page-sub">
-            One click applies a tested combination of engine, routing, DNS and protection settings. Everything here is
-            a real setting — nothing is cosmetic.
+            {t(
+              'One click applies a tested combination of engine, routing, DNS and protection settings. Everything here is a real setting — nothing is cosmetic.'
+            )}
           </p>
         </div>
-        <span className={`status-pill ${connected ? 'ok' : ''}`}>{connected ? 'Live tunnel' : 'Ready'}</span>
+        <span className={`status-pill ${connected ? 'ok' : ''}`}>
+          {connected ? t('Live tunnel') : t('Ready')}
+        </span>
       </header>
 
       {error && <div className="callout danger">{error}</div>}
@@ -199,47 +216,47 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
         ))}
       </div>
 
-      <div className="section-title">Create a custom scenario</div>
+      <div className="section-title">{t('Create a custom scenario')}</div>
       <div className="scenario-form panel">
         <div className="form-grid">
           <label>
-            <span>Name</span>
+            <span>{t('Name')}</span>
             <input
               value={custom.name}
-              placeholder="Low-latency gaming"
+              placeholder={t('Low-latency gaming')}
               onChange={(event) => setCustom({ ...custom, name: event.target.value })}
             />
           </label>
           <label>
-            <span>Engine</span>
+            <span>{t('Engine')}</span>
             <select
               value={custom.engine}
               onChange={(event) => setCustom({ ...custom, engine: event.target.value as EngineChoice })}
             >
-              <option value="auto">Auto (best installed)</option>
+              <option value="auto">{t('Auto (best installed)')}</option>
               <option value="sing-box">sing-box</option>
               <option value="xray">Xray-core</option>
               <option value="mihomo">Mihomo</option>
             </select>
           </label>
           <label>
-            <span>Server strategy</span>
+            <span>{t('Server strategy')}</span>
             <select
               value={custom.strategy}
               onChange={(event) => setCustom({ ...custom, strategy: event.target.value as ServerStrategy })}
             >
-              <option value="selected">Keep my selection</option>
-              <option value="fastest">Fastest node</option>
-              <option value="favorite">Favourite node</option>
+              <option value="selected">{t('Keep my selection')}</option>
+              <option value="fastest">{t('Fastest node')}</option>
+              <option value="favorite">{t('Favourite node')}</option>
             </select>
           </label>
           <label>
-            <span>Routing</span>
+            <span>{t('Routing')}</span>
             <select
               value={custom.routingMode}
               onChange={(event) => setCustom({ ...custom, routingMode: event.target.value as RoutingMode })}
             >
-              {ROUTING.map((mode) => (
+              {routingModes().map((mode) => (
                 <option key={mode.id} value={mode.id}>
                   {mode.label}
                 </option>
@@ -249,10 +266,10 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
         </div>
 
         <label className="form-wide">
-          <span>Description</span>
+          <span>{t('Description')}</span>
           <input
             value={custom.description}
-            placeholder="What is this preset for?"
+            placeholder={t('What is this preset for?')}
             onChange={(event) => setCustom({ ...custom, description: event.target.value })}
           />
         </label>
@@ -260,10 +277,10 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
         <div className="scenario-toggles">
           {(
             [
-              ['tunMode', 'TUN capture'],
-              ['systemProxy', 'System proxy'],
-              ['killSwitch', 'Kill switch'],
-              ['dnsProtection', 'Encrypted DNS'],
+              ['tunMode', t('TUN capture')],
+              ['systemProxy', t('System proxy')],
+              ['killSwitch', t('Kill switch')],
+              ['dnsProtection', t('Encrypted DNS')],
               ['ipv6', 'IPv6']
             ] as const
           ).map(([key, label]) => (
@@ -280,10 +297,11 @@ export function Scenarios({ snap }: Props): React.JSX.Element {
 
         <div className="scenario-form-foot">
           <span className="form-hint">
-            <RouteIcon /> TUN and system proxy are mutually exclusive — Eaglet uses TUN when both are enabled.
+            <RouteIcon />{' '}
+            {t('TUN and system proxy are mutually exclusive — Eaglet uses TUN when both are enabled.')}
           </span>
           <button className="btn primary" onClick={() => void save()} disabled={busy !== null}>
-            {busy === 'new' ? 'Saving…' : 'Save scenario'}
+            {busy === 'new' ? t('Saving…') : t('Save scenario')}
           </button>
         </div>
       </div>

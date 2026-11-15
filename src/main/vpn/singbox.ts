@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
 import { app } from 'electron'
 import type { IpInfo, Profile, Settings } from '@shared/types'
+import { t } from '../i18n'
 
 const execFileAsync = promisify(execFile)
 const CURL = process.platform === 'win32' ? 'curl.exe' : 'curl'
@@ -65,7 +66,7 @@ export async function installCore(log: (message: string) => void): Promise<strin
   const existing = findCore()
   if (existing) return existing
 
-  log('Downloading sing-box coreвЂ¦')
+  log('Downloading sing-box core…')
   const response = await fetch('https://api.github.com/repos/SagerNet/sing-box/releases/latest', {
     headers: { 'User-Agent': 'Eaglet-VPN' }
   })
@@ -722,7 +723,7 @@ export async function downloadThroughput(
   const size = Number(sizeRaw)
   const seconds = Number(timeRaw)
   if (!Number.isFinite(size) || size < 200_000 || !Number.isFinite(seconds) || seconds <= 0) {
-    throw new Error('The speed test did not receive enough data вЂ” try again')
+    throw new Error(t('The speed test did not receive enough data — try again'))
   }
   return { bytes: size, seconds }
 }

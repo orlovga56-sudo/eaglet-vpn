@@ -51,6 +51,7 @@ import {
 import { dnsGuardStats, recoverStaleDns, startDnsGuard, stopDnsGuard, stopDnsGuardSync } from './dns-guard'
 import { geolocateProfiles } from './geo'
 import { allScenarios } from './scenarios'
+import { t } from '../i18n'
 
 const HISTORY_LIMIT = 60
 const LOG_LIMIT = 160
@@ -89,6 +90,8 @@ interface Runtime {
   proxyApplied: boolean
   killSwitchApplied: boolean
   dnsGuardApplied: boolean
+  /** Core binary the armed kill-switch policy was built for. */
+  protectedCorePath: string | null
   tickTimer: NodeJS.Timeout | null
   pingTimer: NodeJS.Timeout | null
   usageTimer: NodeJS.Timeout | null
@@ -125,6 +128,10 @@ export class VpnEngine extends EventEmitter {
   private usage: EngineUsage = EMPTY_USAGE()
   private killSwitchActive = false
   private dnsProtectionActive = false
+  /** Last protection-layer failure, shown instead of pretending to be protected. */
+  private protectionError: string | null = null
+  private killSwitchError: string | null = null
+  private dnsError: string | null = null
   private connectedSince: number | null = null
   private stage: string | null = null
   private progress = 0
@@ -157,6 +164,7 @@ export class VpnEngine extends EventEmitter {
       proxyApplied: false,
       killSwitchApplied: false,
       dnsGuardApplied: false,
+      protectedCorePath: null,
       tickTimer: null,
       pingTimer: null,
       usageTimer: null,
@@ -169,7 +177,7 @@ export class VpnEngine extends EventEmitter {
       lastPing: null,
       probeWindow: []
     }
-    this.pushLog('info', 'Eaglet engine ready · engine manager online')
+    this.pushLog('info', t('Eaglet engine ready · engine manager online'))
   }
 
   /* ------------------------------------------------------------------ */
@@ -190,8 +198,11 @@ export class VpnEngine extends EventEmitter {
     this.pushLog(
       this.core.available ? 'success' : 'warn',
       this.core.available
-        ? `${adapter.name} detected${this.core.version ? ` · ${this.core.version}` : ''}`
-        : `${adapter.name} is not installed · it will be downloaded on first connect`
+        ? t('{name} detected{version}', {
+            name: adapter.name,
+            version: this.core.version ? ` · ${this.core.version}` : ''
+          })
+        : t('{name} is not installed · it will be downloaded on first connect', { name: adapter.name })
     )
     this.emitUpdate()
     void this.refreshDirectIp()
@@ -232,7 +243,7 @@ export class VpnEngine extends EventEmitter {
       id: `${now()}-engine-${id}`,
       at: now(),
       kind: 'engine',
-      message: `${this.manager.adapter(id).name} installed`
+      message: t('{name} installed', { name: this.manager.adapter(id).name })
     })
     this.emitUpdate()
     return this.engines
@@ -240,16 +251,17 @@ export class VpnEngine extends EventEmitter {
 
   async removeEngine(id: EngineId): Promise<EngineState[]> {
     if (this.runtime.engine === id && this.isLive()) {
-      throw new Error('Disconnect before removing the engine that is currently running')
+      throw new Error(t('Disconnect before removing the engine that is currently running'))
     }
     const removed = await this.manager.remove(id)
-    if (!removed) throw new Error(`${this.manager.adapter(id).name} is not installed in the user data folder`)
+    if (!removed)
+      throw new Error(t('{name} is not installed in the user data folder', { name: this.manager.adapter(id).name }))
     this.engines = this.manager.getStates(this.engineId, this.isLive())
     if (id === this.engineId) {
       this.engineId = this.manager.choose(this.activeProfile(), this.store.getSettings()).id
       this.syncCore()
     }
-    this.pushLog('info', `${this.manager.adapter(id).name} removed`)
+    this.pushLog('info', t('{name} removed', { name: this.manager.adapter(id).name }))
     this.emitUpdate()
     return this.engines
   }
@@ -261,8 +273,10 @@ export class VpnEngine extends EventEmitter {
     this.pushLog(
       updates.length > 0 ? 'info' : 'success',
       updates.length > 0
-        ? `Updates available: ${updates.map((engine) => `${engine.name} ${engine.latestVersion}`).join(', ')}`
-        : 'All installed engines are up to date'
+        ? t('Updates available: {list}', {
+            list: updates.map((engine) => `${engine.name} ${engine.latestVersion}`).join(', ')
+          })
+        : t('All installed engines are up to date')
     )
     this.emitUpdate()
     return this.engines
@@ -284,19 +298,19 @@ export class VpnEngine extends EventEmitter {
       this.engineId = target
       this.syncCore()
       this.recordEngineSwitch(target, 'manual', previousEngine)
-      this.pushLog('info', `Engine set to ${targetName}`)
+      this.pushLog('info', t('Engine set to {name}', { name: targetName }))
       this.emitUpdate()
       return settings
     }
 
     if (this.status !== 'connected' || this.runtime.transition) {
-      this.pushLog('warn', `${targetName} selected · it applies on the next connection`)
+      this.pushLog('warn', t('{name} selected · it applies on the next connection', { name: targetName }))
       this.emitUpdate()
       return settings
     }
 
     if (this.runtime.engine === target) {
-      this.pushLog('info', `${targetName} is already running`)
+      this.pushLog('info', t('{name} is already running', { name: targetName }))
       this.emitUpdate()
       return settings
     }
@@ -309,17 +323,20 @@ export class VpnEngine extends EventEmitter {
     }
     if (!profile) {
       revertChoice()
-      throw new Error('Select a profile before switching engines')
+      throw new Error(t('Select a profile before switching engines'))
     }
     if (!this.manager.supportsProfile(target, profile)) {
       revertChoice()
       throw new Error(
-        `${targetName} cannot carry this ${profile.protocol.toUpperCase()} profile`
+        t('{name} cannot carry this {protocol} profile', {
+          name: targetName,
+          protocol: profile.protocol.toUpperCase()
+        })
       )
     }
     if (settings.tunMode && !this.manager.adapter(target).supportsTun) {
       revertChoice()
-      throw new Error(`${targetName} does not support TUN mode`)
+      throw new Error(t('{name} does not support TUN mode', { name: targetName }))
     }
 
     try {
@@ -329,36 +346,39 @@ export class VpnEngine extends EventEmitter {
       })
     } catch (error) {
       revertChoice()
-      throw new Error(`Could not install ${targetName}: ${(error as Error).message}`)
+      throw new Error(t('Could not install {name}: {error}', { name: targetName, error: (error as Error).message }))
     }
 
     const previousName = this.manager.adapter(previousEngine).name
-    this.pushLog('info', `Switching engine · ${previousName} → ${targetName}`)
+    this.pushLog('info', t('Switching engine · {from} → {to}', { from: previousName, to: targetName }))
     this.forcedEngine = target
     try {
-      await this.disconnect()
-      await this.connect()
+      // Keep the existing firewall/DNS policy armed while the new core starts.
+      // Dropping it here would open a direct-traffic window between the two
+      // engines; the policy is re-armed for the new binary by applyProtection.
+      await this.disconnect({ keepProtection: true })
+      await this.connect(undefined, false, true)
       if (this.status !== 'connected' || this.runtime.engine !== target) {
-        throw new Error(this.error ?? `${targetName} could not establish a tunnel`)
+        throw new Error(this.error ?? t('{name} could not establish a tunnel', { name: targetName }))
       }
-      this.pushLog('success', `Engine switched to ${targetName}`)
+      this.pushLog('success', t('Engine switched to {name}', { name: targetName }))
     } catch (error) {
       const message = (error as Error).message
-      this.pushLog('warn', `Engine switch failed · ${message} · rolling back to ${previousName}`)
+      this.pushLog('warn', t('Engine switch failed · {error} · rolling back to {name}', { error: message, name: previousName }))
       this.forcedEngine = previousEngine
       try {
-        if (this.status === 'connected') await this.disconnect()
-        await this.connect()
+        if (this.status === 'connected') await this.disconnect({ keepProtection: true })
+        await this.connect(undefined, false, true)
         if (this.status === 'connected' && this.runtime.engine === previousEngine) {
-          this.pushLog('info', `Rolled back to ${previousName}`)
+          this.pushLog('info', t('Rolled back to {name}', { name: previousName }))
         } else {
-          this.pushLog('error', `Rollback failed: ${this.error ?? 'unknown error'}`)
+          this.pushLog('error', t('Rollback failed: {error}', { error: this.error ?? t('unknown error') }))
         }
       } catch (rollbackError) {
-        this.pushLog('error', `Rollback failed: ${(rollbackError as Error).message}`)
+        this.pushLog('error', t('Rollback failed: {error}', { error: (rollbackError as Error).message }))
       }
       revertChoice()
-      throw new Error(`Could not switch to ${targetName}: ${message}`)
+      throw new Error(t('Could not switch to {name}: {error}', { name: targetName, error: message }))
     } finally {
       this.forcedEngine = null
       this.emitUpdate()
@@ -373,14 +393,20 @@ export class VpnEngine extends EventEmitter {
       if (engine && !this.manager.supportsProfile(engine, profile)) {
         this.pushLog(
           'warn',
-          `${this.manager.adapter(engine).name} cannot carry ${profile.protocol.toUpperCase()} · Eaglet will fall back to a compatible core`
+          t('{name} cannot carry {protocol} · Eaglet will fall back to a compatible core', {
+            name: this.manager.adapter(engine).name,
+            protocol: profile.protocol.toUpperCase()
+          })
         )
       } else {
         this.pushLog(
           'info',
           engine
-            ? `${profile.name} pinned to ${this.manager.adapter(engine).name}`
-            : `${profile.name} follows the global engine`
+            ? t('{name} pinned to {engine}', {
+                name: profile.name,
+                engine: this.manager.adapter(engine).name
+              })
+            : t('{name} follows the global engine', { name: profile.name })
         )
       }
     }
@@ -414,8 +440,37 @@ export class VpnEngine extends EventEmitter {
       usage: { ...this.usage },
       killSwitchActive: this.killSwitchActive,
       dnsProtectionActive: this.dnsProtectionActive,
+      protection: this.protectionState(),
       comparison: this.compareEngines()
     }
+  }
+
+  /**
+   * Honest protection status for the UI. A requested layer is never reported as
+   * active just because the tunnel is up.
+   */
+  private protectionState(): VpnState['protection'] {
+    const settings = this.store.getSettings()
+    const profile = this.activeProfile()
+    const wantKill = settings.killSwitch || settings.networkProtection
+    const wantDns = settings.dnsProtection || settings.networkProtection
+    const killSwitch: VpnState['protection']['killSwitch'] = !wantKill
+      ? 'off'
+      : profile?.protocol === 'direct' || !killSwitchSupported()
+        ? 'unsupported'
+        : this.runtime.killSwitchApplied && this.killSwitchActive
+          ? 'active'
+          : this.killSwitchError
+            ? 'error'
+            : 'off'
+    const dns: VpnState['protection']['dns'] = !wantDns
+      ? 'off'
+      : this.runtime.dnsGuardApplied && this.dnsProtectionActive
+        ? 'active'
+        : this.dnsError
+          ? 'error'
+          : 'off'
+    return { killSwitch, dns, error: this.protectionError }
   }
 
   getProfileId(): string | null {
@@ -502,7 +557,7 @@ export class VpnEngine extends EventEmitter {
 
   selectProfile(id: string): void {
     if (this.status === 'connected' || this.status === 'connecting') {
-      this.pushLog('warn', 'Disconnect before switching to another profile')
+      this.pushLog('warn', t('Disconnect before switching to another profile'))
       this.emitUpdate()
       return
     }
@@ -512,7 +567,14 @@ export class VpnEngine extends EventEmitter {
     this.store.updateSettings({ activeProfileId: id })
     this.engineId = this.manager.choose(profile, this.store.getSettings()).id
     this.syncCore()
-    this.pushLog('info', `Selected ${profile.name} · ${profile.protocol.toUpperCase()} · ${this.manager.adapter(this.engineId).name}`)
+    this.pushLog(
+      'info',
+      t('Selected {name} · {protocol} · {engine}', {
+        name: profile.name,
+        protocol: profile.protocol.toUpperCase(),
+        engine: this.manager.adapter(this.engineId).name
+      })
+    )
     this.emitUpdate()
   }
 
@@ -544,7 +606,7 @@ export class VpnEngine extends EventEmitter {
   /*  Connect / disconnect                                              */
   /* ------------------------------------------------------------------ */
 
-  async connect(id?: string, automatic = false): Promise<void> {
+  async connect(id?: string, automatic = false, keepProtection = false): Promise<void> {
     if (this.runtime.transition) return
     if (!automatic) {
       this.runtime.reconnectAttempts = 0
@@ -552,7 +614,7 @@ export class VpnEngine extends EventEmitter {
       this.clearReconnectTimer()
     }
     if (this.status === 'connected' || this.status === 'connecting') {
-      if (id && id !== this.profileId) this.pushLog('warn', 'Disconnect before switching to another node')
+      if (id && id !== this.profileId) this.pushLog('warn', t('Disconnect before switching to another node'))
       return
     }
     if (id) {
@@ -562,7 +624,7 @@ export class VpnEngine extends EventEmitter {
 
     const profile = this.activeProfile()
     if (!profile) {
-      this.error = 'No profile selected. Import a subscription or a share link first.'
+      this.error = t('No profile selected. Import a subscription or a share link first.')
       this.pushLog('error', this.error)
       this.emitUpdate()
       return
@@ -574,9 +636,10 @@ export class VpnEngine extends EventEmitter {
     // (or the already-allowed resolvers) and the previous node rule still
     // matches, so ordinary traffic cannot leak during the retry loop.
     const preserveProtection =
-      automatic &&
-      (settings.killSwitch || settings.networkProtection) &&
-      (this.runtime.killSwitchApplied || this.runtime.dnsGuardApplied)
+      keepProtection ||
+      (automatic &&
+        (settings.killSwitch || settings.networkProtection) &&
+        (this.runtime.killSwitchApplied || this.runtime.dnsGuardApplied))
     const previousEngine = this.runtime.engine ?? null
     const forced = this.forcedEngine
     const choice: { id: EngineId; reason: EngineSwitchRecord['reason'] } =
@@ -587,7 +650,10 @@ export class VpnEngine extends EventEmitter {
     if (!forced && preference && preference !== choice.id) {
       this.pushLog(
         'warn',
-        `${this.manager.adapter(preference).name} cannot carry this profile · using ${this.manager.adapter(choice.id).name}`
+        t('{name} cannot carry this profile · using {other}', {
+          name: this.manager.adapter(preference).name,
+          other: this.manager.adapter(choice.id).name
+        })
       )
     }
     await this.clearStaleProtection(preserveProtection)
@@ -602,15 +668,18 @@ export class VpnEngine extends EventEmitter {
     this.runtime.probeWindow = []
     this.usage = EMPTY_USAGE()
     this.ip = { ...this.ip, exit: null, checking: false, changed: false }
-    this.pushLog('info', `Connecting · ${profile.name} · ${profile.protocol.toUpperCase()}`)
-    this.setStage('Preparing profile', 0.06)
+    this.pushLog(
+      'info',
+      t('Connecting · {name} · {protocol}', { name: profile.name, protocol: profile.protocol.toUpperCase() })
+    )
+    this.setStage(t('Preparing profile'), 0.06)
 
     try {
       // 1. Make sure the IP probe runs before the system proxy is switched on.
       if (!this.ip.direct) await this.refreshDirectIp()
 
       // 2. Make sure the chosen core is present.
-      this.setStage(`Loading ${this.manager.adapter(choice.id).name} core`, 0.16)
+      this.setStage(t('Loading {name} core', { name: this.manager.adapter(choice.id).name }), 0.16)
       let binary = await this.prepareBinary(choice.id, profile, settings)
       const engineId = this.runtime.engine ?? choice.id
       const adapter = this.manager.adapter(engineId)
@@ -625,10 +694,16 @@ export class VpnEngine extends EventEmitter {
       this.runtime.corePath = binary
       this.engineId = engineId
       this.syncCore()
-      this.pushLog('info', `Core: ${adapter.name}${this.core.version ? ` ${this.core.version}` : ''}`)
+      this.pushLog(
+        'info',
+        t('Core: {name}{version}', {
+          name: adapter.name,
+          version: this.core.version ? ` ${this.core.version}` : ''
+        })
+      )
 
       // 3. Build + validate the native config.
-      this.setStage('Building core configuration', 0.3)
+      this.setStage(t('Building core configuration'), 0.3)
       const mixedPort = await freePort(2080)
       const apiPort = await freePort(mixedPort + 1)
       const content = this.manager.buildConfig(engineId, {
@@ -644,10 +719,10 @@ export class VpnEngine extends EventEmitter {
       const configPath = join(configDir, adapter.configFileName)
       writeFileSync(configPath, content, 'utf-8')
       await this.manager.validate(engineId, binary, configPath)
-      this.pushLog('success', `${adapter.name} configuration validated`)
+      this.pushLog('success', t('{name} configuration validated', { name: adapter.name }))
 
       // 4. Spawn the tunnel.
-      this.setStage('Starting encrypted tunnel', 0.48)
+      this.setStage(t('Starting encrypted tunnel'), 0.48)
       const runtime = this.runtime
       runtime.mixedPort = mixedPort
       runtime.apiPort = apiPort
@@ -668,29 +743,31 @@ export class VpnEngine extends EventEmitter {
       await waitForPort(mixedPort)
 
       // 5. Local proxy is up — verify the tunnel really carries traffic.
-      this.setStage('Verifying exit route', 0.72)
+      this.setStage(t('Verifying exit route'), 0.72)
       const exit = await this.probeExit(mixedPort, 3)
-      if (!exit) throw new Error('The tunnel did not respond. Check the profile and try again.')
+      if (!exit) throw new Error(t('The tunnel did not respond. Check the profile and try again.'))
       const direct = this.ip.direct
       const changed = Boolean(direct && direct.ip !== exit.ip)
       this.ip = { direct, exit, checking: false, changed, checkedAt: now() }
       this.pushLog(
         'success',
-        changed ? `Exit IP changed · ${direct?.ip} → ${exit.ip}` : `Tunnel live · exit IP ${exit.ip}`
+        changed
+          ? t('Exit IP changed · {from} → {to}', { from: direct?.ip ?? '', to: exit.ip })
+          : t('Tunnel live · exit IP {ip}', { ip: exit.ip })
       )
 
       // 6. System routing, then protection layers.
-      this.setStage('Applying system routing', 0.9)
+      this.setStage(t('Applying system routing'), 0.9)
       if (settings.systemProxy && !settings.tunMode) {
         try {
           await enableSystemProxy(mixedPort)
           runtime.proxyApplied = true
-          this.pushLog('info', `System proxy routed through Eaglet (${process.platform})`)
+          this.pushLog('info', t('System proxy routed through Eaglet ({platform})', { platform: process.platform }))
         } catch (error) {
-          this.pushLog('warn', `System proxy not applied: ${(error as Error).message}`)
+          this.pushLog('warn', t('System proxy not applied: {error}', { error: (error as Error).message }))
         }
       } else if (settings.tunMode) {
-        this.pushLog('info', 'TUN mode active · traffic captured at the adapter level')
+        this.pushLog('info', t('TUN mode active · traffic captured at the adapter level'))
       } else if (this.runtime.proxyApplied) {
         // The setting was turned off while protection stayed armed across a
         // reconnect; remove the stale proxy configuration.
@@ -704,18 +781,17 @@ export class VpnEngine extends EventEmitter {
 
       await this.applyProtection(profile, binary, settings)
 
-      // Fail closed: if protection was requested but could not be armed, do not
-      // leave the user on an unprotected tunnel. A direct profile and an
-      // unsupported platform are deliberate skips, not failures.
-      const killSwitchExpected =
-        (settings.killSwitch || settings.networkProtection) &&
-        profile.protocol !== 'direct' &&
-        killSwitchSupported()
-      if (killSwitchExpected && !this.killSwitchActive) {
-        throw new Error('Kill switch was enabled but could not be armed · connection aborted to avoid a leak')
+      // applyProtection throws when a requested layer cannot be armed, so a
+      // session only reaches this point when the protection really is live.
+      if ((settings.killSwitch || settings.networkProtection) && !this.killSwitchActive) {
+        throw new Error(
+          t('Kill switch was enabled but could not be armed · connection aborted to avoid a leak')
+        )
       }
       if ((settings.dnsProtection || settings.networkProtection) && !this.dnsProtectionActive) {
-        throw new Error('DNS protection was enabled but the relay did not start · connection aborted to avoid a leak')
+        throw new Error(
+          t('DNS protection was enabled but the relay did not start · connection aborted to avoid a leak')
+        )
       }
 
       this.status = 'connected'
@@ -723,16 +799,20 @@ export class VpnEngine extends EventEmitter {
       this.sessionSaved = false
       this.stage = null
       this.progress = 1
-      this.pushLog('success', `Tunnel established · ${profile.name} · ${adapter.name}`)
+      this.pushLog(
+        'success',
+        t('Tunnel established · {name} · {engine}', { name: profile.name, engine: adapter.name })
+      )
       this.startTelemetry()
       void this.sampleUsage()
     } catch (error) {
-      const message = (error as Error).message || 'Unknown connection error'
+      const message = (error as Error).message || t('Unknown connection error')
       this.pushLog('error', message)
       this.error = message
       await this.teardown(preserveProtection)
+      if (this.protectionError) this.error = this.protectionError
       if (preserveProtection) {
-        this.pushLog('warn', 'Kill switch stays armed · direct traffic is still blocked')
+        this.pushLog('warn', t('Kill switch stays armed · direct traffic is still blocked'))
       }
       this.status = 'error'
       this.stage = null
@@ -740,36 +820,6 @@ export class VpnEngine extends EventEmitter {
     } finally {
       this.runtime.transition = false
       this.emitUpdate()
-    }
-  }
-
-  /**
-   * Removes protection layers left over from a crashed session before a new
-   * handshake. They are re-armed as soon as the tunnel is verified.
-   */
-  private async clearStaleProtection(preserve = false): Promise<void> {
-    if (preserve) return
-    if (this.runtime.killSwitchApplied) {
-      try {
-        await disableKillSwitch()
-      } catch {
-        // Partial rules are cleaned by the next disable attempt.
-      }
-      this.runtime.killSwitchApplied = false
-      this.killSwitchActive = false
-    }
-    if (this.runtime.dnsGuardApplied) {
-      await stopDnsGuard()
-      this.runtime.dnsGuardApplied = false
-      this.dnsProtectionActive = false
-    }
-    if (this.runtime.proxyApplied) {
-      try {
-        await disableSystemProxy()
-      } catch {
-        // Ignore — a missing backup simply disables the proxy.
-      }
-      this.runtime.proxyApplied = false
     }
   }
 
@@ -788,7 +838,13 @@ export class VpnEngine extends EventEmitter {
         this.emitUpdate()
       })
     } catch (error) {
-      this.pushLog('warn', `Could not install ${this.manager.adapter(id).name}: ${(error as Error).message}`)
+      this.pushLog(
+        'warn',
+        t('Could not install {name}: {error}', {
+          name: this.manager.adapter(id).name,
+          error: (error as Error).message
+        })
+      )
       const fallback = (['sing-box', 'mihomo', 'xray'] as EngineId[]).find(
         (candidate) =>
           this.manager.getPath(candidate) &&
@@ -796,7 +852,7 @@ export class VpnEngine extends EventEmitter {
           (!settings.tunMode || this.manager.adapter(candidate).supportsTun)
       )
       if (!fallback) throw error
-      this.pushLog('warn', `Falling back to ${this.manager.adapter(fallback).name}`)
+      this.pushLog('warn', t('Falling back to {name}', { name: this.manager.adapter(fallback).name }))
       this.runtime.engine = fallback
       const path = this.manager.getPath(fallback)
       if (!path) throw error
@@ -804,18 +860,36 @@ export class VpnEngine extends EventEmitter {
     }
   }
 
+  /**
+   * Arms the requested protection layers. Throws when the user asked for
+   * protection that cannot be provided: the caller then tears the tunnel down
+   * instead of presenting an unprotected session as a secure one.
+   */
   private async applyProtection(profile: Profile, binary: string, settings: Settings): Promise<void> {
+    this.protectionError = null
+    this.killSwitchError = null
+    this.dnsError = null
+
     if (settings.killSwitch || settings.networkProtection) {
       if (profile.protocol === 'direct') {
-        this.pushLog('warn', 'Kill switch skipped · a direct profile is not a tunnel')
-      } else if (!killSwitchSupported()) {
-        this.pushLog('warn', 'Kill switch is not implemented on this platform')
-      } else if (this.runtime.killSwitchApplied) {
-        // The policy survived the crash and already permits this node. Calling
-        // enable() again would overwrite the saved pre-arm state with the
-        // already-blocked state (Windows) or with our own anchor rules (macOS),
-        // which would make a later disable() permanent. Leave it untouched.
-        this.pushLog('info', 'Kill switch already armed for this node · policy kept')
+        this.killSwitchError = t(
+          'Kill switch cannot protect a direct profile. Choose a tunnel profile or turn protection off.'
+        )
+        this.protectionError = this.killSwitchError
+        throw new Error(this.killSwitchError)
+      }
+      if (!killSwitchSupported()) {
+        this.killSwitchError = t(
+          'Kill switch is not supported on this platform. Turn protection off or use a supported OS.'
+        )
+        this.protectionError = this.killSwitchError
+        throw new Error(this.killSwitchError)
+      }
+
+      if (this.runtime.killSwitchApplied && this.runtime.protectedCorePath === binary) {
+        // The policy survived a reconnect and already permits this exact core
+        // and node. Re-arming would be redundant, not unsafe.
+        this.pushLog('info', t('Kill switch already armed for this node · policy kept'))
       } else {
         try {
           const subscriptionUrls = this.store
@@ -824,13 +898,21 @@ export class VpnEngine extends EventEmitter {
             .filter((url) => /^https?:\/\//i.test(url))
           const ips = await enableKillSwitch(profile, binary, settings, subscriptionUrls)
           this.runtime.killSwitchApplied = true
+          this.runtime.protectedCorePath = binary
           this.killSwitchActive = true
           this.pushLog(
             'success',
-            `Kill switch armed · whitelisted ${ips.length > 0 ? ips.join(', ') : 'loopback and Eaglet only'}`
+            t('Kill switch armed · whitelisted {targets}', {
+              targets: ips.length > 0 ? ips.join(', ') : t('loopback and Eaglet only')
+            })
           )
         } catch (error) {
-          this.pushLog('error', `Kill switch could not be armed: ${(error as Error).message}`)
+          this.killSwitchError = (error as Error).message
+          this.protectionError = t('Kill switch could not be armed: {error}', {
+            error: this.killSwitchError
+          })
+          this.pushLog('error', this.protectionError)
+          throw new Error(this.protectionError)
         }
       }
     }
@@ -841,43 +923,112 @@ export class VpnEngine extends EventEmitter {
         this.runtime.dnsGuardApplied = true
         this.dnsProtectionActive = true
         const stats = dnsGuardStats()
-        this.pushLog('success', `DNS protection active · DoH relay ${stats.endpoint ?? 'configured'}`)
+        this.pushLog(
+          'success',
+          t('DNS protection active · DoH relay {endpoint}', {
+            endpoint: stats.endpoint ?? t('configured')
+          })
+        )
       } catch (error) {
-        this.pushLog('warn', `DNS protection could not start: ${(error as Error).message}`)
-        if (this.runtime.killSwitchApplied && (settings.dnsProtection || settings.networkProtection)) {
-          this.pushLog(
-            'error',
-            'Kill switch is armed without the DNS relay · plaintext DNS is blocked until you disconnect'
-          )
-        }
+        const stats = dnsGuardStats()
+        // A relay that is still listening (and still owns the system resolver)
+        // is an active DNS layer with a pending restore, not a disabled one.
+        this.runtime.dnsGuardApplied = Boolean(stats.endpoint)
+        this.dnsProtectionActive = Boolean(stats.endpoint)
+        this.dnsError = (error as Error).message
+        this.protectionError = t('DNS protection could not start: {error}', { error: this.dnsError })
+        this.pushLog('error', this.protectionError)
+        throw new Error(this.protectionError)
       }
     }
   }
 
-  async disconnect(): Promise<void> {
+  /**
+   * Removes protection layers left over from a crashed session before a new
+   * handshake. They are re-armed as soon as the tunnel is verified.
+   */
+  private async clearStaleProtection(preserve = false): Promise<void> {
+    if (preserve) return
+    if (this.runtime.killSwitchApplied) {
+      try {
+        await disableKillSwitch()
+        this.runtime.killSwitchApplied = false
+        this.runtime.protectedCorePath = null
+        this.killSwitchActive = false
+      } catch (error) {
+        // A policy that could not be removed stays armed; the new session will
+        // reuse it instead of asserting that the machine is unprotected.
+        this.killSwitchError = (error as Error).message
+        this.protectionError = t('The previous kill-switch policy could not be removed: {error}', {
+          error: this.killSwitchError
+        })
+        this.pushLog('error', this.protectionError)
+      }
+    }
+    if (this.runtime.dnsGuardApplied) {
+      try {
+        await stopDnsGuard()
+        this.runtime.dnsGuardApplied = false
+        this.dnsProtectionActive = false
+      } catch (error) {
+        // The relay is deliberately kept alive when the resolver cannot be
+        // restored, so the layer is still active, just not removable.
+        this.dnsError = (error as Error).message
+        this.dnsProtectionActive = true
+        this.protectionError = this.dnsError
+        this.pushLog('error', this.dnsError)
+      }
+    }
+    if (this.runtime.proxyApplied) {
+      try {
+        await disableSystemProxy()
+      } catch {
+        // Ignore — a missing backup simply disables the proxy.
+      }
+      this.runtime.proxyApplied = false
+    }
+  }
+
+  async disconnect(options: { keepProtection?: boolean } = {}): Promise<void> {
     if (this.runtime.transition) return
     if (this.status === 'disconnected' || this.status === 'disconnecting') return
+    const keepProtection = options.keepProtection === true
     this.runtime.userStop = true
     this.clearReconnectTimer()
     this.runtime.transition = true
     this.status = 'disconnecting'
-    this.stage = 'Closing tunnel'
+    this.stage = t('Closing tunnel')
     this.progress = 0.5
-    this.pushLog('info', 'Closing the encrypted tunnel')
+    this.pushLog('info', t('Closing the encrypted tunnel'))
     this.emitUpdate()
 
-    await this.teardown(false)
+    this.protectionError = null
+    await this.teardown(keepProtection)
     this.finishSession()
 
-    this.status = 'disconnected'
-    this.stage = null
-    this.progress = 0
     this.connectedSince = null
     this.metrics = EMPTY_METRICS()
     this.history = []
-    this.error = null
     this.usage = EMPTY_USAGE()
-    this.pushLog('info', 'Disconnected · direct connection restored')
+    this.stage = null
+    this.progress = 0
+
+    if (this.protectionError) {
+      // The tunnel is down but a layer could not be removed. Report an error
+      // instead of claiming that direct access was restored.
+      this.status = 'error'
+      this.error = this.protectionError
+      this.pushLog('error', this.protectionError)
+    } else {
+      this.status = 'disconnected'
+      this.error = null
+      this.pushLog(
+        'info',
+        keepProtection && (this.runtime.killSwitchApplied || this.runtime.dnsGuardApplied)
+          ? t('Tunnel closed · protection stays armed until the switch completes')
+          : t('Disconnected · direct connection restored')
+      )
+    }
     this.runtime.transition = false
     this.emitUpdate()
   }
@@ -901,7 +1052,7 @@ export class VpnEngine extends EventEmitter {
       try {
         await disableSystemProxy()
       } catch (error) {
-        this.pushLog('warn', `Could not restore the system proxy: ${(error as Error).message}`)
+        this.pushLog('warn', t('Could not restore the system proxy: {error}', { error: (error as Error).message }))
       }
       this.runtime.proxyApplied = false
     }
@@ -910,16 +1061,31 @@ export class VpnEngine extends EventEmitter {
       if (this.runtime.killSwitchApplied) {
         try {
           await disableKillSwitch()
+          this.runtime.killSwitchApplied = false
+          this.runtime.protectedCorePath = null
+          this.killSwitchActive = false
         } catch (error) {
-          this.pushLog('warn', `Could not remove the kill switch: ${(error as Error).message}`)
+          // Keep the flags: the policy is still armed (or half restored) and
+          // the UI must not pretend the machine is back to direct access.
+          this.killSwitchError = (error as Error).message
+          this.protectionError = t('Could not remove the kill switch: {error}', {
+            error: this.killSwitchError
+          })
+          this.pushLog('error', this.protectionError)
         }
-        this.runtime.killSwitchApplied = false
-        this.killSwitchActive = false
       }
       if (this.runtime.dnsGuardApplied) {
-        await stopDnsGuard()
-        this.runtime.dnsGuardApplied = false
-        this.dnsProtectionActive = false
+        try {
+          await stopDnsGuard()
+          this.runtime.dnsGuardApplied = false
+          this.dnsProtectionActive = false
+        } catch (error) {
+          // The relay stays up on purpose when the resolver cannot be restored.
+          this.dnsError = (error as Error).message
+          this.dnsProtectionActive = true
+          this.protectionError = this.dnsError
+          this.pushLog('error', this.dnsError)
+        }
       }
     }
 
@@ -936,19 +1102,19 @@ export class VpnEngine extends EventEmitter {
     if (this.runtime.proxyApplied) {
       if (this.store.getSettings().killSwitch || this.store.getSettings().networkProtection) {
         // Leave the dead proxy in place so traffic cannot leak around the tunnel.
-        this.pushLog('warn', 'Kill switch active · system proxy kept to block traffic')
+        this.pushLog('warn', t('Kill switch active · system proxy kept to block traffic'))
       } else {
         this.runtime.proxyApplied = false
         void disableSystemProxy()
       }
     }
     if (this.runtime.killSwitchApplied) {
-      this.pushLog('warn', 'Kill switch stays armed until the tunnel is restored')
+      this.pushLog('warn', t('Kill switch stays armed until the tunnel is restored'))
     }
     if (this.runtime.dnsGuardApplied) {
-      this.pushLog('warn', 'DNS protection stays active while reconnecting')
+      this.pushLog('warn', t('DNS protection stays active while reconnecting'))
     }
-    const message = `Core stopped unexpectedly (exit ${code ?? 'unknown'})`
+    const message = t('Core stopped unexpectedly (exit {code})', { code: code ?? t('unknown') })
     this.pushLog('error', message)
     this.status = 'error'
     this.error = message
@@ -975,7 +1141,7 @@ export class VpnEngine extends EventEmitter {
     const engine = this.runtime.engine ?? this.engineId
     this.store.addSession({
       id: `${this.connectedSince}-${this.profileId ?? 'none'}`,
-      profileName: profile?.name ?? 'Unknown node',
+      profileName: profile?.name ?? t('Unknown node'),
       protocol: profile?.protocol ?? 'direct',
       engine,
       startedAt: this.connectedSince,
@@ -1001,11 +1167,11 @@ export class VpnEngine extends EventEmitter {
     if (this.runtime.userStop) return
     if (!this.store.getSettings().autoReconnect) return
     if (this.runtime.reconnectAttempts >= 3) {
-      this.pushLog('error', 'Auto-reconnect gave up after 3 attempts')
+      this.pushLog('error', t('Auto-reconnect gave up after 3 attempts'))
       if (this.runtime.killSwitchApplied || this.runtime.dnsGuardApplied) {
         this.pushLog(
           'warn',
-          'Protection stays armed after the failed reconnects · disconnect to restore direct access'
+          t('Protection stays armed after the failed reconnects · disconnect to restore direct access')
         )
       }
       this.emitUpdate()
@@ -1015,7 +1181,10 @@ export class VpnEngine extends EventEmitter {
     this.runtime.reconnectAttempts += 1
     const attempt = this.runtime.reconnectAttempts
     const delay = attempt * 2500
-    this.pushLog('warn', `Auto-reconnect ${attempt}/3 in ${Math.round(delay / 1000)}s`)
+    this.pushLog(
+      'warn',
+      t('Auto-reconnect {attempt}/3 in {seconds}s', { attempt, seconds: Math.round(delay / 1000) })
+    )
     this.emitUpdate()
 
     this.clearReconnectTimer()
@@ -1030,7 +1199,7 @@ export class VpnEngine extends EventEmitter {
         await this.connect(this.profileId ?? undefined, true)
         if (this.status === 'connected') {
           this.runtime.reconnectAttempts = 0
-          this.pushLog('success', 'Auto-reconnect restored the tunnel')
+          this.pushLog('success', t('Auto-reconnect restored the tunnel'))
           this.emitUpdate()
         } else if (this.runtime.reconnectAttempts < 3) {
           this.scheduleReconnect()
@@ -1079,9 +1248,15 @@ export class VpnEngine extends EventEmitter {
       } else {
         this.ip = { ...this.ip, checking: false }
       }
-      this.pushLog('info', `IP check · direct ${this.ip.direct?.ip ?? 'unknown'} · exit ${exit?.ip ?? 'unknown'}`)
+      this.pushLog(
+        'info',
+        t('IP check · direct {direct} · exit {exit}', {
+          direct: this.ip.direct?.ip ?? t('unknown'),
+          exit: exit?.ip ?? t('unknown')
+        })
+      )
     } catch (error) {
-      this.pushLog('warn', `IP check failed: ${(error as Error).message}`)
+      this.pushLog('warn', t('IP check failed: {error}', { error: (error as Error).message }))
       this.ip = { ...this.ip, checking: false }
     }
     this.emitUpdate()
@@ -1108,7 +1283,7 @@ export class VpnEngine extends EventEmitter {
       // through a blocked path.
       this.pushLog(
         'warn',
-        'Latency tests are unavailable while the kill switch is armed — disconnect to measure nodes'
+        t('Latency tests are unavailable while the kill switch is armed — disconnect to measure nodes')
       )
       this.emitUpdate()
       return this.store.getProfiles()
@@ -1131,7 +1306,12 @@ export class VpnEngine extends EventEmitter {
     for (const [id, point] of geo) this.store.setGeo(id, point)
     this.pushLog(
       'info',
-      `Latency test finished · ${targets.length} profile(s)${geo.size > 0 ? ` · ${geo.size} located` : ''}`
+      geo.size > 0
+        ? t('Latency test finished · {count} profiles · {located} located', {
+            count: targets.length,
+            located: geo.size
+          })
+        : t('Latency test finished · {count} profiles', { count: targets.length })
     )
     this.emitUpdate()
     return this.store.getProfiles()
@@ -1141,7 +1321,7 @@ export class VpnEngine extends EventEmitter {
   async pickFastestProfile(): Promise<Profile> {
     const profiles = this.store.getProfiles().filter((profile) => profile.protocol !== 'direct' && profile.port > 0)
     if (profiles.length === 0) {
-      throw new Error('No nodes yet — import a subscription or find free servers first')
+      throw new Error(t('No nodes yet — import a subscription or find free servers first'))
     }
     const ranked = [...profiles].sort((left, right) => {
       if (left.favorite !== right.favorite) return left.favorite ? -1 : 1
@@ -1251,7 +1431,11 @@ export class VpnEngine extends EventEmitter {
       if (this.metrics.sessionSeconds % 120 === 0) {
         this.pushLog(
           'info',
-          `Session healthy · ${Math.round(this.metrics.ping)} ms · ${this.metrics.connections} connections · ${this.metrics.loss.toFixed(1)}% loss`
+          t('Session healthy · {ping} ms · {connections} connections · {loss}% loss', {
+            ping: Math.round(this.metrics.ping),
+            connections: this.metrics.connections,
+            loss: this.metrics.loss.toFixed(1)
+          })
         )
       }
       this.emitUpdate()
@@ -1292,15 +1476,19 @@ export class VpnEngine extends EventEmitter {
   /** Downloads a fixed payload through the tunnel and reports real throughput. */
   async runSpeedTest(): Promise<SpeedTestResult> {
     if (this.status !== 'connected' || !this.runtime.mixedPort) {
-      throw new Error('Connect to a tunnel before running a speed test')
+      throw new Error(t('Connect to a tunnel before running a speed test'))
     }
-    this.pushLog('info', 'Speed test · downloading 10 MB through the tunnel')
+    this.pushLog('info', t('Speed test · downloading 10 MB through the tunnel'))
     this.emitUpdate()
     const { bytes, seconds } = await downloadThroughput(this.runtime.mixedPort)
     const mbps = Math.round(((bytes * 8) / seconds / 1_000_000) * 10) / 10
     this.pushLog(
       'success',
-      `Speed test · ${mbps} Mbps · ${(bytes / 1_000_000).toFixed(1)} MB in ${seconds.toFixed(1)}s`
+      t('Speed test · {mbps} Mbps · {size} MB in {seconds}s', {
+        mbps,
+        size: (bytes / 1_000_000).toFixed(1),
+        seconds: seconds.toFixed(1)
+      })
     )
     this.emitUpdate()
     return { mbps, bytes, seconds: Math.round(seconds * 100) / 100, at: now() }
@@ -1309,7 +1497,12 @@ export class VpnEngine extends EventEmitter {
   /** Toggles the system proxy while a tunnel is already live. */
   async setSystemProxy(enabled: boolean): Promise<void> {
     if (this.status !== 'connected' || !this.runtime.mixedPort) {
-      this.pushLog('info', `System proxy ${enabled ? 'enabled' : 'disabled'} for the next session`)
+      this.pushLog(
+        'info',
+        t('System proxy {state} for the next session', {
+          state: enabled ? t('enabled') : t('disabled')
+        })
+      )
       this.emitUpdate()
       return
     }
@@ -1317,14 +1510,14 @@ export class VpnEngine extends EventEmitter {
       if (enabled && !this.runtime.proxyApplied) {
         await enableSystemProxy(this.runtime.mixedPort)
         this.runtime.proxyApplied = true
-        this.pushLog('success', 'System proxy enabled')
+        this.pushLog('success', t('System proxy enabled'))
       } else if (!enabled && this.runtime.proxyApplied) {
         await disableSystemProxy()
         this.runtime.proxyApplied = false
-        this.pushLog('info', 'System proxy disabled · apps go direct')
+        this.pushLog('info', t('System proxy disabled · apps go direct'))
       }
     } catch (error) {
-      this.pushLog('error', `System proxy change failed: ${(error as Error).message}`)
+      this.pushLog('error', t('System proxy change failed: {error}', { error: (error as Error).message }))
     }
     this.emitUpdate()
   }
@@ -1335,7 +1528,7 @@ export class VpnEngine extends EventEmitter {
 
   async applyScenario(id: string): Promise<void> {
     const scenario = allScenarios(this.store.getScenarios()).find((item) => item.id === id)
-    if (!scenario) throw new Error('Scenario not found')
+    if (!scenario) throw new Error(t('Scenario not found'))
     const connected = this.isLive()
     const previous = this.store.getSettings()
     this.store.updateSettings({ ...scenario.settings, engine: scenario.engine })
@@ -1343,7 +1536,7 @@ export class VpnEngine extends EventEmitter {
       id: `${now()}-scenario-${id}`,
       at: now(),
       kind: 'scenario',
-      message: `Scenario applied: ${scenario.name}`
+      message: t('Scenario applied: {name}', { name: scenario.name })
     })
 
     const settings = this.store.getSettings()
@@ -1365,24 +1558,39 @@ export class VpnEngine extends EventEmitter {
           if (favourite) this.setProfile(favourite.id)
         }
       } catch (error) {
-        this.pushLog('warn', `Scenario server selection: ${(error as Error).message}`)
+        this.pushLog('warn', t('Scenario server selection: {error}', { error: (error as Error).message }))
       }
     }
 
+    const modeLabel = t(
+      settings.routingMode === 'global'
+        ? 'Global'
+        : settings.routingMode === 'smart'
+          ? 'Smart'
+          : 'Direct'
+    )
     this.pushLog(
       'success',
-      `Scenario «${scenario.name}» applied · ${this.manager.adapter(chosen).name} · ${settings.routingMode} routing${
-        connected ? ' · reconnect to use it' : ''
-      }`
+      connected
+        ? t('Scenario «{name}» applied · {engine} · {mode} routing · reconnect to use it', {
+            name: scenario.name,
+            engine: this.manager.adapter(chosen).name,
+            mode: modeLabel
+          })
+        : t('Scenario «{name}» applied · {engine} · {mode} routing', {
+            name: scenario.name,
+            engine: this.manager.adapter(chosen).name,
+            mode: modeLabel
+          })
     )
-    if (connected) this.pushLog('warn', 'Settings changed; the live tunnel still uses the previous configuration')
+    if (connected) this.pushLog('warn', t('Settings changed; the live tunnel still uses the previous configuration'))
     if (previous.engine !== settings.engine) this.emitUpdate()
     this.emitUpdate()
   }
 
   saveScenario(scenario: Scenario): Scenario[] {
     this.store.saveScenario(scenario)
-    this.pushLog('info', `Scenario saved · ${scenario.name}`)
+    this.pushLog('info', t('Scenario saved · {name}', { name: scenario.name }))
     this.emitUpdate()
     return allScenarios(this.store.getScenarios())
   }
@@ -1408,57 +1616,57 @@ export class VpnEngine extends EventEmitter {
     const binary = this.manager.getPath(this.engineId)
     checks.push({
       id: 'core',
-      label: `${adapter.name} binary`,
+      label: t('{name} binary', { name: adapter.name }),
       status: binary ? 'pass' : 'fail',
-      detail: binary ? binary : 'Not installed — connect once to download it'
+      detail: binary ? binary : t('Not installed — connect once to download it')
     })
     checks.push({
       id: 'core-version',
-      label: 'Engine version',
+      label: t('Engine version'),
       status: this.manager.getVersion(this.engineId) ? 'pass' : 'warn',
-      detail: this.manager.getVersion(this.engineId) ?? 'Version could not be read'
+      detail: this.manager.getVersion(this.engineId) ?? t('Version could not be read')
     })
     checks.push({
       id: 'config',
-      label: 'Validated configuration',
+      label: t('Validated configuration'),
       status: this.runtime.configPath && existsSync(this.runtime.configPath) ? 'pass' : 'skip',
-      detail: this.runtime.configPath ?? 'No configuration generated yet'
+      detail: this.runtime.configPath ?? t('No configuration generated yet')
     })
 
     if (settings.systemProxy && !settings.tunMode) {
       checks.push({
         id: 'proxy',
-        label: 'System proxy',
+        label: t('System proxy'),
         status: this.runtime.proxyApplied ? 'pass' : this.status === 'connected' ? 'warn' : 'skip',
         detail: this.runtime.proxyApplied
-          ? 'Applications are pointed at 127.0.0.1'
+          ? t('Applications are pointed at 127.0.0.1')
           : this.status === 'connected'
-            ? 'Enabled in settings but not applied to the OS'
-            : 'Applied on the next connection'
+            ? t('Enabled in settings but not applied to the OS')
+            : t('Applied on the next connection')
       })
     }
 
     if (settings.tunMode) {
       checks.push({
         id: 'tun',
-        label: 'TUN capture',
+        label: t('TUN capture'),
         status: adapter.supportsTun ? 'pass' : 'fail',
         detail: adapter.supportsTun
-          ? `Supported by ${adapter.name}; needs an administrator session`
-          : `${adapter.name} has no TUN implementation`
+          ? t('Supported by {name}; needs an administrator session', { name: adapter.name })
+          : t('{name} has no TUN implementation', { name: adapter.name })
       })
     }
 
     if (settings.killSwitch || settings.networkProtection) {
       checks.push({
         id: 'kill-switch',
-        label: 'Kill switch',
+        label: t('Kill switch'),
         status: this.killSwitchActive ? 'pass' : killSwitchSupported() ? 'warn' : 'fail',
         detail: this.killSwitchActive
-          ? 'OS firewall policy is armed'
+          ? t('OS firewall policy is armed')
           : killSwitchSupported()
-            ? 'Not armed (disconnected or elevation denied)'
-            : 'No implementation for this platform'
+            ? t('Not armed (disconnected or elevation denied)')
+            : t('No implementation for this platform')
       })
     }
 
@@ -1466,42 +1674,63 @@ export class VpnEngine extends EventEmitter {
       const stats = dnsGuardStats()
       checks.push({
         id: 'dns',
-        label: 'DNS protection',
+        label: t('DNS protection'),
         status: this.dnsProtectionActive ? 'pass' : 'warn',
         detail: this.dnsProtectionActive
-          ? `Local DoH relay active · ${stats.requests} queries · ${stats.failures} failures`
-          : 'Relay not running; system DNS is unchanged'
+          ? t('Local DoH relay active · {queries} queries · {failures} failures', {
+              queries: stats.requests,
+              failures: stats.failures
+            })
+          : t('Relay not running; system DNS is unchanged')
       })
     }
 
     try {
       await lookup('example.com')
-      checks.push({ id: 'resolve', label: 'DNS resolution', status: 'pass', detail: 'example.com resolved' })
+      checks.push({
+        id: 'resolve',
+        label: t('DNS resolution'),
+        status: 'pass',
+        detail: t('example.com resolved')
+      })
     } catch (error) {
-      checks.push({ id: 'resolve', label: 'DNS resolution', status: 'fail', detail: (error as Error).message })
+      checks.push({
+        id: 'resolve',
+        label: t('DNS resolution'),
+        status: 'fail',
+        detail: (error as Error).message
+      })
     }
 
     if (this.status === 'connected') {
       checks.push({
         id: 'exit',
-        label: 'Exit address',
+        label: t('Exit address'),
         status: this.ip.exit ? 'pass' : 'fail',
-        detail: this.ip.exit ? `${this.ip.exit.ip} · ${this.ip.exit.country}` : 'Tunnel did not return an address'
+        detail: this.ip.exit
+          ? `${this.ip.exit.ip} · ${this.ip.exit.country}`
+          : t('Tunnel did not return an address')
       })
       checks.push({
         id: 'latency',
-        label: 'Latency',
+        label: t('Latency'),
         status: this.metrics.ping > 0 ? (this.metrics.ping < 200 ? 'pass' : 'warn') : 'warn',
         detail:
           this.metrics.ping > 0
-            ? `${Math.round(this.metrics.ping)} ms · jitter ${Math.round(this.metrics.jitter)} ms`
-            : 'No successful probe yet'
+            ? t('{ping} ms · jitter {jitter} ms', {
+                ping: Math.round(this.metrics.ping),
+                jitter: Math.round(this.metrics.jitter)
+              })
+            : t('No successful probe yet')
       })
       checks.push({
         id: 'loss',
-        label: 'Packet loss',
+        label: t('Packet loss'),
         status: this.metrics.loss < 5 ? 'pass' : this.metrics.loss < 20 ? 'warn' : 'fail',
-        detail: `${this.metrics.loss.toFixed(1)}% over the last ${this.runtime.probeWindow.length} probes`
+        detail: t('{loss}% over the last {count} probes', {
+          loss: this.metrics.loss.toFixed(1),
+          count: this.runtime.probeWindow.length
+        })
       })
     }
 
@@ -1514,19 +1743,22 @@ export class VpnEngine extends EventEmitter {
       )
     checks.push({
       id: 'subscriptions',
-      label: 'Subscription freshness',
+      label: t('Subscription freshness'),
       status: stale.length === 0 ? 'pass' : 'warn',
       detail:
         stale.length === 0
-          ? 'No stale HTTP subscriptions'
-          : `${stale.length} subscription(s) older than ${settings.subscriptionIntervalHours}h`
+          ? t('No stale HTTP subscriptions')
+          : t('{count} subscription(s) older than {hours}h', {
+              count: stale.length,
+              hours: settings.subscriptionIntervalHours
+            })
     })
 
     const updates = this.engines.filter((engine) => engine.updateAvailable)
     if (updates.length > 0) {
       checks.push({
         id: 'updates',
-        label: 'Engine updates',
+        label: t('Engine updates'),
         status: 'warn',
         detail: updates.map((engine) => `${engine.name} → ${engine.latestVersion}`).join(', ')
       })
@@ -1534,12 +1766,14 @@ export class VpnEngine extends EventEmitter {
 
     checks.push({
       id: 'platform',
-      label: 'Platform support',
+      label: t('Platform support'),
       status: this.manager.platformSupport(this.engineId) === 'supported' ? 'pass' : 'warn',
       detail:
         this.manager.platformSupport(this.engineId) === 'supported'
-          ? `${process.platform} · supported and tested path`
-          : `${process.platform} · experimental, not part of the verified matrix`
+          ? t('{platform} · supported and tested path', { platform: process.platform })
+          : t('{platform} · experimental, not part of the verified matrix', {
+              platform: process.platform
+            })
     })
 
     const failed = checks.filter((check) => check.status === 'fail').length
@@ -1549,10 +1783,10 @@ export class VpnEngine extends EventEmitter {
       checks,
       summary:
         failed > 0
-          ? `${failed} problem(s), ${warned} warning(s)`
+          ? t('{failed} problem(s), {warned} warning(s)', { failed, warned })
           : warned > 0
-            ? `Healthy with ${warned} warning(s)`
-            : 'All checks passed'
+            ? t('Healthy with {count} warning(s)', { count: warned })
+            : t('All checks passed')
     }
   }
 
@@ -1565,7 +1799,7 @@ export class VpnEngine extends EventEmitter {
   /** Renders the config for the currently selected profile without connecting. */
   buildExportConfig(): { engine: EngineId; content: string; extension: string } {
     const profile = this.activeProfile()
-    if (!profile) throw new Error('Select a profile before exporting a configuration')
+    if (!profile) throw new Error(t('Select a profile before exporting a configuration'))
     const settings = this.store.getSettings()
     const choice = this.manager.choose(profile, settings)
     const content = this.manager.buildConfig(choice.id, {
@@ -1589,11 +1823,11 @@ export class VpnEngine extends EventEmitter {
     id: EngineId
   ): Promise<{ engine: EngineId; path: string | null; configPath: string | null; valid: boolean; detail: string }> {
     const profile = this.activeProfile()
-    if (!profile) throw new Error('Select a profile before validating an engine configuration')
+    if (!profile) throw new Error(t('Select a profile before validating an engine configuration'))
     const settings = this.store.getSettings()
     const binary = this.manager.getPath(id)
     if (!binary) {
-      return { engine: id, path: null, configPath: null, valid: false, detail: 'not installed' }
+      return { engine: id, path: null, configPath: null, valid: false, detail: t('not installed') }
     }
     if (!this.manager.supportsProfile(id, profile)) {
       return {
@@ -1601,7 +1835,10 @@ export class VpnEngine extends EventEmitter {
         path: binary,
         configPath: null,
         valid: false,
-        detail: `${this.manager.adapter(id).name} cannot carry this ${profile.protocol.toUpperCase()} profile`
+        detail: t('{name} cannot carry this {protocol} profile', {
+          name: this.manager.adapter(id).name,
+          protocol: profile.protocol.toUpperCase()
+        })
       }
     }
     const content = this.manager.buildConfig(id, {
@@ -1619,7 +1856,7 @@ export class VpnEngine extends EventEmitter {
     writeFileSync(configPath, content, 'utf-8')
     try {
       await this.manager.validate(id, binary, configPath)
-      return { engine: id, path: binary, configPath, valid: true, detail: 'configuration accepted by the core' }
+      return { engine: id, path: binary, configPath, valid: true, detail: t('configuration accepted by the core') }
     } catch (error) {
       return {
         engine: id,
@@ -1636,13 +1873,13 @@ export class VpnEngine extends EventEmitter {
    * engine harness so wintun.dll problems surface before a real connection.
    */
   async prepareTun(): Promise<{ engine: EngineId; path: string; wintun: string | null }> {
-    if (process.platform !== 'win32') throw new Error('TUN preparation is only implemented on Windows')
+    if (process.platform !== 'win32') throw new Error(t('TUN preparation is only implemented on Windows'))
     const profile = this.activeProfile()
-    if (!profile) throw new Error('Select a profile before preparing TUN mode')
+    if (!profile) throw new Error(t('Select a profile before preparing TUN mode'))
     const settings = { ...this.store.getSettings(), tunMode: true }
     const choice = this.manager.choose(profile, settings)
     if (!this.manager.adapter(choice.id).supportsTun) {
-      throw new Error(`${this.manager.adapter(choice.id).name} does not support TUN`)
+      throw new Error(t('{name} does not support TUN', { name: this.manager.adapter(choice.id).name }))
     }
     const binary = await this.prepareBinary(choice.id, profile, settings)
     const staged = await this.manager.ensureTun(choice.id, binary, (message) => {

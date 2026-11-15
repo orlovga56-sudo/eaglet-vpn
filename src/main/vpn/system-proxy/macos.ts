@@ -126,3 +126,26 @@ export function disableSystemProxySync(): void {
 export function recoverStaleProxy(): void {
   if (existsSync(backupPath())) disableSystemProxySync()
 }
+
+/** Current web/secure proxy state per service, used to verify a restore. */
+export async function readSystemProxy(): Promise<Record<string, string> | null> {
+  try {
+    const list = await services()
+    const values: Record<string, string> = {}
+    for (const service of list) {
+      const [web, secure] = await Promise.all([
+        execFileAsync('networksetup', ['-getwebproxy', service]).then((r) => r.stdout).catch(() => ''),
+        execFileAsync('networksetup', ['-getsecurewebproxy', service]).then((r) => r.stdout).catch(() => '')
+      ])
+      const format = (output: string): string => {
+        const parsed = parseProxy(output)
+        return `${parsed.enabled ? 1 : 0}|${parsed.server}|${parsed.port}`
+      }
+      values[`web:${service}`] = format(web)
+      values[`secure:${service}`] = format(secure)
+    }
+    return Object.keys(values).length > 0 ? values : null
+  } catch {
+    return null
+  }
+}

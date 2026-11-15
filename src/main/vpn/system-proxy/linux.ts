@@ -106,3 +106,25 @@ export function disableSystemProxySync(): void {
 export function recoverStaleProxy(): void {
   if (existsSync(backupPath())) disableSystemProxySync()
 }
+
+/** Current GSettings proxy values, used to verify a restore. */
+export async function readSystemProxy(): Promise<Record<string, string> | null> {
+  try {
+    const keys: Array<[string, string]> = [
+      ['org.gnome.system.proxy', 'mode'],
+      ['org.gnome.system.proxy.http', 'host'],
+      ['org.gnome.system.proxy.http', 'port'],
+      ['org.gnome.system.proxy.https', 'host'],
+      ['org.gnome.system.proxy.https', 'port'],
+      ['org.gnome.system.proxy.socks', 'host'],
+      ['org.gnome.system.proxy.socks', 'port']
+    ]
+    const values: Record<string, string> = {}
+    for (const [schema, key] of keys) {
+      values[`${schema}:${key}`] = await gsettings(['get', schema, key]).catch(() => '')
+    }
+    return Object.values(values).some(Boolean) ? values : null
+  } catch {
+    return null
+  }
+}

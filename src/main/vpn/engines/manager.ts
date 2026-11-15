@@ -17,6 +17,7 @@ import { gunzipSync } from 'node:zlib'
 import { promisify } from 'node:util'
 import { app } from 'electron'
 import type { EngineId, EngineState, Profile, Settings } from '@shared/types'
+import { t } from '../../i18n'
 import { mihomoAdapter } from './mihomo-adapter'
 import { singboxAdapter } from './singbox-adapter'
 import { xrayAdapter } from './xray-adapter'
@@ -74,10 +75,15 @@ async function verifyWindowsSignature(file: string, label: string): Promise<void
     )
     status = stdout.trim().split('|')[0] || 'UnknownError'
   } catch (error) {
-    throw new Error(`Could not verify the Authenticode signature of ${label}: ${(error as Error).message}`)
+    throw new Error(
+      t('Could not verify the Authenticode signature of {label}: {error}', {
+        label,
+        error: (error as Error).message
+      })
+    )
   }
   if (!signatureStatusAllowed(status)) {
-    throw new Error(`${label} failed Authenticode verification (${status})`)
+    throw new Error(t('{label} failed Authenticode verification ({status})', { label, status }))
   }
 }
 
@@ -267,7 +273,12 @@ export class EngineManager {
     } catch (error) {
       const detail = (error as { stderr?: string; stdout?: string; message?: string }).stderr?.trim()
       const stdout = (error as { stdout?: string }).stdout?.trim()
-      throw new Error(detail || stdout || (error as Error).message || `${this.adapter(id).name} rejected the config`)
+      throw new Error(
+        detail ||
+          stdout ||
+          (error as Error).message ||
+          t('{name} rejected the config', { name: this.adapter(id).name })
+      )
     }
   }
 
@@ -380,7 +391,7 @@ export class EngineManager {
       headers: { 'User-Agent': 'Eaglet-VPN' },
       signal: AbortSignal.timeout(15000)
     })
-    if (!response.ok) throw new Error(`GitHub release lookup failed (${response.status})`)
+    if (!response.ok) throw new Error(t('GitHub release lookup failed ({status})', { status: response.status }))
     const release = (await response.json()) as {
       tag_name?: string
       assets?: ReleaseAsset[]
@@ -443,9 +454,16 @@ export class EngineManager {
       return existing
     }
 
-    log(`Downloading ${adapter.name}…`)
+    log(t('Downloading {name}…', { name: adapter.name }))
     const release = await this.latestRelease(adapter)
-    if (!release.url) throw new Error(`No ${adapter.name} build found for ${process.platform}/${process.arch}`)
+    if (!release.url)
+      throw new Error(
+        t('No {name} build found for {platform}/{arch}', {
+          name: adapter.name,
+          platform: process.platform,
+          arch: process.arch
+        })
+      )
     entry.latestVersion = release.version
 
     const extension = release.url.endsWith('.tar.gz') ? '.tar.gz' : release.url.endsWith('.gz') ? '.gz' : '.zip'
@@ -454,7 +472,8 @@ export class EngineManager {
       headers: { 'User-Agent': 'Eaglet-VPN' },
       signal: AbortSignal.timeout(180000)
     })
-    if (!download.ok || !download.body) throw new Error(`${adapter.name} download failed (${download.status})`)
+    if (!download.ok || !download.body)
+      throw new Error(t('{name} download failed ({status})', { name: adapter.name, status: download.status }))
     await new Promise<void>((resolve, reject) => {
       const file = createWriteStream(archive)
       const reader = download.body!.getReader()
@@ -477,16 +496,24 @@ export class EngineManager {
     const expected = release.digest ?? (await this.fetchChecksum(release))
     if (!expected) {
       rmSync(archive, { force: true })
-      throw new Error(`No SHA-256 checksum was published for ${adapter.name}; refusing to install an unverified core`)
+      throw new Error(
+        t('No SHA-256 checksum was published for {name}; refusing to install an unverified core', {
+          name: adapter.name
+        })
+      )
     }
     const actual = sha256OfFile(archive)
     if (actual !== expected.toLowerCase()) {
       rmSync(archive, { force: true })
       throw new Error(
-        `${adapter.name} failed SHA-256 verification (expected ${expected.toLowerCase()}, got ${actual})`
+        t('{name} failed SHA-256 verification (expected {expected}, got {actual})', {
+          name: adapter.name,
+          expected: expected.toLowerCase(),
+          actual
+        })
       )
     }
-    log(`${adapter.name} archive verified · SHA-256 ${actual.slice(0, 16)}…`)
+    log(t('{name} archive verified · SHA-256 {hash}…', { name: adapter.name, hash: actual.slice(0, 16) }))
 
     const destination = join(app.getPath('userData'), 'bin')
     mkdirSync(destination, { recursive: true })
@@ -525,7 +552,8 @@ export class EngineManager {
           candidates.find((file) => basename(file) === binaryName) ??
           candidates.find((file) => basename(file).toLowerCase().startsWith(adapter.id)) ??
           candidates.sort((left, right) => statSync(right).size - statSync(left).size)[0]
-        if (!core) throw new Error(`${adapter.name} archive did not contain an executable`)
+        if (!core)
+          throw new Error(t('{name} archive did not contain an executable', { name: adapter.name }))
         await verifyWindowsSignature(core, adapter.name)
         for (const file of files) {
           const name = basename(file)
@@ -541,13 +569,18 @@ export class EngineManager {
 
     rmSync(archive, { force: true })
     const binary = join(destination, binaryName)
-    if (!existsSync(binary)) throw new Error(`${adapter.name} archive did not contain ${binaryName}`)
+    if (!existsSync(binary))
+      throw new Error(t('{name} archive did not contain {file}', { name: adapter.name, file: binaryName }))
     if (process.platform !== 'win32') {
       await execFileAsync('chmod', ['+x', binary]).catch(() => undefined)
     }
     entry.binary = binary
     entry.version = await this.readVersion(adapter, binary)
-    log(`${adapter.name} installed${entry.version ? ` · ${entry.version}` : ''}`)
+    log(
+      entry.version
+        ? t('{name} installed · {version}', { name: adapter.name, version: entry.version })
+        : t('{name} installed', { name: adapter.name })
+    )
     return binary
   }
 
@@ -563,18 +596,19 @@ export class EngineManager {
     const wintun = join(destination, 'wintun.dll')
 
     if (!existsSync(wintun)) {
-      log('Downloading wintun.dll for TUN mode…')
+      log(t('Downloading wintun.dll for TUN mode…'))
       const archive = join(tmpdir(), `eaglet-wintun-${Date.now()}.zip`)
       const response = await fetch('https://www.wintun.net/builds/wintun-0.14.1.zip', {
         headers: { 'User-Agent': 'Eaglet-VPN' },
         signal: AbortSignal.timeout(60000)
       })
-      if (!response.ok) throw new Error(`wintun.dll download failed (${response.status})`)
+      if (!response.ok)
+        throw new Error(t('wintun.dll download failed ({status})', { status: response.status }))
       writeFileSync(archive, Buffer.from(await response.arrayBuffer()))
       const actual = sha256OfFile(archive)
       if (actual !== WINTUN_SHA256) {
         rmSync(archive, { force: true })
-        throw new Error(`wintun.dll archive failed integrity verification (SHA-256 ${actual})`)
+        throw new Error(t('wintun.dll archive failed integrity verification (SHA-256 {hash})', { hash: actual }))
       }
       const extracted = join(tmpdir(), `eaglet-wintun-${Date.now()}`)
       mkdirSync(extracted, { recursive: true })
@@ -585,9 +619,9 @@ export class EngineManager {
         const dll =
           files.find((file) => /wintun\.dll$/i.test(file) && file.replace(/\\/g, '/').includes(`/${arch}/`)) ??
           files.find((file) => /wintun\.dll$/i.test(file))
-        if (!dll) throw new Error('The wintun archive did not contain wintun.dll')
+        if (!dll) throw new Error(t('The wintun archive did not contain wintun.dll'))
         writeFileSync(wintun, readFileSync(dll))
-        log('wintun.dll ready · TUN capture available')
+        log(t('wintun.dll ready · TUN capture available'))
       } finally {
         rmSync(extracted, { recursive: true, force: true })
         rmSync(archive, { force: true })
@@ -606,7 +640,7 @@ export class EngineManager {
       }
       const entry = this.entries.get(id)
       if (entry) entry.binary = target
-      log(`${this.adapter(id).name} staged next to wintun.dll`)
+      log(t('{name} staged next to wintun.dll', { name: this.adapter(id).name }))
       return target
     }
     return binary
@@ -618,7 +652,11 @@ export class EngineManager {
     const binary = entry.binary ?? resourceBinary(entry.adapter)
     if (!binary) return false
     if (!binary.startsWith(app.getPath('userData'))) {
-      throw new Error(`${entry.adapter.name} is bundled with Eaglet and cannot be removed from the app folder`)
+      throw new Error(
+        t('{name} is bundled with Eaglet and cannot be removed from the app folder', {
+          name: entry.adapter.name
+        })
+      )
     }
     const dir = join(app.getPath('userData'), 'bin')
     const keep = new Set(['sing-box.exe', 'xray.exe', 'mihomo.exe', 'sing-box', 'xray', 'mihomo', 'wintun.dll'])

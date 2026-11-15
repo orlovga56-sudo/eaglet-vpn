@@ -1,4 +1,5 @@
 import type { IpInfo, Profile, VpnStatus } from '@shared/types'
+import { t } from '../i18n'
 import worldMap from '../data/worldMap.json'
 
 interface Props {
@@ -64,13 +65,17 @@ export function WorldMap({
       <div className="map-meta">
         <span className="map-title">
           <span className="pulse" style={{ opacity: live ? 1 : 0.3 }} />
-          {live ? 'Encrypted route' : selectedGeo ? `Planned · ${selected?.name ?? 'node'}` : 'Standby'}
+          {live
+            ? t('Encrypted route')
+            : selectedGeo
+              ? t('Planned · {name}', { name: selected?.name ?? t('node') })
+              : t('Standby')}
         </span>
         <span className="map-legend">
-          {pins.length > 0 && <span>{pins.length} located nodes</span>}
-          <button className="map-node" onClick={onManage} title="Manage servers">
+          {pins.length > 0 && <span>{t('{count} located nodes', { count: pins.length })}</span>}
+          <button className="map-node" onClick={onManage} title={t('Manage servers')}>
             {exit?.countryCode ? <span className="code">{exit.countryCode}</span> : null}
-            {place || 'Add a node'}
+            {place || t('Add a node')}
             <span style={{ color: 'var(--dim)' }}>›</span>
           </button>
         </span>
@@ -81,7 +86,7 @@ export function WorldMap({
         viewBox="0 50 1000 300"
         preserveAspectRatio="xMidYMid slice"
         role="img"
-        aria-label="World map with real node, direct and tunnel exit locations"
+        aria-label={t('World map with real node, direct and tunnel exit locations')}
       >
         <defs>
           <pattern id="eg-dots" width="6.5" height="6.5" patternUnits="userSpaceOnUse">
@@ -126,7 +131,14 @@ export function WorldMap({
                 if (event.key === 'Enter') onPick?.(profile.id)
               }}
             >
-              <title>{`${profile.name} · ${profile.geo?.city ?? ''} ${profile.geo?.country ?? ''} · ${profile.ping ?? '—'} ms`}</title>
+              <title>
+                {t('{name} · {city} {country} · {ping} ms', {
+                  name: profile.name,
+                  city: profile.geo?.city ?? '',
+                  country: profile.geo?.country ?? '',
+                  ping: profile.ping ?? '—'
+                })}
+              </title>
               <circle r={isSelected ? 7 : 4.2} fill="var(--accent)" opacity={isSelected ? 0.95 : 0.55} />
               <circle
                 r={isSelected ? 12 : 7}
@@ -176,7 +188,7 @@ export function WorldMap({
               fill="var(--dim)"
               style={{ fontSize: 9, fontFamily: 'var(--mono)', fontWeight: 600, letterSpacing: '0.14em' }}
             >
-              YOU
+              {t('YOU')}
             </text>
           </>
         )}
@@ -200,7 +212,7 @@ export function WorldMap({
               fill="var(--muted)"
               style={{ fontSize: 9, fontFamily: 'var(--mono)', fontWeight: 600, letterSpacing: '0.14em' }}
             >
-              {exit?.countryCode || 'EXIT'}
+              {exit?.countryCode || t('EXIT')}
             </text>
           </>
         )}
@@ -212,7 +224,7 @@ export function WorldMap({
             fill="var(--muted)"
             style={{ fontSize: 9, fontFamily: 'var(--mono)', fontWeight: 600, letterSpacing: '0.14em' }}
           >
-            {selectedGeo.countryCode || 'NODE'}
+            {selectedGeo.countryCode || t('NODE')}
           </text>
         )}
       </svg>

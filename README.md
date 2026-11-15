@@ -5,6 +5,8 @@ cores** — [sing-box](https://sing-box.sagernet.org/), [Xray-core](https://gith
 and [Mihomo](https://github.com/MetaCubeX/mihomo) — with six swappable interface
 styles.
 
+[English version](README.md) · [Русская версия](README.ru.md)
+
 ![Electric Cyber](screenshots/connected.png)
 
 ## What actually works
@@ -103,8 +105,9 @@ the local inbound and restores every system change on disconnect or crash.
   node addresses. Nothing is invented client-side.
 - **Happ-style conveniences** — subscription refresh/removal and scheduled
   auto-update, latency tests, search, per-node connect, auto-connect on launch,
-  launch at startup, tray mode, compact always-on-top mode, DNS selection and
-  six themes.
+  launch at startup, tray mode, compact always-on-top mode, DNS selection,
+  six themes and a fully bilingual interface (Russian by default, English in
+  Settings).
 - **Quick connect** — pings a bounded sample of nodes in parallel and connects to
   the fastest one, preferring nodes you starred.
 - **Favourites and clipboard** — pin any node with a star, copy its share link,

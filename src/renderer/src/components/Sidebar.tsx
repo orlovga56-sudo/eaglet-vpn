@@ -1,4 +1,5 @@
 import { ChartIcon, GearIcon, GlobeIcon, HomeIcon, LogoIcon, RouteIcon, SparkIcon } from './Icons'
+import { t } from '../i18n'
 import type { PageId } from '../App'
 
 interface Props {
@@ -13,14 +14,16 @@ interface Props {
   version: string
 }
 
-const ITEMS: Array<{ id: PageId; label: string; icon: React.JSX.Element }> = [
-  { id: 'home', label: 'Home', icon: <HomeIcon /> },
-  { id: 'servers', label: 'Servers', icon: <GlobeIcon /> },
-  { id: 'scenarios', label: 'Scenarios', icon: <SparkIcon /> },
-  { id: 'routing', label: 'Routing', icon: <RouteIcon /> },
-  { id: 'stats', label: 'Stats', icon: <ChartIcon /> },
-  { id: 'settings', label: 'Settings', icon: <GearIcon /> }
-]
+function navItems(): Array<{ id: PageId; label: string; icon: React.JSX.Element }> {
+  return [
+    { id: 'home', label: t('Home'), icon: <HomeIcon /> },
+    { id: 'servers', label: t('Servers'), icon: <GlobeIcon /> },
+    { id: 'scenarios', label: t('Scenarios'), icon: <SparkIcon /> },
+    { id: 'routing', label: t('Routing'), icon: <RouteIcon /> },
+    { id: 'stats', label: t('Stats'), icon: <ChartIcon /> },
+    { id: 'settings', label: t('Settings'), icon: <GearIcon /> }
+  ]
+}
 
 export function Sidebar({
   page,
@@ -41,12 +44,12 @@ export function Sidebar({
         </div>
         <div>
           <span className="brand-name">Eaglet</span>
-          <span className="brand-tag">Private network</span>
+          <span className="brand-tag">{t('Private network')}</span>
         </div>
       </div>
 
       <nav className="nav">
-        {ITEMS.map((item) => (
+        {navItems().map((item) => (
           <button
             key={item.id}
             className={`nav-item ${page === item.id ? 'active' : ''}`}
@@ -61,15 +64,17 @@ export function Sidebar({
 
       <div className="side-foot">
         <div className="side-chip">
-          <span>Engine</span>
-          <strong>{engineVersion ? `${engineName} ${engineVersion}` : `${engineName} · not installed`}</strong>
+          <span>{t('Engine')}</span>
+          <strong>{engineVersion ? `${engineName} ${engineVersion}` : t('{engine} · not installed', { engine: engineName })}</strong>
         </div>
         <div className="side-chip">
-          <span>Protection</span>
-          <strong>{protection ? 'armed' : systemProxy ? 'system proxy' : 'manual'}</strong>
+          <span>{t('Protection')}</span>
+          <strong>{protection ? t('armed') : systemProxy ? t('system proxy') : t('manual')}</strong>
         </div>
         <div className="side-version">
-          EAGLET v{version} · {subscriptions} SUB{subscriptions === 1 ? '' : 'S'}
+          {subscriptions === 1
+            ? t('EAGLET v{version} · {count} SUB', { version, count: subscriptions })
+            : t('EAGLET v{version} · {count} SUBS', { version, count: subscriptions })}
         </div>
       </div>
     </aside>

@@ -1,5 +1,6 @@
 import type { VpnStatus } from '@shared/types'
 import { PowerIcon } from './Icons'
+import { t } from '../i18n'
 
 interface Props {
   status: VpnStatus
@@ -12,8 +13,8 @@ export function PowerDial({ status, onToggle }: Props): React.JSX.Element {
       className="dial"
       data-status={status}
       onClick={onToggle}
-      title={status === 'connected' ? 'Disconnect' : 'Connect'}
-      aria-label={status === 'connected' ? 'Disconnect' : 'Connect'}
+      title={status === 'connected' ? t('Disconnect') : t('Connect')}
+      aria-label={status === 'connected' ? t('Disconnect') : t('Connect')}
     >
       <span className="dial-halo" />
       <span className="dial-ring dial-ring--outer" />

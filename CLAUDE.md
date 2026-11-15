@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+[English version](CLAUDE.md) · [Русская версия](CLAUDE.ru.md)
+
 Guidance for AI agents and humans working inside the **Eaglet** repository.
 
 ## What this project is
@@ -61,8 +63,10 @@ scripts/fetch-core.mjs downloads the bundled sing-box core
 src/
   shared/types.ts      single source of truth for the IPC contract
   shared/validation.ts IPC payload validators and settings/scenario sanitisers
+  shared/i18n.ts       language list, English-keyed `ru` dictionary, translate()
   main/
     index.ts           window, IPC handlers, tray, subscriptions, QR/backup, shots
+    i18n.ts            main-process translator (t / setMainLanguage)
     store.ts           JSON settings/profiles/subscriptions/scenarios/sessions
     secret-vault.ts    safeStorage-encrypted vault for share links/subscription URLs
     vpn/
@@ -89,6 +93,7 @@ src/
     index.html
     src/
       App.tsx          page routing, theme override plumbing
+      i18n.ts          renderer translator (t / setLanguage)
       format.ts        speed/bytes/duration/date-time formatters
       data/worldMap.json
       components/      TitleBar, Sidebar, PowerDial, WorldMap, …
@@ -96,6 +101,36 @@ src/
       styles/theme.css theme tokens + backdrops
       styles/app.css   layout and components
 ```
+
+## Localization (i18n)
+
+Eaglet ships in English and Russian, with **Russian as the default UI language**.
+The layer is intentionally dependency-free:
+
+1. `src/shared/i18n.ts` holds `LANGUAGES`, `DEFAULT_LANGUAGE = 'ru'`, the `ru`
+   dictionary and `translate()`. **The English source string is the translation
+   key**, so a missing Russian entry falls back to English instead of a
+   placeholder. Interpolation uses `{name}` placeholders.
+2. `src/renderer/src/i18n.ts` exposes module-level `t()` and `setLanguage()`.
+   `App.tsx` calls `setLanguage(snap.settings.language)` during render. The app has
+   no memoised children, so a language switch re-renders the whole tree.
+3. `src/main/i18n.ts` exposes module-level `t()` and `setMainLanguage()`. The main
+   process syncs the language from persisted settings at startup and in the
+   `settings:update` handler.
+4. `format.ts` picks the locale (`ru-RU` / `en-US`) from `getLanguage()`.
+5. `test/i18n.test.ts` scans every `t('...')` call in `src` and fails when a
+   Russian entry is missing, so forgotten keys are caught in CI.
+
+Rules when adding copy:
+
+- Wrap every user-facing string in `t('English source')` and pass variables as
+  `t('... {count} ...', { count })`.
+- Never call `t()` at module top level — the language changes at runtime. Convert
+  module-level text constants into functions that run during render.
+- Do not translate technical identifiers: engine/protocol ids, `TUN`, `DoH`, `DNS`,
+  `IPv6`, paths, URLs, CSS classes.
+- Add the Russian entry to the `ru` dictionary in `src/shared/i18n.ts`; a missing key
+  safely falls back to English.
 
 ## The theme system
 
@@ -356,7 +391,9 @@ All harnesses write JSON because Electron’s stdout is invisible on Windows.
 - Comments explain *why*; the code says *what*.
 - Keep components presentational — data and actions arrive as props from
   `App.tsx`.
-- Russian-speaking users: UI copy stays in English to match the concept sheet.
+- UI copy is localized: wrap every user-facing string in `t('English source')`
+  and add the Russian translation to the `ru` dictionary in `src/shared/i18n.ts`.
+  Never call `t()` at module top level — see "Localization (i18n)".
 - Never invent server coordinates, telemetry, traffic or protection status. If a
   capability needs elevation or is not implemented, report it honestly.
 

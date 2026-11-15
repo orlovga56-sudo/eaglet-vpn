@@ -2993,6 +2993,12 @@ input {
   background: var(--accent-soft);
 }
 
+.home-badge.is-bad {
+  color: #f87171;
+  border-color: rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.12);
+}
+
 .scenario-strip {
   display: flex;
   align-items: center;
@@ -3351,6 +3357,10 @@ input {
 
 .usage-cell strong.is-ok {
   color: var(--accent);
+}
+
+.usage-cell strong.is-bad {
+  color: #f87171;
 }
 
 .comparison {

@@ -1,3 +1,13 @@
+import type { Language } from '@shared/types'
+import { getLanguage } from './i18n'
+
+const LOCALES: Record<Language, string> = { en: 'en-US', ru: 'ru-RU' }
+
+/** BCP-47 locale for date and number formatting, driven by the UI language. */
+function locale(): string {
+  return LOCALES[getLanguage()] ?? 'en-US'
+}
+
 export function formatSpeed(mbps: number): string {
   if (!Number.isFinite(mbps) || mbps <= 0) return '0'
   return mbps >= 100 ? String(Math.round(mbps)) : mbps.toFixed(1)
@@ -25,11 +35,11 @@ export function formatDuration(seconds: number): string {
 }
 
 export function formatClock(timestamp: number): string {
-  return new Date(timestamp).toLocaleTimeString([], { hour12: false })
+  return new Date(timestamp).toLocaleTimeString(locale(), { hour12: false })
 }
 
 export function formatDateTime(timestamp: number): string {
-  return new Date(timestamp).toLocaleString('en-US', {
+  return new Date(timestamp).toLocaleString(locale(), {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',

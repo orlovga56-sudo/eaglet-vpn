@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import type { EngineId, FreeDiscoveryResult, Profile, ProtocolId, Snapshot } from '@shared/types'
 import { CheckIcon, ClipboardIcon, CopyIcon, GlobeIcon, SearchIcon, StarIcon } from '../components/Icons'
 import { Sparkline } from '../components/Sparkline'
+import { t } from '../i18n'
 
 interface Props {
   snap: Snapshot
@@ -23,15 +24,15 @@ const PROTOCOL_LABEL: Record<ProtocolId, string> = {
 }
 
 function cleanError(error: unknown): string {
-  const message = (error as Error)?.message ?? 'Something went wrong'
+  const message = (error as Error)?.message ?? t('Something went wrong')
   return message.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, '')
 }
 
 function formatAgo(timestamp: number): string {
   const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000))
-  if (seconds < 60) return 'just now'
-  if (seconds < 3600) return `${Math.round(seconds / 60)} min ago`
-  if (seconds < 86400) return `${Math.round(seconds / 3600)} h ago`
+  if (seconds < 60) return t('just now')
+  if (seconds < 3600) return t('{count} min ago', { count: Math.round(seconds / 60) })
+  if (seconds < 86400) return t('{count} h ago', { count: Math.round(seconds / 3600) })
   return new Date(timestamp).toLocaleDateString('en-US')
 }
 
@@ -84,8 +85,14 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
       setMessage({
         tone: 'ok',
         text: result.subscription
-          ? `Subscription saved · ${result.subscription.count} nodes from ${result.subscription.name}`
-          : `${result.imported} node(s) added${result.updated ? `, ${result.updated} updated` : ''}`
+          ? t('Subscription saved · {count} nodes from {name}', {
+              count: result.subscription.count,
+              name: result.subscription.name
+            })
+          : t('{count} node(s) added{updated}', {
+              count: result.imported,
+              updated: result.updated ? t(', {count} updated', { count: result.updated }) : ''
+            })
       })
     } catch (error) {
       setMessage({ tone: 'err', text: cleanError(error) })
@@ -98,7 +105,7 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
     setMessage(null)
     try {
       const result = await window.eaglet.importQr()
-      setMessage({ tone: 'ok', text: `QR code decoded · ${result.imported} node(s) added` })
+      setMessage({ tone: 'ok', text: t('QR code decoded · {count} node(s) added', { count: result.imported }) })
     } catch (error) {
       setMessage({ tone: 'err', text: cleanError(error) })
     }
@@ -112,7 +119,10 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
       const nodes = results.reduce((sum, item) => sum + item.imported + item.updated, 0)
       setMessage({
         tone: 'ok',
-        text: results.length > 0 ? `${results.length} subscription(s) refreshed · ${nodes} nodes` : 'No HTTP subscriptions to refresh'
+        text:
+          results.length > 0
+            ? t('{count} subscription(s) refreshed · {nodes} nodes', { count: results.length, nodes })
+            : t('No HTTP subscriptions to refresh')
       })
     } catch (error) {
       setMessage({ tone: 'err', text: cleanError(error) })
@@ -134,7 +144,7 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
     setMessage(null)
     try {
       const result = await window.eaglet.updateSubscription(id)
-      setMessage({ tone: 'ok', text: `Subscription updated · ${result.subscription?.count ?? 0} nodes` })
+      setMessage({ tone: 'ok', text: t('Subscription updated · {count} nodes', { count: result.subscription?.count ?? 0 }) })
     } catch (error) {
       setMessage({ tone: 'err', text: cleanError(error) })
     } finally {
@@ -187,7 +197,10 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
       const total = result.imported + result.updated
       setMessage({
         tone: 'ok',
-        text: total > 0 ? `Imported ${total} node(s) from the clipboard.` : 'Nothing new was imported.'
+        text:
+          total > 0
+            ? t('Imported {count} node(s) from the clipboard.', { count: total })
+            : t('Nothing new was imported.')
       })
     } catch (error) {
       setMessage({ tone: 'err', text: cleanError(error) })
@@ -227,7 +240,10 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
       setSelectedFree(new Set())
       setMessage({
         tone: 'ok',
-        text: `Added ${result.imported} free ${result.imported === 1 ? 'node' : 'nodes'}. Use Test all, then Connect — public nodes are often slow.`
+        text: t('Added {count} free {nodeLabel}. Use Test all, then Connect — public nodes are often slow.', {
+          count: result.imported,
+          nodeLabel: result.imported === 1 ? t('node') : t('nodes')
+        })
       })
     } catch (error) {
       setMessage({ tone: 'err', text: cleanError(error) })
@@ -238,31 +254,32 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
     <div className="page">
       <header className="page-head">
         <div>
-          <p className="page-eyebrow">Network</p>
-          <h1 className="page-title">Servers</h1>
+          <p className="page-eyebrow">{t('Network')}</p>
+          <h1 className="page-title">{t('Servers')}</h1>
           <p className="page-sub">
-            Import a subscription URL or paste share links. Eaglet runs them on the sing-box core — VLESS, VMess,
-            Trojan, Shadowsocks, Hysteria2 and TUIC.
+            {t(
+              'Import a subscription URL or paste share links. Eaglet runs them on the sing-box core — VLESS, VMess, Trojan, Shadowsocks, Hysteria2 and TUIC.'
+            )}
           </p>
         </div>
         <div className="head-actions">
-          <button className="btn" onClick={() => void importQr()} title="Decode a QR code from an image file">
-            QR import
+          <button className="btn" onClick={() => void importQr()} title={t('Decode a QR code from an image file')}>
+            {t('QR import')}
           </button>
           <button className="btn" onClick={() => void findFree()} disabled={discovering}>
             <GlobeIcon />
-            {discovering ? 'Searching…' : 'Find free servers'}
+            {discovering ? t('Searching…') : t('Find free servers')}
           </button>
           <button className="btn primary" onClick={() => void testAll()} disabled={testing || profiles.length === 0}>
-            {testing ? 'Testing…' : 'Test all'}
+            {testing ? t('Testing…') : t('Test all')}
           </button>
         </div>
       </header>
 
       <div className="import panel">
         <div className="import-head">
-          <strong>Add nodes</strong>
-          <span>Subscription URL · share link · base64 list</span>
+          <strong>{t('Add nodes')}</strong>
+          <span>{t('Subscription URL · share link · base64 list')}</span>
         </div>
         <div className="import-row">
           <input
@@ -272,25 +289,27 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
             onKeyDown={(event) => {
               if (event.key === 'Enter') void runImport()
             }}
-            placeholder="https://provider.example/sub/abc  ·  vless://…  ·  ss://…"
+            placeholder={t('https://provider.example/sub/abc  ·  vless://…  ·  ss://…')}
             spellCheck={false}
           />
           <button
             className="btn"
             onClick={() => void pasteFromClipboard()}
-            title="Read the clipboard in the main process and import it"
+            title={t('Read the clipboard in the main process and import it')}
           >
             <ClipboardIcon />
-            Paste &amp; import
+            {t('Paste & import')}
           </button>
           <button className="btn primary" onClick={() => void runImport()} disabled={busy || !input.trim()}>
-            {busy ? 'Importing…' : 'Import'}
+            {busy ? t('Importing…') : t('Import')}
           </button>
         </div>
         {message && <div className={`import-message ${message.tone}`}>{message.text}</div>}
         {!message && (
           <div className="import-hint">
-            Happ, v2rayN and Shadowrocket base64 subscriptions work. Use Update on a subscription to refresh its nodes.
+            {t(
+              'Happ, v2rayN and Shadowrocket base64 subscriptions work. Use Update on a subscription to refresh its nodes.'
+            )}
           </div>
         )}
       </div>
@@ -299,15 +318,19 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
         <section className="free panel">
           <div className="free-head">
             <div className="free-title">
-              <strong>Free public servers</strong>
+              <strong>{t('Free public servers')}</strong>
               <span>
                 {discovering
-                  ? 'Fetching community catalogs and testing latency…'
-                  : `${free?.profiles.length ?? 0} working · ${free?.reachable ?? 0} reachable · ${free?.found ?? 0} found in catalogs`}
+                  ? t('Fetching community catalogs and testing latency…')
+                  : t('{working} working · {reachable} reachable · {found} found in catalogs', {
+                      working: free?.profiles.length ?? 0,
+                      reachable: free?.reachable ?? 0,
+                      found: free?.found ?? 0
+                    })}
               </span>
             </div>
             {!discovering && (
-              <button className="icon-ghost" onClick={() => setFree(null)} title="Close">
+              <button className="icon-ghost" onClick={() => setFree(null)} title={t('Close')}>
                 ×
               </button>
             )}
@@ -317,8 +340,9 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
             <div className="free-loading">
               <span className="boot-ring" />
               <p>
-                This can take up to two minutes. Each candidate is started in a throwaway sing-box instance to confirm
-                real traffic, so only working nodes are listed.
+                {t(
+                  'This can take up to two minutes. Each candidate is started in a throwaway sing-box instance to confirm real traffic, so only working nodes are listed.'
+                )}
               </p>
             </div>
           ) : free ? (
@@ -330,32 +354,35 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                     className={`free-chip ${source.error ? 'is-bad' : ''}`}
                     title={source.error ? `${source.name}: ${source.error}` : source.url}
                   >
-                    {source.name} · {source.error ? 'offline' : source.count}
+                    {source.name} · {source.error ? t('offline') : source.count}
                   </span>
                 ))}
               </div>
 
               <div className="free-warning">
-                Public nodes are run by unknown people. Don't sign in to banking, work or other sensitive accounts while
-                using them — treat this as a quick way to test the tunnel, not as a trustworthy provider.
+                {t(
+                  "Public nodes are run by unknown people. Don't sign in to banking, work or other sensitive accounts while using them — treat this as a quick way to test the tunnel, not as a trustworthy provider."
+                )}
               </div>
 
               {!free.verified && (
                 <div className="free-warning">
-                  The sing-box core was unavailable, so these nodes were only port-checked and may not actually carry
-                  traffic.
+                  {t(
+                    'The sing-box core was unavailable, so these nodes were only port-checked and may not actually carry traffic.'
+                  )}
                 </div>
               )}
 
               {free.profiles.length === 0 ? (
                 <div className="free-empty">
-                  <strong>No working nodes right now</strong>
+                  <strong>{t('No working nodes right now')}</strong>
                   <span>
-                    The catalogs responded, but none of the sampled nodes carried real traffic. Try again in a minute —
-                    these lists change constantly.
+                    {t(
+                      'The catalogs responded, but none of the sampled nodes carried real traffic. Try again in a minute — these lists change constantly.'
+                    )}
                   </span>
                   <button className="btn small" onClick={() => void findFree()}>
-                    Retry
+                    {t('Retry')}
                   </button>
                 </div>
               ) : (
@@ -385,22 +412,22 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                     ))}
                   </div>
                   <div className="free-actions">
-                    <span className="free-count">{selectedFree.size} selected</span>
+                    <span className="free-count">{t('{count} selected', { count: selectedFree.size })}</span>
                     <button
                       className="btn small"
                       onClick={() => setSelectedFree(new Set(free.profiles.map((profile) => profile.id)))}
                     >
-                      Select all
+                      {t('Select all')}
                     </button>
                     <button className="btn small" onClick={() => setSelectedFree(new Set())}>
-                      Clear
+                      {t('Clear')}
                     </button>
                     <button
                       className="btn small primary"
                       onClick={() => void addSelectedFree()}
                       disabled={selectedFree.size === 0}
                     >
-                      Add selected
+                      {t('Add selected')}
                     </button>
                   </div>
                 </>
@@ -413,9 +440,9 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
       {subscriptions.length > 0 && (
         <>
           <div className="section-title section-title-row">
-            <span>Subscriptions</span>
+            <span>{t('Subscriptions')}</span>
             <button className="btn small" onClick={() => void updateAll()} disabled={busy}>
-              Update all
+              {t('Update all')}
             </button>
           </div>
           <div className="sub-list">
@@ -426,29 +453,29 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                   <span className="sub-url">{subscription.url}</span>
                 </div>
                 <span className="sub-count">
-                  {subscription.count} {subscription.count === 1 ? 'node' : 'nodes'}
+                  {subscription.count} {subscription.count === 1 ? t('node') : t('nodes')}
                 </span>
                 <span className="sub-age">{formatAgo(subscription.updatedAt)}</span>
                 {subscription.url.startsWith('eaglet://') ? (
-                  <span className="status-pill">Finder</span>
+                  <span className="status-pill">{t('Finder')}</span>
                 ) : (
                   <button
                     className="btn small"
                     onClick={() => void refresh(subscription.id)}
                     disabled={refreshing === subscription.id}
                   >
-                    {refreshing === subscription.id ? 'Updating…' : 'Update'}
+                    {refreshing === subscription.id ? t('Updating…') : t('Update')}
                   </button>
                 )}
                 <button
                   className="btn small danger"
                   onClick={() => {
-                    if (window.confirm(`Remove ${subscription.name} and its nodes?`)) {
+                    if (window.confirm(t('Remove {name} and its nodes?', { name: subscription.name }))) {
                       void window.eaglet.removeSubscription(subscription.id)
                     }
                   }}
                 >
-                  Remove
+                  {t('Remove')}
                 </button>
               </div>
             ))}
@@ -462,13 +489,13 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
             className={`filter-chip ${filter === 'all' ? 'active' : ''}`}
             onClick={() => setFilter('all')}
           >
-            All <span>{profiles.length}</span>
+            {t('All')} <span>{profiles.length}</span>
           </button>
           <button
             className={`filter-chip ${filter === 'favorites' ? 'active' : ''}`}
             onClick={() => setFilter('favorites')}
           >
-            <StarIcon filled={filter === 'favorites'} /> Favourites <span>{favoriteCount}</span>
+            <StarIcon filled={filter === 'favorites'} /> {t('Favourites')} <span>{favoriteCount}</span>
           </button>
         </div>
         <div className="search panel">
@@ -476,7 +503,7 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
           <input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search name, protocol or host…"
+            placeholder={t('Search name, protocol or host…')}
             spellCheck={false}
           />
         </div>
@@ -487,8 +514,10 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
 
       {profiles.length === 0 ? (
         <div className="empty-state panel">
-          <strong>No nodes yet</strong>
-          <span>Paste a subscription URL above. A subscription usually looks like https://provider.example/api/sub/…</span>
+          <strong>{t('No nodes yet')}</strong>
+          <span>
+            {t('Paste a subscription URL above. A subscription usually looks like https://provider.example/api/sub/…')}
+          </span>
         </div>
       ) : (
         <div className="server-list">
@@ -509,7 +538,7 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
               >
                 <button
                   className={`profile-star ${profile.favorite ? 'is-on' : ''}`}
-                  title={profile.favorite ? 'Remove from favourites' : 'Pin to favourites'}
+                  title={profile.favorite ? t('Remove from favourites') : t('Pin to favourites')}
                   onClick={(event) => {
                     event.stopPropagation()
                     void toggleFavorite(profile)
@@ -521,7 +550,9 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                 <span className="profile-name">
                   <strong>{profile.name}</strong>
                   <span>
-                    {profile.protocol === 'direct' ? 'Built-in direct route' : `${profile.host}:${profile.port}`}
+                    {profile.protocol === 'direct'
+                      ? t('Built-in direct route')
+                      : `${profile.host}:${profile.port}`}
                     {profile.geo ? ` · ${[profile.geo.city, profile.geo.country].filter(Boolean).join(', ')}` : ''}
                     {source ? ` · ${source}` : ''}
                   </span>
@@ -533,11 +564,11 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                   <select
                     className="engine-select"
                     value={profile.engine ?? ''}
-                    title="Per-profile engine override"
+                    title={t('Per-profile engine override')}
                     onClick={(event) => event.stopPropagation()}
                     onChange={(event) => void pinEngine(profile, (event.target.value || null) as EngineId | null)}
                   >
-                    <option value="">Auto</option>
+                    <option value="">{t('Auto')}</option>
                     {snap.state.engines.map((engine) => (
                       <option key={engine.id} value={engine.id}>
                         {engine.name}
@@ -555,7 +586,7 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                       event.stopPropagation()
                       void copyLink(profile)
                     }}
-                    title="Copy share link"
+                    title={t('Copy share link')}
                   >
                     {copied === profile.id ? <CheckIcon /> : <CopyIcon />}
                   </button>
@@ -566,9 +597,9 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                       void testAll([profile.id])
                     }}
                     disabled={testing || profile.protocol === 'direct'}
-                    title="Measure latency"
+                    title={t('Measure latency')}
                   >
-                    Test
+                    {t('Test')}
                   </button>
                   <button
                     className={`btn tiny ${isActive ? 'primary' : ''}`}
@@ -579,11 +610,11 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
                     }}
                     disabled={busyConnection && isSelected}
                   >
-                    {isActive ? 'Disconnect' : busyConnection && isSelected ? 'Connecting' : 'Connect'}
+                    {isActive ? t('Disconnect') : busyConnection && isSelected ? t('Connecting') : t('Connect')}
                   </button>
                   <button
                     className="icon-ghost"
-                    title="Remove node"
+                    title={t('Remove node')}
                     onClick={(event) => {
                       event.stopPropagation()
                       void removeProfile(profile)
@@ -598,8 +629,8 @@ export function Servers({ snap, onConnect, onSelect, onDisconnect }: Props): Rea
           {filtered.length === 0 && (
             <div className="empty-hint">
               {filter === 'favorites'
-                ? 'No favourites yet — tap the star on any node to pin it here.'
-                : `No nodes match “${query}”.`}
+                ? t('No favourites yet — tap the star on any node to pin it here.')
+                : t('No nodes match “{query}”.', { query })}
             </div>
           )}
         </div>

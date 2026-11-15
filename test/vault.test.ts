@@ -1,8 +1,9 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { safeStorage } from 'electron'
+import { setMainLanguage } from '../src/main/i18n'
 import { Store } from '../src/main/store'
 import { SecretVault } from '../src/main/secret-vault'
 import { makeProfile, makeSettings } from './helpers'
@@ -23,6 +24,8 @@ afterEach(() => {
 })
 
 describe('SecretVault', () => {
+  beforeAll(() => setMainLanguage('en'))
+
   it('encrypts values and never stores plaintext', () => {
     const dir = tempDir()
     const file = join(dir, 'secrets.bin')

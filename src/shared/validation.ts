@@ -2,6 +2,7 @@ import type {
   DnsMode,
   EngineChoice,
   EngineId,
+  Language,
   RoutingMode,
   Scenario,
   ScenarioIcon,
@@ -12,6 +13,7 @@ import type {
 
 export const ENGINE_IDS: EngineId[] = ['sing-box', 'xray', 'mihomo']
 const THEMES: ThemeId[] = ['cyber', 'glass', 'minimal', 'hud', 'neon', 'aurora']
+const LANGUAGES: Language[] = ['en', 'ru']
 const DNS_MODES: DnsMode[] = ['auto', 'cloudflare', 'google', 'custom']
 const ROUTING_MODES: RoutingMode[] = ['global', 'smart', 'direct']
 const SCENARIO_ICONS: ScenarioIcon[] = ['game', 'speed', 'shield', 'manual', 'custom']
@@ -84,6 +86,9 @@ export function sanitizeSettingsPatch(value: unknown): Partial<Settings> {
     switch (key) {
       case 'theme':
         patch.theme = oneOf(entry, THEMES, 'theme')
+        break
+      case 'language':
+        patch.language = oneOf(entry, LANGUAGES, 'language')
         break
       case 'systemProxy':
         patch.systemProxy = requireBoolean(entry, 'systemProxy')

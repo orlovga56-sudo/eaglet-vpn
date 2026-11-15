@@ -10,6 +10,8 @@ import { Routing } from './pages/Routing'
 import { Stats } from './pages/Stats'
 import { SettingsPage } from './pages/Settings'
 import { MiniView } from './pages/MiniView'
+import { DEFAULT_LANGUAGE } from '@shared/i18n'
+import { setLanguage, t } from './i18n'
 
 export type PageId = 'home' | 'servers' | 'scenarios' | 'routing' | 'stats' | 'settings'
 
@@ -18,16 +20,24 @@ export default function App(): React.JSX.Element {
   const [page, setPage] = useState<PageId>('home')
   const [themeOverride, setThemeOverride] = useState<ThemeId | null>(null)
 
+  // Keep the translator in sync with the persisted setting before children render.
+  setLanguage(snap?.settings.language ?? DEFAULT_LANGUAGE)
+
   useEffect(() => {
     void window.eaglet.snapshot().then(setSnap)
     return window.eaglet.onState(setSnap)
   }, [])
 
   const theme: ThemeId = themeOverride ?? snap?.settings.theme ?? 'cyber'
+  const language = snap?.settings.language ?? DEFAULT_LANGUAGE
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
   }, [theme])
+
+  useEffect(() => {
+    document.documentElement.lang = language
+  }, [language])
 
   const updateSettings = useCallback(async (patch: Partial<Settings>) => {
     if (patch.theme) setThemeOverride(null)
@@ -60,7 +70,7 @@ export default function App(): React.JSX.Element {
         <ThemeBackdrop theme="cyber" />
         <div className="boot">
           <span className="boot-ring" />
-          <span>Starting Eaglet core…</span>
+          <span>{t('Starting Eaglet core…')}</span>
         </div>
       </div>
     )
@@ -68,7 +78,7 @@ export default function App(): React.JSX.Element {
 
   const { state, settings } = snap
   const busy = state.status === 'connecting' || state.status === 'disconnecting'
-  const protocol = state.profile?.protocol.toUpperCase() ?? 'NO PROFILE'
+  const protocol = state.profile?.protocol.toUpperCase() ?? t('NO PROFILE')
 
   const toggle = (): void => {
     if (busy) return
@@ -121,7 +131,9 @@ export default function App(): React.JSX.Element {
           engineName={state.engines.find((engine) => engine.id === state.engine)?.name ?? state.engine}
           engineVersion={state.engines.find((engine) => engine.id === state.engine)?.version ?? state.core.version}
           systemProxy={settings.systemProxy}
-          protection={state.killSwitchActive || state.dnsProtectionActive || settings.networkProtection}
+          protection={
+            state.protection.killSwitch === 'active' || state.protection.dns === 'active'
+          }
           version={snap.version}
         />
 

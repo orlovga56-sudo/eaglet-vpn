@@ -1,18 +1,20 @@
-import { app } from 'electron'
+﻿import { app } from 'electron'
 import { execFile, execFileSync } from 'node:child_process'
 import { createSocket, type Socket as UdpSocket } from 'node:dgram'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { request as httpsRequest } from 'node:https'
 import { createServer, isIP, type Server as TcpServer } from 'node:net'
 import { lookup } from 'node:dns/promises'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import type { Settings } from '@shared/types'
+import { t } from '../i18n'
 import { dohEndpoint } from './engines/types'
 
 const execFileAsync = promisify(execFile)
 const PORT = 53
 const MAX_DNS_MESSAGE = 65535
+const LOOPBACK = new Set(['127.0.0.1', '::1', '0.0.0.0'])
 
 interface DnsGuardState {
   udp: UdpSocket[]
@@ -23,21 +25,42 @@ interface DnsGuardState {
   failures: number
 }
 
-interface DnsServiceBackup {
+/**
+ * How a resolver was configured before Eaglet replaced it:
+ *  - `static`  — explicit addresses the user (or an admin) configured;
+ *  - `auto`    — supplied by DHCP / the OS; must be reset, never frozen into
+ *                permanent static addresses;
+ *  - `unknown` — the origin could not be determined; only the loopback entry
+ *                is removed, nothing is guessed.
+ */
+export type DnsMethod = 'static' | 'auto' | 'unknown'
+
+export interface DnsServiceBackup {
   name: string
   /** Windows interface index; absent on macOS/Linux. */
   index?: number
-  /** IPv4 and IPv6 resolvers, combined. */
-  servers: string[]
+  v4: string[]
+  v6: string[]
+  method: DnsMethod
 }
 
-interface DnsBackup {
+export interface DnsBackup {
+  version: 2
   platform: 'win32' | 'darwin' | 'linux'
   at: number
   services: DnsServiceBackup[]
 }
 
+export interface DnsRestoreReport {
+  restored: string[]
+  /** Interfaces whose DNS no longer pointed at the relay (changed by the user). */
+  skipped: string[]
+  mismatches: string[]
+}
+
 let state: DnsGuardState | null = null
+/** Last restore failure, surfaced by diagnostics and the UI. */
+let restoreFailure: string | null = null
 
 function backupPath(): string {
   return join(app.getPath('userData'), 'dns-backup.json')
@@ -47,8 +70,19 @@ function psQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`
 }
 
-function byFamily(servers: string[], version: 4 | 6): string[] {
-  return servers.filter((server) => isIP(server) === version)
+export function byFamily(servers: string[], version: 4 | 6): string[] {
+  return [...new Set(servers.filter((server) => isIP(server) === version))]
+}
+
+/** True when any address still points at the local relay. */
+export function hasLoopback(servers: string[]): boolean {
+  return servers.some((server) => LOOPBACK.has(server))
+}
+
+function sameSet(left: string[], right: string[]): boolean {
+  const a = [...new Set(left)].sort()
+  const b = [...new Set(right)].sort()
+  return a.length === b.length && a.every((value, index) => value === b[index])
 }
 
 function delay(ms: number): Promise<void> {
@@ -79,11 +113,12 @@ export interface DohTarget {
 export async function prepareDohTarget(settings: Settings): Promise<DohTarget> {
   const endpoint = dohEndpoint(settings)
   const url = new URL(endpoint)
-  if (url.protocol !== 'https:') throw new Error('DNS protection requires an https:// DoH endpoint')
+  if (url.protocol !== 'https:') throw new Error(t('DNS protection requires an https:// DoH endpoint'))
   const hostname = url.hostname.replace(/^\[|\]$/g, '')
-  if (!hostname) throw new Error('The DoH endpoint has no hostname')
+  if (!hostname) throw new Error(t('The DoH endpoint has no hostname'))
   const port = url.port ? Number(url.port) : 443
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('The DoH endpoint has an invalid port')
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error(t('The DoH endpoint has an invalid port'))
   const path = `${url.pathname === '/' ? '/dns-query' : url.pathname || '/dns-query'}${url.search}`
 
   const literal = isIP(hostname)
@@ -93,7 +128,7 @@ export async function prepareDohTarget(settings: Settings): Promise<DohTarget> {
 
   const addresses = await lookup(hostname, { all: true, verbatim: true })
   const picked = addresses.find((entry) => entry.family === 4) ?? addresses[0]
-  if (!picked) throw new Error(`The DoH endpoint ${hostname} could not be resolved`)
+  if (!picked) throw new Error(t('The DoH endpoint {host} could not be resolved', { host: hostname }))
   return {
     endpoint,
     hostname,
@@ -228,201 +263,430 @@ function startTcp(target: DohTarget, host: string, ipv6Only: boolean): Promise<T
 }
 
 /* ------------------------------------------------------------------ */
-/*  System resolver override                                          */
+/*  Backup format                                                     */
 /* ------------------------------------------------------------------ */
 
 function writeBackup(backup: DnsBackup): void {
-  mkdirSync(dirname(backupPath()), { recursive: true })
-  writeFileSync(backupPath(), JSON.stringify(backup, null, 2), 'utf-8')
+  const path = backupPath()
+  mkdirSync(dirname(path), { recursive: true })
+  const temp = `${path}.${process.pid}.${Date.now()}.tmp`
+  writeFileSync(temp, JSON.stringify(backup, null, 2), 'utf-8')
+  try {
+    renameSync(temp, path)
+  } catch (error) {
+    rmSync(temp, { force: true })
+    throw error
+  }
 }
 
 /**
- * Reads a backup written by this version or by the older IPv4-only format
- * (`items` instead of `services`). Older data is migrated per interface so a
- * crash from a previous build still restores cleanly.
+ * Reads a backup written by this version or by the older `{items}`/`servers`
+ * format. Legacy data carries no origin information, so non-empty resolvers
+ * are restored as static and empty ones are reset — never the other way round.
  */
-function readBackup(): DnsBackup {
-  const raw = JSON.parse(readFileSync(backupPath(), 'utf-8')) as DnsBackup & {
+export function parseDnsBackup(raw: string): DnsBackup {
+  const parsed = JSON.parse(raw) as DnsBackup & {
     items?: Array<{ index: number; alias: string; servers: string[] }>
+    services?: Array<{ name: string; index?: number; servers?: string[]; v4?: string[]; v6?: string[]; method?: DnsMethod }>
   }
-  const services = Array.isArray(raw.services)
-    ? raw.services
-    : Array.isArray(raw.items)
-      ? raw.items.map((item) => ({
+  const rawServices = Array.isArray(parsed.services)
+    ? parsed.services
+    : Array.isArray(parsed.items)
+      ? parsed.items.map((item) => ({
           name: String(item.alias ?? item.index),
           index: Number(item.index),
           servers: Array.isArray(item.servers) ? item.servers : []
         }))
       : []
-  return {
-    platform: raw.platform,
-    at: Number(raw.at) || 0,
-    services: services.map((service) => ({
-      name: String(service.name),
-      index: typeof service.index === 'number' ? service.index : undefined,
-      servers: Array.isArray(service.servers) ? service.servers.filter((server) => isIP(server) !== 0) : []
-    }))
-  }
-}
-
-async function applySystemDns(includeIpv6: boolean): Promise<void> {
-  const loopback = includeIpv6 ? ['127.0.0.1', '::1'] : ['127.0.0.1']
-  if (process.platform === 'win32') {
-    const script = `
-$items = @();
-Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-  $idx = $_.ifIndex;
-  $v4 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ });
-  $v6 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction SilentlyContinue | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ });
-  $items += [pscustomobject]@{ index = $idx; alias = $_.Name; servers = @($v4 + $v6) }
-}
-$items | ConvertTo-Json -Compress
-`
-    const { stdout } = await execFileAsync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { timeout: 15000, windowsHide: true }
-    )
-    const parsedRaw = stdout.trim() ? (JSON.parse(stdout) as unknown) : []
-    const parsed = Array.isArray(parsedRaw)
-      ? (parsedRaw as Array<{ index: number; alias: string; servers: string[] }>)
-      : [parsedRaw as { index: number; alias: string; servers: string[] }]
-    const services: DnsServiceBackup[] = parsed
-      .filter((item) => item && Number.isFinite(Number(item.index)))
-      .map((item) => ({
-        index: Number(item.index),
-        name: String(item.alias ?? item.index),
-        servers: Array.isArray(item.servers) ? item.servers.filter((server) => isIP(server) !== 0) : []
-      }))
-    if (services.length === 0) throw new Error('No active network adapter was found')
-
-    writeBackup({ platform: 'win32', at: Date.now(), services })
-    const commands = services.map((service) => {
-      // A single cmdlet call keeps both families in sync; setting them in two
-      // calls can clear the family that was configured first. IPv6 loopback is
-      // only advertised when the relay really bound an IPv6 socket *and* this
-      // interface already uses IPv6 resolvers.
-      const addresses =
-        includeIpv6 && byFamily(service.servers, 6).length > 0 ? loopback : ['127.0.0.1']
-      return `Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ServerAddresses ${addresses.map(psQuote).join(',')} -ErrorAction Stop;`
+  const services: DnsServiceBackup[] = rawServices
+    .map((service) => {
+      const entry = service as {
+        name?: string
+        index?: number
+        servers?: string[]
+        v4?: string[]
+        v6?: string[]
+        method?: DnsMethod
+      }
+      const legacy = Array.isArray(entry.servers) ? entry.servers : null
+      const v4 = legacy ? byFamily(legacy, 4) : byFamily(entry.v4 ?? [], 4)
+      const v6 = legacy ? byFamily(legacy, 6) : byFamily(entry.v6 ?? [], 6)
+      const method: DnsMethod =
+        entry.method === 'static' || entry.method === 'auto' || entry.method === 'unknown'
+          ? entry.method
+          : legacy
+            ? legacy.length > 0
+              ? 'static'
+              : 'auto'
+            : 'unknown'
+      return {
+        name: typeof entry.name === 'string' ? entry.name : '',
+        index: typeof entry.index === 'number' ? entry.index : undefined,
+        v4,
+        v6,
+        method
+      }
     })
-    await execFileAsync(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        `${commands.join('\n')}\nipconfig /flushdns | Out-Null`
-      ],
-      { timeout: 20000, windowsHide: true }
-    )
-    return
+    .filter((service) => service.name)
+  return {
+    version: 2,
+    platform: parsed.platform,
+    at: Number(parsed.at) || 0,
+    services
   }
-
-  if (process.platform === 'darwin') {
-    const { stdout } = await execFileAsync('networksetup', ['-listallnetworkservices'])
-    const names = stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith('An asterisk') && !line.startsWith('*'))
-    const services: DnsServiceBackup[] = []
-    for (const name of names) {
-      const current = await execFileAsync('networksetup', ['-getdnsservers', name])
-        .then((result) => result.stdout)
-        .catch(() => '')
-      services.push({
-        name,
-        servers: current
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter((line) => line && !/There aren't any/i.test(line))
-      })
-    }
-    if (services.length === 0) throw new Error('No network services were found')
-    writeBackup({ platform: 'darwin', at: Date.now(), services })
-    for (const service of services) {
-      const addresses =
-        includeIpv6 && byFamily(service.servers, 6).length > 0 ? loopback : ['127.0.0.1']
-      await execFileAsync('networksetup', ['-setdnsservers', service.name, ...addresses])
-    }
-    return
-  }
-
-  if (process.platform === 'linux') {
-    const { stdout } = await execFileAsync('sh', ['-c', "ip route show default | awk '{print $5; exit}'"])
-    const iface = stdout.trim()
-    if (!iface) throw new Error('Could not determine the default network interface')
-    const current = await execFileAsync('resolvectl', ['dns', iface]).catch(() => ({ stdout: '' }))
-    const servers = current.stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.includes(':') || line.includes('.'))
-      .flatMap((line) => line.split(/\s+/).slice(1))
-      .filter((value) => isIP(value) !== 0)
-    writeBackup({ platform: 'linux', at: Date.now(), services: [{ name: iface, servers }] })
-    const addresses = includeIpv6 && byFamily(servers, 6).length > 0 ? loopback : ['127.0.0.1']
-    await execFileAsync('resolvectl', ['dns', iface, ...addresses])
-    await execFileAsync('resolvectl', ['flush-caches']).catch(() => undefined)
-    return
-  }
-
-  throw new Error('DNS protection is not implemented on this platform')
 }
 
-/** Restores both address families. Throws when the OS rejects a command so the backup survives. */
-async function restoreSystemDns(): Promise<void> {
-  if (!existsSync(backupPath())) return
+function readBackup(): DnsBackup {
+  return parseDnsBackup(readFileSync(backupPath(), 'utf-8'))
+}
+
+/* ------------------------------------------------------------------ */
+/*  Pure restore plans (unit-tested per platform)                     */
+/* ------------------------------------------------------------------ */
+
+export interface WindowsRestoreStep {
+  /** Reset both families back to DHCP/automatic first. */
+  reset: boolean
+  /** Static addresses to apply after the reset. */
+  addresses: string[]
+}
+
+/**
+ * Windows needs a reset before static addresses because `-ServerAddresses`
+ * replaces only the family it is given, leaving the other one on our loopback
+ * value. `-ResetServerAddresses` clears both families.
+ */
+export function planWindowsRestore(service: DnsServiceBackup): WindowsRestoreStep {
+  const addresses = [...byFamily(service.v4, 4), ...byFamily(service.v6, 6)]
+  if (service.method === 'auto') return { reset: true, addresses: [] }
+  if (service.method === 'static') return { reset: true, addresses }
+  return { reset: addresses.length === 0, addresses }
+}
+
+export function windowsRestoreScript(services: DnsServiceBackup[]): string {
+  const lines: string[] = []
+  for (const service of services) {
+    if (service.index === undefined) continue
+    const plan = planWindowsRestore(service)
+    if (plan.reset) {
+      lines.push(
+        `Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ResetServerAddresses -ErrorAction Stop;`
+      )
+    }
+    if (plan.addresses.length > 0) {
+      lines.push(
+        `Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ServerAddresses ${plan.addresses.map(psQuote).join(',')} -ErrorAction Stop;`
+      )
+    }
+  }
+  lines.push('ipconfig /flushdns | Out-Null')
+  return lines.join('\n')
+}
+
+export function planMacRestore(service: DnsServiceBackup): string[] {
+  const servers = [...byFamily(service.v4, 4), ...byFamily(service.v6, 6)]
+  if (service.method === 'static' && servers.length > 0) {
+    return ['-setdnsservers', service.name, ...servers]
+  }
+  // Automatic and unknown both return the service to DHCP-provided resolvers.
+  return ['-setdnsservers', service.name, 'Empty']
+}
+
+export function planLinuxRestore(service: DnsServiceBackup): string[] {
+  const servers = [...byFamily(service.v4, 4), ...byFamily(service.v6, 6)]
+  if (service.method === 'static' && servers.length > 0) {
+    return ['dns', service.name, ...servers]
+  }
+  // `revert` drops the per-link override, so DHCP-provided DNS comes back.
+  return ['revert', service.name]
+}
+
+/** True when the interface no longer points at the relay — the user changed it. */
+export function userChangedDns(service: DnsServiceBackup, current: DnsServiceBackup): boolean {
+  if (service.method === 'auto') return !hasLoopback([...current.v4, ...current.v6])
+  if (service.method === 'static') {
+    const sameAsOriginal = sameSet(current.v4, service.v4) && sameSet(current.v6, service.v6)
+    const onRelay = hasLoopback([...current.v4, ...current.v6])
+    return !onRelay && !sameAsOriginal
+  }
+  return !hasLoopback([...current.v4, ...current.v6])
+}
+
+/** Mismatch description, or `null` when the interface is back to its saved state. */
+export function verifyRestored(
+  service: DnsServiceBackup,
+  current: DnsServiceBackup
+): string | null {
+  const addresses = [...current.v4, ...current.v6]
+  if (hasLoopback(addresses)) return t('{name}: still points at the local relay', { name: service.name })
+  if (service.method === 'static') {
+    if (!sameSet(current.v4, byFamily(service.v4, 4)))
+      return t('{name}: IPv4 resolvers differ', { name: service.name })
+    if (!sameSet(current.v6, byFamily(service.v6, 6)))
+      return t('{name}: IPv6 resolvers differ', { name: service.name })
+  }
+  return null
+}
+
+/* ------------------------------------------------------------------ */
+/*  Platform implementations                                          */
+/* ------------------------------------------------------------------ */
+
+async function powershell(script: string, timeout = 20000): Promise<string> {
+  const { stdout } = await execFileAsync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    { timeout, windowsHide: true }
+  )
+  return stdout
+}
+
+const WINDOWS_READ = `
+$ErrorActionPreference = 'Stop'
+$items = @()
+foreach ($adapter in @(Get-NetAdapter -Physical)) {
+  if ($adapter.Status -ne 'Up') { continue }
+  $idx = $adapter.ifIndex
+  $v4 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
+  $v6 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
+  $ip4 = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop
+  $ip6 = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction Stop
+  $items += [pscustomobject]@{ index = $idx; name = $adapter.Name; v4 = $v4; v6 = $v6; dhcp4 = [string]$ip4.Dhcp; dhcp6 = [string]$ip6.Dhcp }
+}
+$items | ConvertTo-Json -Depth 4 -Compress
+`
+
+interface WindowsAdapter {
+  index: number
+  name: string
+  v4: string[]
+  v6: string[]
+  dhcp4: string
+  dhcp6: string
+}
+
+function classifyWindowsMethod(adapter: WindowsAdapter): DnsMethod {
+  const v4 = byFamily(adapter.v4, 4)
+  const v6 = byFamily(adapter.v6, 6)
+  if (v4.length > 0 || v6.length > 0) return 'static'
+  const dhcp = /enabled/i.test(adapter.dhcp4) || /enabled/i.test(adapter.dhcp6)
+  return dhcp ? 'auto' : 'unknown'
+}
+
+async function readWindowsDns(): Promise<DnsServiceBackup[]> {
+  const stdout = (await powershell(WINDOWS_READ)).trim()
+  if (!stdout) throw new Error(t('PowerShell returned no adapter information'))
+  const parsed = JSON.parse(stdout) as WindowsAdapter | WindowsAdapter[]
+  const adapters = Array.isArray(parsed) ? parsed : [parsed]
+  const services = adapters
+    .filter((adapter) => adapter && Number.isFinite(Number(adapter.index)))
+    .map<DnsServiceBackup>((adapter) => ({
+      name: String(adapter.name ?? adapter.index),
+      index: Number(adapter.index),
+      v4: byFamily(Array.isArray(adapter.v4) ? adapter.v4 : [], 4),
+      v6: byFamily(Array.isArray(adapter.v6) ? adapter.v6 : [], 6),
+      method: classifyWindowsMethod(adapter)
+    }))
+  if (services.length === 0) throw new Error(t('No active network adapter was found'))
+  return services
+}
+
+async function applyWindowsDns(services: DnsServiceBackup[], ipv6: boolean): Promise<void> {
+  const commands = services.map((service) => {
+    // IPv6 loopback is advertised only when the relay bound an IPv6 socket
+    // *and* this interface already uses IPv6 resolvers.
+    const addresses = ipv6 && byFamily(service.v6, 6).length > 0 ? ['127.0.0.1', '::1'] : ['127.0.0.1']
+    return `Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ServerAddresses ${addresses.map(psQuote).join(',')} -ErrorAction Stop;`
+  })
+  await powershell(`${commands.join('\n')}\nipconfig /flushdns | Out-Null`)
+}
+
+async function readMacDns(): Promise<DnsServiceBackup[]> {
+  const { stdout } = await execFileAsync('networksetup', ['-listallnetworkservices'])
+  const names = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('An asterisk') && !line.startsWith('*'))
+  const services: DnsServiceBackup[] = []
+  for (const name of names) {
+    const current = await execFileAsync('networksetup', ['-getdnsservers', name])
+      .then((result) => result.stdout)
+      .catch(() => '')
+    const servers = current
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !/There aren't any/i.test(line) && isIP(line) !== 0)
+    services.push({
+      name,
+      v4: byFamily(servers, 4),
+      v6: byFamily(servers, 6),
+      // "There aren't any DNS Servers set" means the service gets DNS
+      // automatically (DHCP); it must be restored to that, not frozen.
+      method: servers.length > 0 ? 'static' : 'auto'
+    })
+  }
+  if (services.length === 0) throw new Error(t('No network services were found'))
+  return services
+}
+
+async function applyMacDns(services: DnsServiceBackup[], ipv6: boolean): Promise<void> {
+  for (const service of services) {
+    const addresses = ipv6 && byFamily(service.v6, 6).length > 0 ? ['127.0.0.1', '::1'] : ['127.0.0.1']
+    await execFileAsync('networksetup', ['-setdnsservers', service.name, ...addresses])
+  }
+}
+
+async function linuxDefaultInterface(): Promise<string> {
+  const { stdout } = await execFileAsync('sh', ['-c', "ip route show default | awk '{print $5; exit}'"])
+  const iface = stdout.trim()
+  if (!iface) throw new Error(t('Could not determine the default network interface'))
+  return iface
+}
+
+/**
+ * systemd-resolved does not expose where a resolver came from. A static DNS=
+ * entry in systemd-networkd configuration is the only reliable signal; without
+ * it the addresses may come from DHCP and the link must be reverted, not frozen.
+ */
+async function linuxHasStaticDns(): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('sh', [
+      '-c',
+      "grep -Rhs '^DNS=' /etc/systemd/network 2>/dev/null | head -n 1"
+    ])
+    return stdout.trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+async function readLinuxDns(): Promise<DnsServiceBackup[]> {
+  const iface = await linuxDefaultInterface()
+  const current = await execFileAsync('resolvectl', ['dns', iface]).catch(() => ({ stdout: '' }))
+  const servers = current.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.includes(':') || line.includes('.'))
+    .flatMap((line) => line.split(/\s+/).slice(1))
+    .filter((value) => isIP(value) !== 0)
+  const v4 = byFamily(servers, 4)
+  const v6 = byFamily(servers, 6)
+  const staticConfig = await linuxHasStaticDns()
+  return [
+    {
+      name: iface,
+      v4,
+      v6,
+      method: v4.length === 0 && v6.length === 0 ? 'auto' : staticConfig ? 'static' : 'auto'
+    }
+  ]
+}
+
+async function applyLinuxDns(services: DnsServiceBackup[], ipv6: boolean): Promise<void> {
+  for (const service of services) {
+    const addresses = ipv6 && byFamily(service.v6, 6).length > 0 ? ['127.0.0.1', '::1'] : ['127.0.0.1']
+    await execFileAsync('resolvectl', ['dns', service.name, ...addresses])
+  }
+  await execFileAsync('resolvectl', ['flush-caches']).catch(() => undefined)
+}
+
+async function readCurrentDns(): Promise<DnsServiceBackup[]> {
+  if (process.platform === 'win32') return readWindowsDns()
+  if (process.platform === 'darwin') return readMacDns()
+  if (process.platform === 'linux') return readLinuxDns()
+  throw new Error(t('DNS protection is not implemented on this platform'))
+}
+
+async function applySystemDns(services: DnsServiceBackup[], includeIpv6: boolean): Promise<void> {
+  if (process.platform === 'win32') return applyWindowsDns(services, includeIpv6)
+  if (process.platform === 'darwin') return applyMacDns(services, includeIpv6)
+  if (process.platform === 'linux') return applyLinuxDns(services, includeIpv6)
+  throw new Error(t('DNS protection is not implemented on this platform'))
+}
+
+async function verifyOverride(services: DnsServiceBackup[]): Promise<string[]> {
+  const current = await readCurrentDns()
+  const mismatches: string[] = []
+  for (const service of services) {
+    const live = current.find((item) =>
+      item.index !== undefined && service.index !== undefined
+        ? item.index === service.index
+        : item.name === service.name
+    )
+    if (!live) {
+      mismatches.push(`${service.name}: interface disappeared`)
+      continue
+    }
+    if (!hasLoopback([...live.v4, ...live.v6])) {
+      mismatches.push(`${service.name}: the system resolver did not switch to the local relay`)
+    }
+  }
+  return mismatches
+}
+
+/**
+ * Restores every changed adapter. Interfaces whose DNS no longer points at the
+ * relay are left alone: the user changed them while the VPN was running, and
+ * silently overwriting that would be worse than keeping the current value.
+ */
+export async function restoreSystemDns(): Promise<DnsRestoreReport> {
+  if (!existsSync(backupPath())) return { restored: [], skipped: [], mismatches: [] }
   const backup = readBackup()
   if (backup.platform !== process.platform) {
     rmSync(backupPath(), { force: true })
-    return
+    return { restored: [], skipped: [], mismatches: [] }
   }
 
-  if (backup.platform === 'win32') {
-    const lines: string[] = []
-    for (const service of backup.services) {
-      const v4 = byFamily(service.servers, 4)
-      const v6 = byFamily(service.servers, 6)
-      if (v4.length === 0 && v6.length === 0) {
-        lines.push(`Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ResetServerAddresses;`)
-        continue
-      }
-      if (v4.length === 0) {
-        // DHCP-provided IPv4 resolvers: a reset clears both families, then the
-        // saved IPv6 servers are re-applied.
-        lines.push(`Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ResetServerAddresses;`)
-      }
-      const addresses = [...v4, ...v6]
-      lines.push(
-        `Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ServerAddresses ${addresses.map(psQuote).join(',')};`
-      )
-    }
-    await execFileAsync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `${lines.join('\n')}\nipconfig /flushdns | Out-Null`],
-      { timeout: 20000, windowsHide: true }
+  const current = await readCurrentDns()
+  const skipped: string[] = []
+  const targets: DnsServiceBackup[] = []
+  for (const service of backup.services) {
+    const live = current.find((item) =>
+      item.index !== undefined && service.index !== undefined ? item.index === service.index : item.name === service.name
     )
-  } else if (backup.platform === 'darwin') {
-    for (const service of backup.services) {
-      const args =
-        service.servers.length > 0
-          ? ['-setdnsservers', service.name, ...service.servers]
-          : ['-setdnsservers', service.name, 'Empty']
-      await execFileAsync('networksetup', args)
+    if (live && userChangedDns(service, live)) {
+      skipped.push(service.name)
+      continue
     }
-  } else if (backup.platform === 'linux') {
-    for (const service of backup.services) {
-      if (service.servers.length > 0) {
-        await execFileAsync('resolvectl', ['dns', service.name, ...service.servers])
-      } else {
-        await execFileAsync('resolvectl', ['revert', service.name])
-      }
-    }
-    await execFileAsync('resolvectl', ['flush-caches']).catch(() => undefined)
+    targets.push(service)
   }
+
+  if (targets.length > 0) {
+    if (backup.platform === 'win32') {
+      await powershell(windowsRestoreScript(targets))
+    } else if (backup.platform === 'darwin') {
+      for (const service of targets) {
+        await execFileAsync('networksetup', planMacRestore(service))
+      }
+    } else {
+      for (const service of targets) {
+        await execFileAsync('resolvectl', planLinuxRestore(service))
+      }
+      await execFileAsync('resolvectl', ['flush-caches']).catch(() => undefined)
+    }
+  }
+
+  const after = await readCurrentDns()
+  const mismatches: string[] = []
+  for (const service of targets) {
+    const live = after.find((item) =>
+      item.index !== undefined && service.index !== undefined ? item.index === service.index : item.name === service.name
+    )
+    if (!live) {
+      mismatches.push(`${service.name}: interface disappeared before verification`)
+      continue
+    }
+    const mismatch = verifyRestored(service, live)
+    if (mismatch) mismatches.push(mismatch)
+  }
+
+  if (mismatches.length > 0) {
+    throw new Error(mismatches.join('; '))
+  }
+
+  // Only a verified restore may delete the backup.
   rmSync(backupPath(), { force: true })
+  return { restored: targets.map((service) => service.name), skipped, mismatches }
 }
 
 function restoreSystemDnsSync(): void {
@@ -433,40 +697,25 @@ function restoreSystemDnsSync(): void {
     return
   }
   if (backup.platform === 'win32') {
-    const lines: string[] = []
-    for (const service of backup.services) {
-      const v4 = byFamily(service.servers, 4)
-      const v6 = byFamily(service.servers, 6)
-      if (v4.length === 0) {
-        lines.push(`Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ResetServerAddresses;`)
-      }
-      const addresses = [...v4, ...v6]
-      if (addresses.length > 0) {
-        lines.push(
-          `Set-DnsClientServerAddress -InterfaceIndex ${service.index} -ServerAddresses ${addresses.map(psQuote).join(',')};`
-        )
-      }
-    }
     execFileSync(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', lines.join('\n')],
-      { windowsHide: true, timeout: 9000 }
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        windowsRestoreScript(backup.services)
+      ],
+      { windowsHide: true, timeout: 12000 }
     )
   } else if (backup.platform === 'darwin') {
     for (const service of backup.services) {
-      const args =
-        service.servers.length > 0
-          ? ['-setdnsservers', service.name, ...service.servers]
-          : ['-setdnsservers', service.name, 'Empty']
-      execFileSync('networksetup', args, { timeout: 5000, stdio: 'ignore' })
+      execFileSync('networksetup', planMacRestore(service), { timeout: 5000, stdio: 'ignore' })
     }
   } else {
     for (const service of backup.services) {
-      if (service.servers.length > 0) {
-        execFileSync('resolvectl', ['dns', service.name, ...service.servers], { timeout: 5000, stdio: 'ignore' })
-      } else {
-        execFileSync('resolvectl', ['revert', service.name], { timeout: 5000, stdio: 'ignore' })
-      }
+      execFileSync('resolvectl', planLinuxRestore(service), { timeout: 5000, stdio: 'ignore' })
     }
   }
   rmSync(backupPath(), { force: true })
@@ -515,47 +764,77 @@ export async function startDnsGuard(settings: Settings): Promise<void> {
   } catch (error) {
     closeListeners({ udp, tcp, endpoint: target.endpoint, ipv6, requests: 0, failures: 0 })
     throw new Error(
-      `DNS protection needs UDP/TCP port 53 on the loopback interface: ${(error as Error).message}`
+      t('DNS protection needs UDP/TCP port 53 on the loopback interface: {error}', {
+        error: (error as Error).message
+      })
     )
   }
 
   state = { udp, tcp, endpoint: target.endpoint, ipv6, requests: 0, failures: 0 }
+  restoreFailure = null
+
   try {
-    await applySystemDns(ipv6)
+    const services = await readCurrentDns()
+    // Persist the exact pre-arm state before touching anything, atomically.
+    writeBackup({ version: 2, platform: process.platform as DnsBackup['platform'], at: Date.now(), services })
+    await applySystemDns(services, ipv6)
+    const mismatches = await verifyOverride(services)
+    if (mismatches.length > 0) throw new Error(mismatches.join('; '))
   } catch (error) {
     // A partially applied resolver override must never survive a failure.
+    // The relay keeps answering until the restore is verified, otherwise the
+    // machine would be left with 127.0.0.1 and no resolver.
     try {
       await restoreSystemDns()
-    } catch {
-      // The backup stays on disk for the next launch.
+    } catch (restoreError) {
+      restoreFailure = (restoreError as Error).message
+      throw new Error(
+        t(
+          'DNS protection failed ({error}) and the previous resolvers could not be restored ({restore}). The DoH relay stays running so DNS keeps working; disconnect and re-run Eaglet as administrator.',
+          { error: (error as Error).message, restore: restoreFailure }
+        )
+      )
     }
     closeListeners(state)
     state = null
     throw new Error(
-      `DNS protection could not change the system resolver: ${(error as Error).message}`
+      t('DNS protection could not change the system resolver: {error}', {
+        error: (error as Error).message
+      })
     )
   }
 }
 
 /**
  * Restores the system resolver while the relay is still answering, then closes
- * the listeners. If the OS rejects the restore it is retried once and the
- * backup file is kept so the next launch can finish the job.
+ * the listeners. If the OS rejects the restore, the relay is deliberately kept
+ * alive: closing it would leave every adapter pointing at a dead 127.0.0.1.
  */
 export async function stopDnsGuard(): Promise<void> {
   const current = state
-  let restored = false
-  for (let attempt = 0; attempt < 2 && !restored; attempt += 1) {
+  let lastError: string | null = null
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await restoreSystemDns()
-      restored = true
-    } catch {
-      if (attempt === 0) await delay(250)
+      lastError = null
+      break
+    } catch (error) {
+      lastError = (error as Error).message
+      if (attempt === 0) await delay(300)
     }
   }
-  if (!restored && existsSync(backupPath())) {
-    console.warn('[dns-guard] resolver restore failed; the backup was kept for the next launch')
+
+  if (lastError) {
+    restoreFailure = lastError
+    throw new Error(
+      t(
+        'The system DNS could not be restored ({error}). The DoH relay stays active so DNS keeps working and the backup is kept for the next launch; disconnect again or restart Eaglet as administrator.',
+        { error: lastError }
+      )
+    )
   }
+
+  restoreFailure = null
   state = null
   closeListeners(current)
 }
@@ -572,14 +851,21 @@ export function stopDnsGuardSync(): void {
   }
 }
 
+/** Retries a restore left behind by a crash or a failed shutdown. */
 export function recoverStaleDns(): void {
   if (existsSync(backupPath())) stopDnsGuardSync()
 }
 
-export function dnsGuardStats(): { requests: number; failures: number; endpoint: string | null } {
+export function dnsGuardStats(): {
+  requests: number
+  failures: number
+  endpoint: string | null
+  restoreError: string | null
+} {
   return {
     requests: state?.requests ?? 0,
     failures: state?.failures ?? 0,
-    endpoint: state?.endpoint ?? null
+    endpoint: state?.endpoint ?? null,
+    restoreError: restoreFailure
   }
 }

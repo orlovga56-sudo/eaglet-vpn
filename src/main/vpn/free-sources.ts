@@ -2,6 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { FreeDiscoveryResult, FreeSourceStatus, Profile, Settings } from '@shared/types'
+import { t } from '../i18n'
 import { parseProfilesPayload } from './profiles'
 import { buildConfig, freePort, quickProxiedIp, startCore, tcpPing, waitForPort } from './singbox'
 
@@ -71,7 +72,7 @@ async function fetchCatalog(url: string): Promise<string> {
     },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   })
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  if (!response.ok) throw new Error(t('HTTP {status}', { status: response.status }))
   return response.text()
 }
 
@@ -158,7 +159,7 @@ async function verifyCandidates(
       const index = cursor
       cursor += 1
       if (index >= pool.length) return
-      onProgress?.(`Verifying node ${index + 1} of ${pool.length}`)
+      onProgress?.(t('Verifying node {current} of {total}', { current: index + 1, total: pool.length }))
       const exit = await verifyProfile(pool[index], settings, corePath, slot)
       if (exit) verified.push(pool[index])
     }
@@ -174,7 +175,7 @@ async function verifyCandidates(
 export async function discoverFreeProfiles(options: FreeDiscoveryOptions): Promise<FreeDiscoveryResult> {
   const { settings, corePath, onProgress } = options
 
-  onProgress?.('Downloading community catalogs')
+  onProgress?.(t('Downloading community catalogs'))
   const settled = await Promise.allSettled(
     FREE_SOURCES.map(async (source) => ({
       source,
@@ -201,7 +202,7 @@ export async function discoverFreeProfiles(options: FreeDiscoveryOptions): Promi
         name: source.name,
         url: source.url,
         count: 0,
-        error: (result.reason as Error)?.message ?? 'Request failed'
+        error: (result.reason as Error)?.message ?? t('Request failed')
       })
     }
   })
@@ -222,8 +223,8 @@ export async function discoverFreeProfiles(options: FreeDiscoveryOptions): Promi
     if (candidates.length === 0) break
     onProgress?.(
       pass === 0
-        ? `Checking ${candidates.length} node ports`
-        : 'No working nodes in the first sample · trying another batch'
+        ? t('Checking {count} node ports', { count: candidates.length })
+        : t('No working nodes in the first sample · trying another batch')
     )
 
     const measured = await mapLimit(candidates, PING_CONCURRENCY, async (profile) => ({

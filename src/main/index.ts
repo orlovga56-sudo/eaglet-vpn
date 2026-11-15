@@ -5,13 +5,14 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import jsQR from 'jsqr'
 import { Store } from './store'
+import { setMainLanguage, t } from './i18n'
 import { publicProfile, publicProfiles, publicSubscription } from './privacy'
 import { VpnEngine } from './vpn/engine'
+import { readSystemProxy, sameSystemProxy } from './vpn/system-proxy'
 import { runEngineTest } from './vpn/engine-test'
 import { isHttpUrl, parseProfileUri, parseProfilesPayload, subscriptionName } from './vpn/profiles'
 import { discoverFreeProfiles } from './vpn/free-sources'
 import { normalizeScenario } from './vpn/scenarios'
-import { recoverStaleProxy } from './vpn/system-proxy'
 import {
   requireBoolean,
   requireEngineChoice,
@@ -120,7 +121,7 @@ function createWindow(): void {
     show: false,
     frame: false,
     backgroundColor: '#04060d',
-    title: 'Eaglet',
+    title: t('Eaglet'),
     ...(icon.isEmpty() ? {} : { icon }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -241,7 +242,7 @@ async function fetchSubscription(url: string): Promise<string> {
     },
     signal: AbortSignal.timeout(20000)
   })
-  if (!response.ok) throw new Error(`Subscription request failed (${response.status})`)
+  if (!response.ok) throw new Error(t('Subscription request failed ({status})', { status: response.status }))
   return response.text()
 }
 
@@ -252,7 +253,7 @@ function subscriptionId(url: string): string {
 async function importFromUrl(url: string): Promise<ImportResult> {
   const text = await fetchSubscription(url)
   const profiles = parseProfilesPayload(text)
-  if (profiles.length === 0) throw new Error('The subscription did not contain any supported nodes')
+  if (profiles.length === 0) throw new Error(t('The subscription did not contain any supported nodes'))
 
   const id = subscriptionId(url)
   const existing = store.getSubscriptions().find((item) => item.id === id)
@@ -267,8 +268,14 @@ async function importFromUrl(url: string): Promise<ImportResult> {
   }
   store.upsertSubscription(subscription)
   engine.reconcileProfiles()
-  engine.pushExternalLog('success', `Subscription imported · ${profiles.length} nodes · ${subscription.name}`)
-  logProfileEvent('subscription', `Subscription ${subscription.name} imported · ${profiles.length} nodes`)
+  engine.pushExternalLog(
+    'success',
+    t('Subscription imported · {count} nodes · {name}', { count: profiles.length, name: subscription.name })
+  )
+  logProfileEvent(
+    'subscription',
+    t('Subscription {name} imported · {count} nodes', { name: subscription.name, count: profiles.length })
+  )
   broadcast()
 
   return {
@@ -281,18 +288,18 @@ async function importFromUrl(url: string): Promise<ImportResult> {
 
 function importFromText(text: string): ImportResult {
   const profiles = parseProfilesPayload(text)
-  if (profiles.length === 0) throw new Error('No supported share links found in that text')
+  if (profiles.length === 0) throw new Error(t('No supported share links found in that text'))
   const { added, updated } = store.addProfiles(profiles)
   engine.reconcileProfiles()
-  engine.pushExternalLog('success', `Imported ${profiles.length} node(s) from a share link`)
-  logProfileEvent('import', `Imported ${profiles.length} node(s) from a share link`)
+  engine.pushExternalLog('success', t('Imported {count} node(s) from a share link', { count: profiles.length }))
+  logProfileEvent('import', t('Imported {count} node(s) from a share link', { count: profiles.length }))
   broadcast()
   return { imported: added, updated, subscription: null, profiles: publicProfiles(store.getProfiles()) }
 }
 
 async function importAnything(input: string): Promise<ImportResult> {
   const text = input.trim()
-  if (!text) throw new Error('Paste a share link, a subscription URL or a base64 list')
+  if (!text) throw new Error(t('Paste a share link, a subscription URL or a base64 list'))
   if (isHttpUrl(text)) return importFromUrl(text)
   return importFromText(text)
 }
@@ -300,10 +307,10 @@ async function importAnything(input: string): Promise<ImportResult> {
 /** Refreshes one HTTP subscription and removes nodes the provider dropped. */
 async function updateSubscriptionById(id: string): Promise<ImportResult> {
   const subscription = store.getSubscriptions().find((item) => item.id === id)
-  if (!subscription) throw new Error('Subscription not found')
+  if (!subscription) throw new Error(t('Subscription not found'))
   const text = await fetchSubscription(subscription.url)
   const profiles = parseProfilesPayload(text)
-  if (profiles.length === 0) throw new Error('Subscription returned no supported nodes')
+  if (profiles.length === 0) throw new Error(t('Subscription returned no supported nodes'))
   const incoming: Profile[] = profiles.map((profile) => ({ ...profile, sourceId: id }))
   const incomingIds = new Set(incoming.map((profile) => profile.id))
   for (const old of store.getProfiles().filter((profile) => profile.sourceId === id)) {
@@ -313,8 +320,14 @@ async function updateSubscriptionById(id: string): Promise<ImportResult> {
   const refreshed: Subscription = { ...subscription, updatedAt: Date.now(), count: incoming.length }
   store.upsertSubscription(refreshed)
   engine.reconcileProfiles()
-  engine.pushExternalLog('success', `Subscription refreshed · ${incoming.length} nodes · ${subscription.name}`)
-  logProfileEvent('subscription', `Subscription ${subscription.name} refreshed · ${incoming.length} nodes`)
+  engine.pushExternalLog(
+    'success',
+    t('Subscription refreshed · {count} nodes · {name}', { count: incoming.length, name: subscription.name })
+  )
+  logProfileEvent(
+    'subscription',
+    t('Subscription {name} refreshed · {count} nodes', { name: subscription.name, count: incoming.length })
+  )
   broadcast()
   return {
     imported: added,
@@ -336,7 +349,10 @@ async function updateAllSubscriptions(onlyDue = false): Promise<ImportResult[]> 
     try {
       results.push(await updateSubscriptionById(subscription.id))
     } catch (error) {
-      engine.pushExternalLog('warn', `Auto-update failed · ${subscription.name}: ${(error as Error).message}`)
+      engine.pushExternalLog(
+        'warn',
+        t('Auto-update failed · {name}: {message}', { name: subscription.name, message: (error as Error).message })
+      )
     }
   }
   if (results.length > 0) broadcast()
@@ -365,22 +381,22 @@ function addFreeProfiles(links: string[]): ImportResult {
   const parsed = links
     .map((link) => parseProfileUri(link))
     .filter((profile): profile is Profile => Boolean(profile))
-  if (parsed.length === 0) throw new Error('No valid share links were selected')
+  if (parsed.length === 0) throw new Error(t('No valid share links were selected'))
 
   const incoming = parsed.map((profile) => ({ ...profile, sourceId: FREE_SOURCE_ID }))
   const { added, updated } = store.addProfiles(incoming)
   const count = store.getProfiles().filter((profile) => profile.sourceId === FREE_SOURCE_ID).length
   const subscription: Subscription = {
     id: FREE_SOURCE_ID,
-    name: 'Free public nodes',
+    name: t('Free public nodes'),
     url: 'eaglet://free-public',
     updatedAt: Date.now(),
     count
   }
   store.upsertSubscription(subscription)
   engine.reconcileProfiles()
-  engine.pushExternalLog('success', `Added ${added} free node(s) from public catalogs`)
-  logProfileEvent('import', `Added ${added} free node(s) from public catalogs`)
+  engine.pushExternalLog('success', t('Added {count} free node(s) from public catalogs', { count: added }))
+  logProfileEvent('import', t('Added {count} free node(s) from public catalogs', { count: added }))
   broadcast()
   return {
     imported: added,
@@ -400,9 +416,9 @@ function addFreeProfiles(links: string[]): ImportResult {
  */
 function decodeQr(file: string): string {
   const image = nativeImage.createFromPath(file)
-  if (image.isEmpty()) throw new Error('That image could not be read')
+  if (image.isEmpty()) throw new Error(t('That image could not be read'))
   const { width, height } = image.getSize()
-  if (width <= 0 || height <= 0) throw new Error('That image has no pixels')
+  if (width <= 0 || height <= 0) throw new Error(t('That image has no pixels'))
   const raw = image.toBitmap()
   const direct = new Uint8ClampedArray(width * height * 4)
   const swapped = new Uint8ClampedArray(width * height * 4)
@@ -417,7 +433,7 @@ function decodeQr(file: string): string {
     swapped[index + 3] = raw[index + 3]
   }
   const code = jsQR(direct, width, height) ?? jsQR(swapped, width, height)
-  if (!code?.data) throw new Error('No QR code was found in that image')
+  if (!code?.data) throw new Error(t('No QR code was found in that image'))
   return code.data
 }
 
@@ -453,14 +469,14 @@ function refreshTray(): void {
     .filter((profile) => profile.favorite && profile.protocol !== 'direct')
     .slice(0, 8)
   const menu = Menu.buildFromTemplate([
-    { label: `Eaglet · ${connected ? 'connected' : state.status}`, enabled: false },
+    { label: t('Eaglet · {status}', { status: connected ? t('connected') : t(state.status) }), enabled: false },
     {
-      label: state.profile ? state.profile.name : 'No node selected',
+      label: state.profile ? state.profile.name : t('No node selected'),
       enabled: false
     },
     { type: 'separator' },
     {
-      label: connected ? 'Disconnect' : 'Connect',
+      label: connected ? t('Disconnect') : t('Connect'),
       click: () => toggleFromTray()
     },
     { type: 'separator' },
@@ -474,9 +490,9 @@ function refreshTray(): void {
       }
     })),
     ...(favourites.length > 0 ? [{ type: 'separator' as const }] : []),
-    { label: 'Open Eaglet', click: () => showWindow() },
+    { label: t('Open Eaglet'), click: () => showWindow() },
     {
-      label: 'Quit',
+      label: t('Quit'),
       click: () => {
         quitting = true
         app.quit()
@@ -485,7 +501,9 @@ function refreshTray(): void {
   ])
   tray.setContextMenu(menu)
   tray.setToolTip(
-    state.profile ? `Eaglet · ${connected ? state.profile.name : state.status}` : `Eaglet · ${state.status}`
+    state.profile
+      ? t('Eaglet · {status}', { status: connected ? state.profile.name : t(state.status) })
+      : t('Eaglet · {status}', { status: t(state.status) })
   )
 }
 
@@ -493,7 +511,7 @@ function ensureTray(): void {
   if (tray || isShotMode) return
   const icon = appIcon()
   tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon)
-  tray.setToolTip('Eaglet VPN')
+  tray.setToolTip(t('Eaglet VPN'))
   tray.on('click', () => {
     if (mainWindow?.isVisible()) mainWindow.hide()
     else showWindow()
@@ -518,7 +536,7 @@ function destroyTray(): void {
 async function pickFastestProfile(): Promise<Profile> {
   const profiles = store.getProfiles().filter((profile) => profile.protocol !== 'direct' && profile.port > 0)
   if (profiles.length === 0) {
-    throw new Error('No nodes yet — import a subscription or find free servers first')
+    throw new Error(t('No nodes yet — import a subscription or find free servers first'))
   }
 
   // Favourites and nodes without a measurement are worth re-testing first.
@@ -560,22 +578,25 @@ function notifyState(state: VpnState): void {
   if (state.status !== lastNotifiedStatus) {
     if (state.status === 'connected') {
       notify(
-        'Eaglet · Tunnel up',
+        t('Eaglet · Tunnel up'),
         state.profile
-          ? `${state.profile.name} · exit ${state.ip.exit?.ip ?? 'measuring…'}`
-          : 'Encrypted tunnel established'
+          ? t('{name} · exit {ip}', { name: state.profile.name, ip: state.ip.exit?.ip ?? t('measuring…') })
+          : t('Encrypted tunnel established')
       )
     } else if (state.status === 'error') {
-      notify('Eaglet · Tunnel dropped', state.error ?? 'The core stopped unexpectedly')
+      notify(t('Eaglet · Tunnel dropped'), state.error ?? t('The core stopped unexpectedly'))
     } else if (state.status === 'disconnected' && lastNotifiedStatus === 'connected') {
-      notify('Eaglet · Disconnected', 'Direct connection restored')
+      notify(t('Eaglet · Disconnected'), t('Direct connection restored'))
     }
     lastNotifiedStatus = state.status
   }
 
   if (state.ip.changed && state.ip.checkedAt && state.ip.checkedAt !== lastNotifiedIpCheck) {
     lastNotifiedIpCheck = state.ip.checkedAt
-    notify('Eaglet · Exit IP changed', `${state.ip.direct?.ip ?? 'unknown'} → ${state.ip.exit?.ip ?? 'unknown'}`)
+    notify(
+      t('Eaglet · Exit IP changed'),
+      t('{from} → {to}', { from: state.ip.direct?.ip ?? t('unknown'), to: state.ip.exit?.ip ?? t('unknown') })
+    )
   }
 }
 
@@ -612,13 +633,16 @@ function registerIpc(): void {
 
   handleIpc('vpn:quick-connect', async () => {
     if (engine.getState().status === 'connected' || engine.getState().status === 'connecting') {
-      throw new Error('Disconnect before picking a new fastest node')
+      throw new Error(t('Disconnect before picking a new fastest node'))
     }
     try {
       const fastest = await pickFastestProfile()
       engine.pushExternalLog(
         'info',
-        `Quick connect · fastest node ${fastest.name}${fastest.ping !== null ? ` (${fastest.ping} ms)` : ''}`
+        t('Quick connect · fastest node {name}{ping}', {
+          name: fastest.name,
+          ping: fastest.ping !== null ? ` (${fastest.ping} ms)` : ''
+        })
       )
       await engine.connect(fastest.id)
       broadcast()
@@ -644,7 +668,7 @@ function registerIpc(): void {
     const profileId = requireId(id, 'profileId')
     const pinned = requireBoolean(favorite, 'favorite')
     store.setFavorite(profileId, pinned)
-    engine.pushExternalLog('info', pinned ? 'Pinned node to favourites' : 'Removed node from favourites')
+    engine.pushExternalLog('info', pinned ? t('Pinned node to favourites') : t('Removed node from favourites'))
     broadcast()
     return publicProfiles(store.getProfiles())
   })
@@ -660,7 +684,7 @@ function registerIpc(): void {
   })
 
   handleIpc('free:discover', async () => {
-    engine.pushExternalLog('info', 'Searching public free-node catalogs…')
+    engine.pushExternalLog('info', t('Searching public free-node catalogs…'))
     try {
       let corePath: string | null = null
       try {
@@ -678,7 +702,11 @@ function registerIpc(): void {
       })
       engine.pushExternalLog(
         result.profiles.length > 0 ? 'success' : 'warn',
-        `Free search · ${result.found} found · ${result.reachable} reachable · ${result.profiles.length} working`
+        t('Free search · {found} found · {reachable} reachable · {working} working', {
+          found: result.found,
+          reachable: result.reachable,
+          working: result.profiles.length
+        })
       )
       // Keep the share links in this process. The renderer only receives
       // profile metadata and opaque ids, so an XSS cannot harvest credentials.
@@ -689,7 +717,7 @@ function registerIpc(): void {
       broadcast()
       return { ...result, profiles: publicProfiles(result.profiles) }
     } catch (error) {
-      engine.pushExternalLog('error', `Free search failed: ${(error as Error).message}`)
+      engine.pushExternalLog('error', t('Free search failed: {message}', { message: (error as Error).message }))
       broadcast()
       throw error
     }
@@ -700,7 +728,7 @@ function registerIpc(): void {
       const profileIds = requireStringArray(ids, 'ids', 200, 128)
       const links = profileIds.map((id) => freeCandidates.get(id))
       if (links.some((link) => !link)) {
-        throw new Error('Some selected free nodes expired; run the search again')
+        throw new Error(t('Some selected free nodes expired; run the search again'))
       }
       return addFreeProfiles(links as string[])
     } catch (error) {
@@ -714,7 +742,7 @@ function registerIpc(): void {
     try {
       return await updateSubscriptionById(requireId(id, 'subscriptionId'))
     } catch (error) {
-      engine.pushExternalLog('error', `Subscription refresh failed: ${(error as Error).message}`)
+      engine.pushExternalLog('error', t('Subscription refresh failed: {message}', { message: (error as Error).message }))
       broadcast()
       throw error
     }
@@ -724,7 +752,7 @@ function registerIpc(): void {
     try {
       return await updateAllSubscriptions(false)
     } catch (error) {
-      engine.pushExternalLog('error', `Subscription refresh failed: ${(error as Error).message}`)
+      engine.pushExternalLog('error', t('Subscription refresh failed: {message}', { message: (error as Error).message }))
       throw error
     }
   })
@@ -735,8 +763,11 @@ function registerIpc(): void {
     store.removeProfilesBySource(subscriptionId)
     store.removeSubscription(subscriptionId)
     engine.reconcileProfiles()
-    engine.pushExternalLog('info', 'Subscription removed')
-    logProfileEvent('remove', `Subscription ${subscription?.name ?? subscriptionId} removed`)
+    engine.pushExternalLog('info', t('Subscription removed'))
+    logProfileEvent(
+      'remove',
+      t('Subscription {name} removed', { name: subscription?.name ?? subscriptionId })
+    )
     broadcast()
   })
 
@@ -745,8 +776,8 @@ function registerIpc(): void {
     const profile = store.getProfile(profileId)
     store.removeProfile(profileId)
     engine.reconcileProfiles()
-    engine.pushExternalLog('info', 'Node removed')
-    logProfileEvent('remove', `Node ${profile?.name ?? profileId} removed`)
+    engine.pushExternalLog('info', t('Node removed'))
+    logProfileEvent('remove', t('Node {name} removed', { name: profile?.name ?? profileId }))
     broadcast()
   })
 
@@ -771,7 +802,10 @@ function registerIpc(): void {
       broadcast()
       return result
     } catch (error) {
-      engine.pushExternalLog('warn', `Speed test failed: ${(error as Error).message}`)
+      engine.pushExternalLog(
+        'warn',
+        t('Speed test failed: {error}', { error: (error as Error).message })
+      )
       broadcast()
       throw error
     }
@@ -779,24 +813,24 @@ function registerIpc(): void {
 
   handleIpc('sessions:clear', () => {
     store.clearSessions()
-    engine.pushExternalLog('info', 'Session history cleared')
+    engine.pushExternalLog('info', t('Session history cleared'))
     broadcast()
     return store.getSessions()
   })
 
   handleIpc('profiles:import-clipboard', async () => {
     const text = (await clipboard.readText()).trim()
-    if (!text) throw new Error('The clipboard is empty. Copy a subscription URL or a share link first.')
+    if (!text) throw new Error(t('The clipboard is empty. Copy a subscription URL or a share link first.'))
     return importAnything(text)
   })
 
   handleIpc('profiles:copy-link', (_event, id: string) => {
     const profile = store.getProfile(requireId(id, 'profileId'))
-    if (!profile) throw new Error('Profile not found')
+    if (!profile) throw new Error(t('Profile not found'))
     const link = profile.raw?.trim()
     if (!link) {
       throw new Error(
-        'The share link for this profile is unavailable — re-import it or unlock the OS keyring'
+        t('The share link for this profile is unavailable — re-import it or unlock the OS keyring')
       )
     }
     // The link never leaves the main process; only the clipboard receives it.
@@ -825,7 +859,10 @@ function registerIpc(): void {
       broadcast()
       return engines
     } catch (error) {
-      engine.pushExternalLog('warn', `Engine update check failed: ${(error as Error).message}`)
+      engine.pushExternalLog(
+        'warn',
+        t('Engine update check failed: {error}', { error: (error as Error).message })
+      )
       broadcast()
       throw error
     }
@@ -837,7 +874,10 @@ function registerIpc(): void {
       broadcast()
       return engines
     } catch (error) {
-      engine.pushExternalLog('error', `Engine install failed: ${(error as Error).message}`)
+      engine.pushExternalLog(
+        'error',
+        t('Engine install failed: {error}', { error: (error as Error).message })
+      )
       broadcast()
       throw error
     }
@@ -849,7 +889,10 @@ function registerIpc(): void {
       broadcast()
       return engines
     } catch (error) {
-      engine.pushExternalLog('error', `Engine removal failed: ${(error as Error).message}`)
+      engine.pushExternalLog(
+        'error',
+        t('Engine removal failed: {error}', { error: (error as Error).message })
+      )
       broadcast()
       throw error
     }
@@ -884,7 +927,10 @@ function registerIpc(): void {
       scheduleSubscriptionUpdates()
       broadcast()
     } catch (error) {
-      engine.pushExternalLog('error', `Scenario failed: ${(error as Error).message}`)
+      engine.pushExternalLog(
+        'error',
+        t('Scenario failed: {error}', { error: (error as Error).message })
+      )
       broadcast()
       throw error
     }
@@ -897,7 +943,10 @@ function registerIpc(): void {
       broadcast()
       return scenarios
     } catch (error) {
-      engine.pushExternalLog('error', `Scenario save failed: ${(error as Error).message}`)
+      engine.pushExternalLog(
+        'error',
+        t('Scenario save failed: {error}', { error: (error as Error).message })
+      )
       throw error
     }
   })
@@ -922,16 +971,21 @@ function registerIpc(): void {
     const security = store.getSecretStatus()
     const warning = await dialog.showMessageBox({
       type: 'warning',
-      title: 'Export Eaglet backup',
-      message: 'Backups can contain connection secrets',
+      title: t('Export Eaglet backup'),
+      message: t('Backups can contain connection secrets'),
       detail:
-        'Share links and subscription URLs may contain passwords and access tokens. ' +
-        'Exporting them writes those secrets to the chosen file in readable form.\n\n' +
-        'Export without secrets keeps your settings and server list, but the profiles must be re-imported before they can connect.' +
+        t('Share links and subscription URLs may contain passwords and access tokens. Exporting them writes those secrets to the chosen file in readable form.') +
+        '\n\n' +
+        t('Export without secrets keeps your settings and server list, but the profiles must be re-imported before they can connect.') +
         (security.secretStorage === 'encrypted'
           ? ''
-          : '\n\nWarning: the OS keyring is not protecting secrets in this profile; they are already stored in config.json without encryption.'),
-      buttons: ['Export without secrets', 'Export with secrets', 'Cancel'],
+          : '\n\n' +
+            t('Warning: the OS keyring is not protecting secrets in this profile; they are already stored in config.json without encryption.')),
+      buttons: [
+        t('Export without secrets'),
+        t('Export with secrets'),
+        t('Cancel')
+      ],
       defaultId: 0,
       cancelId: 2,
       noLink: true
@@ -957,7 +1011,7 @@ function registerIpc(): void {
       includesSecrets: includeSecrets
     }
     const result = await dialog.showSaveDialog({
-      title: 'Export Eaglet backup',
+      title: t('Export Eaglet backup'),
       defaultPath: `eaglet-backup-${new Date().toISOString().slice(0, 10)}.json`,
       filters: [{ name: 'JSON', extensions: ['json'] }]
     })
@@ -966,8 +1020,12 @@ function registerIpc(): void {
     engine.pushExternalLog(
       includeSecrets ? 'warn' : 'success',
       includeSecrets
-        ? `Backup exported with plaintext secrets · ${payload.profiles.length} profiles`
-        : `Backup exported without secrets · ${payload.profiles.length} profiles`
+        ? t('Backup exported with plaintext secrets · {count} profiles', {
+            count: payload.profiles.length
+          })
+        : t('Backup exported without secrets · {count} profiles', {
+            count: payload.profiles.length
+          })
     )
     broadcast()
     return result.filePath
@@ -975,14 +1033,14 @@ function registerIpc(): void {
 
   handleIpc('backup:import', async () => {
     const result = await dialog.showOpenDialog({
-      title: 'Import Eaglet backup',
+      title: t('Import Eaglet backup'),
       properties: ['openFile'],
       filters: [{ name: 'JSON', extensions: ['json'] }]
     })
     if (result.canceled || result.filePaths.length === 0) return null
     const raw = JSON.parse(readFileSync(result.filePaths[0], 'utf-8')) as Partial<BackupPayload>
     if (raw.format !== 'eaglet-backup' || !raw.settings || !Array.isArray(raw.profiles)) {
-      throw new Error('That file is not an Eaglet backup')
+      throw new Error(t('That file is not an Eaglet backup'))
     }
     store.replaceAll({
       settings: { ...store.getSettings(), ...sanitizeSettingsPatch(raw.settings) },
@@ -992,17 +1050,20 @@ function registerIpc(): void {
     })
     engine.reconcileProfiles()
     scheduleSubscriptionUpdates()
-    engine.pushExternalLog('success', `Backup imported · ${raw.profiles.length} profiles`)
+    engine.pushExternalLog(
+      'success',
+      t('Backup imported · {count} profiles', { count: raw.profiles.length })
+    )
     if (raw.includesSecrets) {
       const security = store.getSecretStatus()
       engine.pushExternalLog(
         security.secretStorage === 'encrypted' ? 'info' : 'warn',
         security.secretStorage === 'encrypted'
-          ? 'Backup contained plaintext secrets; they were moved into the encrypted vault'
-          : 'Backup contained plaintext secrets and the OS keyring is unavailable; they remain in config.json without encryption'
+          ? t('Backup contained plaintext secrets; they were moved into the encrypted vault')
+          : t('Backup contained plaintext secrets and the OS keyring is unavailable; they remain in config.json without encryption')
       )
     }
-    logProfileEvent('import', 'Configuration restored from a backup')
+    logProfileEvent('import', t('Configuration restored from a backup'))
     broadcast()
     return snapshot()
   })
@@ -1011,36 +1072,38 @@ function registerIpc(): void {
     const exported = engine.buildExportConfig()
     const warning = await dialog.showMessageBox({
       type: 'warning',
-      title: 'Export core configuration',
-      message: 'This configuration contains credentials in plaintext',
+      title: t('Export core configuration'),
+      message: t('This configuration contains credentials in plaintext'),
       detail:
-        'The native core configuration includes the node UUID/password and any TLS secrets needed to connect. ' +
-        'Anyone who can read the exported file can use those credentials. Store it securely and delete it when it is no longer needed.',
-      buttons: ['Export configuration', 'Cancel'],
+        t('The native core configuration includes the node UUID/password and any TLS secrets needed to connect. Anyone who can read the exported file can use those credentials. Store it securely and delete it when it is no longer needed.'),
+      buttons: [t('Export configuration'), t('Cancel')],
       defaultId: 1,
       cancelId: 1,
       noLink: true
     })
     if (warning.response !== 0) return null
     const result = await dialog.showSaveDialog({
-      title: `Export ${exported.engine} configuration`,
+      title: t('Export {engine} configuration', { engine: exported.engine }),
       defaultPath: `eaglet-${exported.engine}-config.${exported.extension}`,
       filters: [{ name: exported.extension.toUpperCase(), extensions: [exported.extension] }]
     })
     if (result.canceled || !result.filePath) return null
     writeFileSync(result.filePath, exported.content, 'utf-8')
-    engine.pushExternalLog('success', `${exported.engine} configuration exported`)
+    engine.pushExternalLog(
+      'success',
+      t('{engine} configuration exported', { engine: exported.engine })
+    )
     broadcast()
     return result.filePath
   })
 
   handleIpc('profiles:qr', async (): Promise<QrImportResult> => {
     const result = await dialog.showOpenDialog({
-      title: 'Import a QR code from an image',
+      title: t('Import a QR code from an image'),
       properties: ['openFile'],
-      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp'] }]
+      filters: [{ name: t('Images'), extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp'] }]
     })
-    if (result.canceled || result.filePaths.length === 0) throw new Error('No image selected')
+    if (result.canceled || result.filePaths.length === 0) throw new Error(t('No image selected'))
     const text = decodeQr(result.filePaths[0])
     const imported = await importAnything(text)
     return { ...imported, codes: 1 }
@@ -1050,6 +1113,7 @@ function registerIpc(): void {
     const sanitized = sanitizeSettingsPatch(patch)
     const previous = store.getSettings()
     const settings = store.updateSettings(sanitized)
+    if (sanitized.language !== undefined) setMainLanguage(settings.language)
     if (sanitized.mini !== undefined && mainWindow) setMini(mainWindow, sanitized.mini)
     if (sanitized.launchAtStartup !== undefined) applyLoginItem(sanitized.launchAtStartup)
     if (sanitized.systemProxy !== undefined && sanitized.systemProxy !== previous.systemProxy) {
@@ -1059,7 +1123,7 @@ function registerIpc(): void {
         (sanitized.dns && sanitized.dns !== previous.dns) ||
         (sanitized.customDns !== undefined && sanitized.customDns !== previous.customDns)) {
       if (engine.getState().status === 'connected') {
-        engine.pushExternalLog('warn', 'Routing changes apply on the next connection')
+        engine.pushExternalLog('warn', t('Routing changes apply on the next connection'))
       }
     }
     if (sanitized.autoUpdateSubscriptions !== undefined || sanitized.subscriptionIntervalHours !== undefined) {
@@ -1097,6 +1161,7 @@ app.whenReady().then(async () => {
   installSessionGuards()
   store = new Store()
   const settings = store.getSettings()
+  setMainLanguage(settings.language)
   engine = new VpnEngine(store)
 
   engine.on('state', (state: VpnState) => {
@@ -1138,7 +1203,7 @@ app.whenReady().then(async () => {
       report.tested = found.tested
       report.verified = found.verified
       const picks = found.profiles.slice(0, 10)
-      if (picks.length === 0) throw new Error('No working public nodes found')
+      if (picks.length === 0) throw new Error(t('No working public nodes found'))
       const imported = addFreeProfiles(picks.map((profile) => profile.raw))
       report.added = imported.imported
       report.subscription = imported.subscription
@@ -1207,13 +1272,13 @@ app.whenReady().then(async () => {
       let direct = store.getProfiles().find((profile) => profile.protocol === 'direct')
       if (!direct) {
         const [parsed] = parseProfilesPayload('direct://Feature%20test')
-        if (!parsed) throw new Error('Could not create a direct profile')
+        if (!parsed) throw new Error(t('Could not create a direct profile'))
         store.addProfiles([parsed])
         engine.reconcileProfiles()
         direct = store.getProfile(parsed.id) ?? undefined
         addedDirectId = parsed.id
       }
-      if (!direct) throw new Error('Direct profile missing')
+      if (!direct) throw new Error(t('Direct profile missing'))
 
       store.setFavorite(direct.id, true)
       report.favoriteOn = store.getProfile(direct.id)?.favorite
@@ -1230,6 +1295,8 @@ app.whenReady().then(async () => {
       report.bypassParsed = store.getSettings().bypassList.split(/\s+/).filter(Boolean).length
       report.notificationsStored = store.getSettings().notifications
 
+      // Snapshot the real system proxy before Eaglet touches it.
+      const proxyBefore = await readSystemProxy()
       engine.setProfile(direct.id)
       await engine.connect()
       const connectDeadline = Date.now() + 60000
@@ -1289,12 +1356,14 @@ app.whenReady().then(async () => {
       const sessions = store.getSessions()
       report.sessions = sessions.length
       report.lastSession = sessions[0] ?? null
-      try {
-        recoverStaleProxy()
-        report.proxyRestored = true
-      } catch (error) {
-        report.proxyRestored = false
-        report.proxyRestoreError = (error as Error).message
+
+      // Real verification, never a hard-coded pass: compare the live proxy with
+      // the state captured before the tunnel was opened.
+      const proxyAfter = await readSystemProxy()
+      if (!proxyBefore || !proxyAfter) {
+        report.proxyRestored = 'NOT_CHECKED'
+      } else {
+        report.proxyRestored = sameSystemProxy(proxyBefore, proxyAfter) ? 'PASS' : 'FAIL'
       }
     } catch (error) {
       report.error = (error as Error).message

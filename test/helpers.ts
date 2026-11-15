@@ -3,6 +3,7 @@ import type { Profile, Settings } from '@shared/types'
 export function makeSettings(patch: Partial<Settings> = {}): Settings {
   return {
     theme: 'cyber',
+    language: 'en',
     systemProxy: true,
     tunMode: false,
     killSwitch: false,

@@ -4,6 +4,7 @@ import { Sparkline } from '../components/Sparkline'
 import { WorldMap } from '../components/WorldMap'
 import { ArrowDownIcon, ArrowUpIcon, BoltIcon, ShieldIcon, SignalIcon } from '../components/Icons'
 import { formatDuration, formatSpeed } from '../format'
+import { t } from '../i18n'
 
 interface Props {
   snap: Snapshot
@@ -32,40 +33,43 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
 
   const label =
     status === 'connected'
-      ? 'Connected'
+      ? t('Connected')
       : status === 'connecting'
-        ? 'Connecting'
+        ? t('Connecting')
         : status === 'disconnecting'
-          ? 'Disconnecting'
+          ? t('Disconnecting')
           : status === 'error'
-            ? 'Error'
-            : 'Disconnected'
+            ? t('Error')
+            : t('Disconnected')
 
   const location = profile ? (
     <>
       <strong>{profile.name}</strong> · {profile.protocol.toUpperCase()}
     </>
   ) : (
-    <>No profile selected</>
+    <>{t('No profile selected')}</>
   )
 
   const meta = connected
-    ? `Session ${formatDuration(metrics.sessionSeconds)} · ${ip.exit?.countryCode ?? 'tunnel active'}`
+    ? t('Session {duration} · {exit}', {
+        duration: formatDuration(metrics.sessionSeconds),
+        exit: ip.exit?.countryCode ?? t('tunnel active')
+      })
     : busy
-      ? (state.stage ?? 'Working…')
+      ? (state.stage ?? t('Working…'))
       : profile
-        ? 'Tap the dial to connect'
-        : 'Import a subscription to begin'
+        ? t('Tap the dial to connect')
+        : t('Import a subscription to begin')
 
   const verdict = ip.checking
-    ? { text: 'Checking', tone: 'wait' }
+    ? { text: t('Checking'), tone: 'wait' }
     : ip.changed
-      ? { text: 'IP changed', tone: 'ok' }
+      ? { text: t('IP changed'), tone: 'ok' }
       : connected && ip.exit
-        ? { text: 'Unchanged', tone: 'idle' }
+        ? { text: t('Unchanged'), tone: 'idle' }
         : ip.exit
-          ? { text: 'Last known', tone: 'idle' }
-          : { text: 'Standby', tone: 'idle' }
+          ? { text: t('Last known'), tone: 'idle' }
+          : { text: t('Standby'), tone: 'idle' }
 
   return (
     <div className="home">
@@ -88,14 +92,27 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
             <span className="home-badge">
               <BoltIcon /> {ENGINE_NAME[state.engine]}
             </span>
-            {state.killSwitchActive && (
+            {state.protection.killSwitch === 'active' && (
               <span className="home-badge is-on">
-                <ShieldIcon /> Kill switch
+                <ShieldIcon /> {t('Kill switch')}
               </span>
             )}
-            {state.dnsProtectionActive && <span className="home-badge is-on">DNS guard</span>}
+            {(state.protection.killSwitch === 'error' ||
+              state.protection.killSwitch === 'unsupported') && (
+              <span className="home-badge is-bad" title={state.protection.error ?? undefined}>
+                <ShieldIcon /> {t('Kill switch')} · {t('not active')}
+              </span>
+            )}
+            {state.protection.dns === 'active' && (
+              <span className="home-badge is-on">{t('DNS guard')}</span>
+            )}
+            {state.protection.dns === 'error' && (
+              <span className="home-badge is-bad" title={state.protection.error ?? undefined}>
+                {t('DNS guard')} · {t('not active')}
+              </span>
+            )}
             {settings.tunMode && <span className="home-badge">TUN</span>}
-            {!settings.ipv6 && <span className="home-badge">IPv4 only</span>}
+            {!settings.ipv6 && <span className="home-badge">{t('IPv4 only')}</span>}
           </div>
         </div>
       </section>
@@ -104,20 +121,20 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
         <button
           className="quick-connect panel"
           onClick={() => (hasRemote ? onQuickConnect() : onManageServers())}
-          title={hasRemote ? 'Ping nodes and connect to the fastest' : 'Open the server list'}
+          title={hasRemote ? t('Ping nodes and connect to the fastest') : t('Open the server list')}
         >
           <span className="quick-icon">
             <BoltIcon />
           </span>
           <span className="quick-text">
-            <strong>{hasRemote ? 'Quick connect' : 'Find a server first'}</strong>
+            <strong>{hasRemote ? t('Quick connect') : t('Find a server first')}</strong>
             <span>
               {hasRemote
-                ? 'Pings your nodes in parallel and connects to the fastest one'
-                : 'Import a subscription or run the free-server finder'}
+                ? t('Pings your nodes in parallel and connects to the fastest one')
+                : t('Import a subscription or run the free-server finder')}
             </span>
           </span>
-          <span className="quick-cta">{hasRemote ? 'Auto-pick' : 'Open servers'}</span>
+          <span className="quick-cta">{hasRemote ? t('Auto-pick') : t('Open servers')}</span>
         </button>
       )}
 
@@ -125,32 +142,36 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
         <div className="ip-card panel">
           <div className="ip-head">
             <span className="ip-dot" />
-            Direct address
-            <span className="ip-tag">before tunnel</span>
+            {t('Direct address')}
+            <span className="ip-tag">{t('before tunnel')}</span>
           </div>
           <div className={`ip-value ${ip.direct ? '' : 'is-empty'}`}>{ip.direct?.ip ?? '—'}</div>
           <div className="ip-meta">
-            {ip.direct ? place(ip.direct) || 'Direct connection' : 'Waiting for the first probe'}
+            {ip.direct ? place(ip.direct) || t('Direct connection') : t('Waiting for the first probe')}
           </div>
         </div>
 
         <div className={`ip-card panel ${ip.changed ? 'is-changed' : ''}`}>
           <div className="ip-head">
             <span className="ip-dot exit" />
-            Tunnel exit
+            {t('Tunnel exit')}
             <span className={`ip-badge ${verdict.tone}`}>{verdict.text}</span>
             <button
               className="ip-refresh"
               onClick={() => void window.eaglet.checkIp()}
               disabled={ip.checking}
-              title="Re-probe both addresses"
+              title={t('Re-probe both addresses')}
             >
-              {ip.checking ? 'Probing…' : 'Re-check'}
+              {ip.checking ? t('Probing…') : t('Re-check')}
             </button>
           </div>
           <div className={`ip-value ${ip.exit ? '' : 'is-empty'}`}>{ip.exit?.ip ?? '—'}</div>
           <div className="ip-meta">
-            {ip.exit ? place(ip.exit) || ip.exit.countryCode : connected ? 'Probing the tunnel…' : 'Connect to measure the exit'}
+            {ip.exit
+              ? place(ip.exit) || ip.exit.countryCode
+              : connected
+                ? t('Probing the tunnel…')
+                : t('Connect to measure the exit')}
           </div>
         </div>
       </section>
@@ -161,8 +182,9 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
             <ShieldIcon />
           </span>
           <span>
-            Your public address changed from <strong>{ip.direct?.ip}</strong> to <strong>{ip.exit?.ip}</strong>.
-            Traffic is leaving through {place(ip.exit) || ip.exit?.countryCode}.
+            {t('Your public address changed from')} <strong>{ip.direct?.ip}</strong> {t('to')}{' '}
+            <strong>{ip.exit?.ip}</strong>.{' '}
+            {t('Traffic is leaving through {exit}.', { exit: place(ip.exit) || ip.exit?.countryCode || '' })}
           </span>
         </div>
       )}
@@ -173,7 +195,7 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
             <SignalIcon />
           </div>
           <div className="stat-body">
-            <div className="stat-label">Ping</div>
+            <div className="stat-label">{t('Ping')}</div>
             <div className="stat-value">
               {connected ? Math.round(metrics.ping) : '—'}
               <span className="unit">ms</span>
@@ -189,7 +211,7 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
             <ArrowDownIcon />
           </div>
           <div className="stat-body">
-            <div className="stat-label">Download</div>
+            <div className="stat-label">{t('Download')}</div>
             <div className="stat-value">
               {connected ? formatSpeed(metrics.down) : '—'}
               <span className="unit">Mbps</span>
@@ -203,7 +225,7 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
             <ArrowUpIcon />
           </div>
           <div className="stat-body">
-            <div className="stat-label">Upload</div>
+            <div className="stat-label">{t('Upload')}</div>
             <div className="stat-value">
               {connected ? formatSpeed(metrics.up) : '—'}
               <span className="unit">Mbps</span>
@@ -216,8 +238,8 @@ export function Home({ snap, onToggle, onQuickConnect, onManageServers }: Props)
       {snap.scenarios.length > 0 && (
         <section className="scenario-strip panel">
           <div className="scenario-strip-head">
-            <strong>Scenarios</strong>
-            <span>One click applies engine, routing and protection settings</span>
+            <strong>{t('Scenarios')}</strong>
+            <span>{t('One click applies engine, routing and protection settings')}</span>
           </div>
           <div className="scenario-strip-actions">
             {snap.scenarios.map((scenario) => (
