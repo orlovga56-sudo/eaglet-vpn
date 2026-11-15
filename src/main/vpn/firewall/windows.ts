@@ -285,6 +285,13 @@ export function createWindowsKillSwitch(
     backup: PolicyBackup
   ): Promise<{ restored: boolean; error: string | null }> => {
     await removeRules().catch(() => undefined)
+    
+    // Check if rules were actually removed
+    const leftoverRules = await countRules()
+    if (leftoverRules > 0) {
+      return { restored: false, error: t('{count} kill-switch firewall rules are still present', { count: leftoverRules }) }
+    }
+    
     const error = await restoreVerified(backup)
     if (error === null) {
       store.remove(path)
@@ -358,8 +365,12 @@ export function createWindowsKillSwitch(
       // Remove the allow rules first: while the default action is still Block
       // the machine stays closed even if the policy restore fails.
       let failure: string | null = null
+      let leftoverRules = 0
+      
       try {
         await removeRules()
+        // Check if rules were actually removed
+        leftoverRules = await countRules()
       } catch (error) {
         failure = (error as Error).message
       }
@@ -368,16 +379,15 @@ export function createWindowsKillSwitch(
         if (failure) {
           throw new Error(t('Could not remove the kill-switch firewall rules: {error}', { error: failure }))
         }
-        const leftover = await countRules()
-        if (leftover > 0) {
-          throw new Error(t('{count} kill-switch firewall rules are still present', { count: leftover }))
+        if (leftoverRules > 0) {
+          throw new Error(t('{count} kill-switch firewall rules are still present', { count: leftoverRules }))
         }
         return
       }
 
       const restoreError = await restoreVerified(backup)
-      const leftovers = await countRules().catch(() => -1)
-      if (restoreError !== null || failure || leftovers !== 0) {
+      const leftoversAfterRestore = await countRules().catch(() => -1)
+      if (restoreError !== null || failure || leftoversAfterRestore !== 0) {
         throw new Error(
           t(
             'The Windows firewall policy could not be fully restored ({error}). The backup is kept at {path}; run Eaglet as administrator to retry.',
@@ -385,7 +395,7 @@ export function createWindowsKillSwitch(
               error:
                 restoreError ??
                 failure ??
-                t('{count} kill-switch rules are still present', { count: leftovers }),
+                t('{count} kill-switch rules are still present', { count: leftoversAfterRestore }),
               path
             }
           )
@@ -400,24 +410,39 @@ export function createWindowsKillSwitch(
       const script = backup
         ? `${REMOVE_RULES}\n${restoreProfilesScript(backup.profiles)}\n${COUNT_RULES}`
         : `${REMOVE_RULES}\n${READ_PROFILES}`
+      
+      let output = ''
+      let count = 0
+      let actual: Record<string, string> = {}
+      let mismatches: string[] = []
+      
       try {
-        const output = runner.runSync(script).trim()
+        output = runner.runSync(script).trim()
         if (!backup) {
+          // Check if rules were actually removed
+          const countAfterRemoval = Number(runner.runSync(COUNT_RULES).trim())
+          if (countAfterRemoval > 0) {
+            throw new Error(t('{count} kill-switch firewall rules are still present', { count: countAfterRemoval }))
+          }
           store.remove(path)
           return
         }
+        
         const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
-        const count = Number(lines.at(-1))
-        const actual = parseFirewallProfiles(lines.slice(0, -1).join('\n'))
-        const mismatches = profileMismatches(backup.profiles, actual)
+        count = Number(lines.at(-1))
+        actual = parseFirewallProfiles(lines.slice(0, -1).join('\n'))
+        mismatches = profileMismatches(backup.profiles, actual)
+        
         if (mismatches.length > 0 || count !== 0) {
           // Keep the backup: the next launch retries instead of trusting an
           // exit code that only says the command itself returned.
           throw new Error(mismatches.join('; ') || `rules left: ${count}`)
         }
+        
         store.remove(path)
       } catch (error) {
         console.error('[firewall] synchronous restore failed; backup kept:', (error as Error).message)
+        throw error
       }
     },
 

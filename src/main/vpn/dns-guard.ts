@@ -696,29 +696,63 @@ function restoreSystemDnsSync(): void {
     rmSync(backupPath(), { force: true })
     return
   }
-  if (backup.platform === 'win32') {
-    execFileSync(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        windowsRestoreScript(backup.services)
-      ],
-      { windowsHide: true, timeout: 12000 }
-    )
-  } else if (backup.platform === 'darwin') {
-    for (const service of backup.services) {
-      execFileSync('networksetup', planMacRestore(service), { timeout: 5000, stdio: 'ignore' })
+  
+  let restoreSuccess = false
+  let currentDnsAfterRestore: DnsServiceBackup[] | null = null
+  
+  try {
+    if (backup.platform === 'win32') {
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          windowsRestoreScript(backup.services)
+        ],
+        { windowsHide: true, timeout: 12000 }
+      )
+    } else if (backup.platform === 'darwin') {
+      for (const service of backup.services) {
+        execFileSync('networksetup', planMacRestore(service), { timeout: 5000, stdio: 'ignore' })
+      }
+    } else {
+      for (const service of backup.services) {
+        execFileSync('resolvectl', planLinuxRestore(service), { timeout: 5000, stdio: 'ignore' })
+      }
     }
-  } else {
+    
+    // Read actual DNS settings after restoration
+    currentDnsAfterRestore = readCurrentDns()
+    
+    // Verify restoration
+    let allRestored = true
     for (const service of backup.services) {
-      execFileSync('resolvectl', planLinuxRestore(service), { timeout: 5000, stdio: 'ignore' })
+      const live = currentDnsAfterRestore.find((item) =>
+        item.index !== undefined && service.index !== undefined ? item.index === service.index : item.name === service.name
+      )
+      if (!live || userChangedDns(service, live)) {
+        allRestored = false
+        break
+      }
     }
+    
+    if (allRestored) {
+      restoreSuccess = true
+      // Only delete backup after successful verification
+      rmSync(backupPath(), { force: true })
+    }
+  } catch (error) {
+    console.error(`[dns] Synchronous restore failed: ${(error as Error).message}`)
   }
-  rmSync(backupPath(), { force: true })
+  
+  if (!restoreSuccess) {
+    // Keep backup for retry on next launch
+    console.error('[dns] Synchronous restore verification failed, backup preserved')
+    throw new Error(t('System DNS restore verification failed, backup preserved for retry'))
+  }
 }
 
 function closeListeners(current: DnsGuardState | null): void {
@@ -813,10 +847,13 @@ export async function startDnsGuard(settings: Settings): Promise<void> {
 export async function stopDnsGuard(): Promise<void> {
   const current = state
   let lastError: string | null = null
+  let restoreSuccess = false
+  
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await restoreSystemDns()
       lastError = null
+      restoreSuccess = true
       break
     } catch (error) {
       lastError = (error as Error).message
@@ -826,6 +863,8 @@ export async function stopDnsGuard(): Promise<void> {
 
   if (lastError) {
     restoreFailure = lastError
+    // Keep relay running to avoid DNS breakage
+    console.error('[dns] System DNS restore failed, keeping relay active')
     throw new Error(
       t(
         'The system DNS could not be restored ({error}). The DoH relay stays active so DNS keeps working and the backup is kept for the next launch; disconnect again or restart Eaglet as administrator.',
@@ -834,20 +873,34 @@ export async function stopDnsGuard(): Promise<void> {
     )
   }
 
-  restoreFailure = null
-  state = null
-  closeListeners(current)
+  // Only close relay if DNS was successfully restored
+  if (restoreSuccess) {
+    restoreFailure = null
+    state = null
+    closeListeners(current)
+  }
 }
 
 export function stopDnsGuardSync(): void {
   const current = state
+  let restoreSuccess = false
+  
   try {
     restoreSystemDnsSync()
-  } catch {
+    restoreSuccess = true
+  } catch (error) {
+    console.error(`[dns] Synchronous stop failed: ${(error as Error).message}`)
     // Keep the backup so the next launch can retry.
   } finally {
-    state = null
-    closeListeners(current)
+    // Only close relay if DNS was successfully restored
+    if (restoreSuccess) {
+      state = null
+      closeListeners(current)
+    } else {
+      // Keep relay running to avoid DNS breakage
+      console.error('[dns] Keeping relay active due to failed restore')
+      restoreFailure = t('System DNS restore failed during shutdown')
+    }
   }
 }
 

@@ -134,24 +134,34 @@ async function installChain(command: string, chain: string, rules: string[][]): 
   })
 }
 
+async function checkEagletChains(): Promise<{ ipv4: boolean; ipv6: boolean }> {
+  const ipv4 = await iptables(['-C', 'OUTPUT', '-j', CHAIN], 'iptables').catch(() => false)
+  const ipv6 = await iptables(['-C', 'OUTPUT', '-j', CHAIN6], 'ip6tables').catch(() => false)
+  return { ipv4, ipv6 }
+}
+
 async function removeChain(command: string, chain: string): Promise<void> {
   await iptables(['-D', 'OUTPUT', '-j', chain], command).catch(() => undefined)
   await iptables(['-F', chain], command).catch(() => undefined)
   await iptables(['-X', chain], command).catch(() => undefined)
 }
 
-function removeChainSync(command: string, chain: string): void {
+function removeChainSync(command: string, chain: string): boolean {
+  let removed = false
   try {
     iptablesSync(['-D', 'OUTPUT', '-j', chain], command)
+    removed = true
   } catch {
     // ignore
   }
   try {
     iptablesSync(['-F', chain], command)
     iptablesSync(['-X', chain], command)
+    removed = true
   } catch {
     // ignore
   }
+  return removed
 }
 
 /**
@@ -201,19 +211,101 @@ export const linuxKillSwitch: KillSwitchBackend = {
   },
 
   async disable(): Promise<void> {
-    await removeChain('iptables', CHAIN)
-    await removeChain('ip6tables', CHAIN6)
-    rmSync(markerPath(), { force: true })
+    let ipv4Removed = false
+    let ipv6Removed = false
+    
+    try {
+      await removeChain('iptables', CHAIN)
+      ipv4Removed = true
+    } catch (error) {
+      console.error(`[firewall] Failed to remove IPv4 chain: ${(error as Error).message}`)
+    }
+    
+    try {
+      await removeChain('ip6tables', CHAIN6)
+      ipv6Removed = true
+    } catch (error) {
+      console.error(`[firewall] Failed to remove IPv6 chain: ${(error as Error).message}`)
+    }
+    
+    // Check if chains were actually removed
+    const chainsExist = await checkEagletChains()
+    
+    // Only remove marker if both chains were successfully removed and no longer exist
+    if (ipv4Removed && ipv6Removed && !chainsExist.ipv4 && !chainsExist.ipv6) {
+      rmSync(markerPath(), { force: true })
+    } else {
+      // Save marker for recovery if chains still exist
+      const marker = markerExists() ? JSON.parse(readFileSync(markerPath(), 'utf-8')) : null
+      if (marker) {
+        writeFileSync(
+          markerPath(),
+          JSON.stringify({ 
+            ...marker, 
+            ipv4: ipv4Removed, 
+            ipv6: ipv6Removed, 
+            cleanupFailed: true,
+            chainsStillExist: chainsExist.ipv4 || chainsExist.ipv6
+          }, null, 2),
+          'utf-8'
+        )
+      }
+      throw new Error(t('Kill switch could not be fully disabled'))
+    }
   },
 
   disableSync(): void {
-    removeChainSync('iptables', CHAIN)
-    removeChainSync('ip6tables', CHAIN6)
-    rmSync(markerPath(), { force: true })
+    let ipv4Removed = false
+    let ipv6Removed = false
+    
+    ipv4Removed = removeChainSync('iptables', CHAIN)
+    ipv6Removed = removeChainSync('ip6tables', CHAIN6)
+    
+    // Check if chains were actually removed
+    const chainsExist = {
+      ipv4: iptablesSync(['-C', 'OUTPUT', '-j', CHAIN], 'iptables').catch(() => false),
+      ipv6: iptablesSync(['-C', 'OUTPUT', '-j', CHAIN6], 'ip6tables').catch(() => false)
+    }
+    
+    // Only remove marker if both chains were successfully removed and no longer exist
+    if (ipv4Removed && ipv6Removed && !chainsExist.ipv4 && !chainsExist.ipv6) {
+      rmSync(markerPath(), { force: true })
+    } else {
+      // Save marker for recovery if chains still exist
+      const marker = markerExists() ? JSON.parse(readFileSync(markerPath(), 'utf-8')) : null
+      if (marker) {
+        writeFileSync(
+          markerPath(),
+          JSON.stringify({ 
+            ...marker, 
+            ipv4: ipv4Removed, 
+            ipv6: ipv6Removed, 
+            cleanupFailed: true,
+            chainsStillExist: chainsExist.ipv4 || chainsExist.ipv6
+          }, null, 2),
+          'utf-8'
+        )
+      }
+      throw new Error(t('Kill switch could not be fully disabled'))
+    }
   },
 
   recover(): void {
     if (!markerExists()) return
+    
+    const marker = JSON.parse(readFileSync(markerPath(), 'utf-8'))
+    
+    // If cleanup previously failed, try to remove remaining chains
+    if (marker.cleanupFailed) {
+      console.log('[firewall] Previous cleanup failed, attempting to remove remaining chains')
+      try {
+        this.disableSync()
+      } catch (error) {
+        console.error(`[firewall] Recovery failed: ${(error as Error).message}`)
+      }
+      return
+    }
+    
     // The marker can only have been written by Eaglet after our chains were
     // installed. Remove both tables regardless of age: leaving a stale DROP
     // chain behind after a crash is exactly the outage this recovery prevents.
