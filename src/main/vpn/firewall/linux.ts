@@ -4,6 +4,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { isIP } from 'node:net'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { t } from '../../i18n'
 import type { KillSwitchBackend, KillSwitchContext } from './types'
 
 const execFileAsync = promisify(execFile)
@@ -140,27 +141,52 @@ async function checkEagletChains(): Promise<{ ipv4: boolean; ipv6: boolean }> {
   return { ipv4, ipv6 }
 }
 
-async function removeChain(command: string, chain: string): Promise<void> {
-  await iptables(['-D', 'OUTPUT', '-j', chain], command).catch(() => undefined)
-  await iptables(['-F', chain], command).catch(() => undefined)
-  await iptables(['-X', chain], command).catch(() => undefined)
+async function removeChain(command: string, chain: string): Promise<{ removed: boolean; error: string | null }> {
+  let removed = false
+  let error: string | null = null
+  
+  try {
+    await iptables(['-D', 'OUTPUT', '-j', chain], command)
+    removed = true
+  } catch (err) {
+    error = `Failed to delete OUTPUT rule: ${(err as Error).message}`
+  }
+  
+  try {
+    await iptables(['-F', chain], command)
+    removed = true
+  } catch (err) {
+    error = error ? `${error}; Failed to flush chain: ${(err as Error).message}` : `Failed to flush chain: ${(err as Error).message}`
+  }
+  
+  try {
+    await iptables(['-X', chain], command)
+    removed = true
+  } catch (err) {
+    error = error ? `${error}; Failed to delete chain: ${(err as Error).message}` : `Failed to delete chain: ${(err as Error).message}`
+  }
+  
+  return { removed, error }
 }
 
 function removeChainSync(command: string, chain: string): boolean {
   let removed = false
+  
   try {
     iptablesSync(['-D', 'OUTPUT', '-j', chain], command)
     removed = true
-  } catch {
-    // ignore
+  } catch (error) {
+    // Rule doesn't exist or can't be removed - not necessarily an error
   }
+  
   try {
     iptablesSync(['-F', chain], command)
     iptablesSync(['-X', chain], command)
     removed = true
-  } catch {
-    // ignore
+  } catch (error) {
+    // Chain doesn't exist or can't be flushed/removed - not necessarily an error
   }
+  
   return removed
 }
 
@@ -211,64 +237,89 @@ export const linuxKillSwitch: KillSwitchBackend = {
   },
 
   async disable(): Promise<void> {
-    let ipv4Removed = false
-    let ipv6Removed = false
+    let ipv4Result = { removed: false, error: null as string | null }
+    let ipv6Result = { removed: false, error: null as string | null }
+    let chainsExist = { ipv4: false, ipv6: false }
     
     try {
-      await removeChain('iptables', CHAIN)
-      ipv4Removed = true
+      ipv4Result = await removeChain('iptables', CHAIN)
     } catch (error) {
-      console.error(`[firewall] Failed to remove IPv4 chain: ${(error as Error).message}`)
+      ipv4Result.error = `Failed to remove IPv4 chain: ${(error as Error).message}`
     }
     
     try {
-      await removeChain('ip6tables', CHAIN6)
-      ipv6Removed = true
+      ipv6Result = await removeChain('ip6tables', CHAIN6)
     } catch (error) {
-      console.error(`[firewall] Failed to remove IPv6 chain: ${(error as Error).message}`)
+      ipv6Result.error = `Failed to remove IPv6 chain: ${(error as Error).message}`
     }
     
     // Check if chains were actually removed
-    const chainsExist = await checkEagletChains()
+    try {
+      chainsExist = await checkEagletChains()
+    } catch (error) {
+      console.error(`[firewall] Failed to check chain status: ${(error as Error).message}`)
+    }
     
     // Only remove marker if both chains were successfully removed and no longer exist
-    if (ipv4Removed && ipv6Removed && !chainsExist.ipv4 && !chainsExist.ipv6) {
+    if (ipv4Result.removed && ipv6Result.removed && !chainsExist.ipv4 && !chainsExist.ipv6) {
       rmSync(markerPath(), { force: true })
     } else {
-      // Save marker for recovery if chains still exist
+      // Save marker for recovery if chains still exist or there were errors
       const marker = markerExists() ? JSON.parse(readFileSync(markerPath(), 'utf-8')) : null
       if (marker) {
         writeFileSync(
           markerPath(),
           JSON.stringify({ 
             ...marker, 
-            ipv4: ipv4Removed, 
-            ipv6: ipv6Removed, 
+            ipv4: ipv4Result.removed, 
+            ipv6: ipv6Result.removed, 
             cleanupFailed: true,
-            chainsStillExist: chainsExist.ipv4 || chainsExist.ipv6
+            chainsStillExist: chainsExist.ipv4 || chainsExist.ipv6,
+            ipv4Error: ipv4Result.error,
+            ipv6Error: ipv6Result.error
           }, null, 2),
           'utf-8'
         )
       }
-      throw new Error(t('Kill switch could not be fully disabled'))
+      
+      const errors = [
+        ipv4Result.error,
+        ipv6Result.error,
+        chainsExist.ipv4 ? 'IPv4 chain still exists' : null,
+        chainsExist.ipv6 ? 'IPv6 chain still exists' : null
+      ].filter(Boolean).join('; ')
+      
+      throw new Error(t('Kill switch could not be fully disabled: {error}', { error }))
     }
   },
 
   disableSync(): void {
     let ipv4Removed = false
     let ipv6Removed = false
+    let ipv4Exists = false
+    let ipv6Exists = false
     
+    // Try to remove chains
     ipv4Removed = removeChainSync('iptables', CHAIN)
     ipv6Removed = removeChainSync('ip6tables', CHAIN6)
     
-    // Check if chains were actually removed
-    const chainsExist = {
-      ipv4: iptablesSync(['-C', 'OUTPUT', '-j', CHAIN], 'iptables').catch(() => false),
-      ipv6: iptablesSync(['-C', 'OUTPUT', '-j', CHAIN6], 'ip6tables').catch(() => false)
+    // Check if chains still exist
+    try {
+      iptablesSync(['-C', 'OUTPUT', '-j', CHAIN], 'iptables')
+      ipv4Exists = true
+    } catch {
+      // Chain doesn't exist - this is good
+    }
+    
+    try {
+      iptablesSync(['-C', 'OUTPUT', '-j', CHAIN6], 'ip6tables')
+      ipv6Exists = true
+    } catch {
+      // Chain doesn't exist - this is good
     }
     
     // Only remove marker if both chains were successfully removed and no longer exist
-    if (ipv4Removed && ipv6Removed && !chainsExist.ipv4 && !chainsExist.ipv6) {
+    if (ipv4Removed && ipv6Removed && !ipv4Exists && !ipv6Exists) {
       rmSync(markerPath(), { force: true })
     } else {
       // Save marker for recovery if chains still exist
@@ -281,7 +332,7 @@ export const linuxKillSwitch: KillSwitchBackend = {
             ipv4: ipv4Removed, 
             ipv6: ipv6Removed, 
             cleanupFailed: true,
-            chainsStillExist: chainsExist.ipv4 || chainsExist.ipv6
+            chainsStillExist: ipv4Exists || ipv6Exists
           }, null, 2),
           'utf-8'
         )

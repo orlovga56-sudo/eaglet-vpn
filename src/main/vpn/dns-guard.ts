@@ -468,9 +468,29 @@ interface WindowsAdapter {
 function classifyWindowsMethod(adapter: WindowsAdapter): DnsMethod {
   const v4 = byFamily(adapter.v4, 4)
   const v6 = byFamily(adapter.v6, 6)
-  if (v4.length > 0 || v6.length > 0) return 'static'
-  const dhcp = /enabled/i.test(adapter.dhcp4) || /enabled/i.test(adapter.dhcp6)
-  return dhcp ? 'auto' : 'unknown'
+  
+  // If no DNS servers are configured, it's likely DHCP/auto
+  if (v4.length === 0 && v6.length === 0) {
+    return /enabled/i.test(adapter.dhcp4) || /enabled/i.test(adapter.dhcp6) ? 'auto' : 'unknown'
+  }
+  
+  // Check if DHCP is enabled for IPv4 or IPv6
+  const dhcp4Enabled = /enabled/i.test(adapter.dhcp4)
+  const dhcp6Enabled = /enabled/i.test(adapter.dhcp6)
+  
+  // If DHCP is enabled for the corresponding family and no manual DNS is set,
+  // it's likely auto-obtained DNS
+  if ((dhcp4Enabled && v4.length === 0) || (dhcp6Enabled && v6.length === 0)) {
+    return 'auto'
+  }
+  
+  // If DNS servers are manually configured, it's static
+  if (v4.length > 0 || v6.length > 0) {
+    return 'static'
+  }
+  
+  // Fallback to unknown
+  return 'unknown'
 }
 
 async function readWindowsDns(): Promise<DnsServiceBackup[]> {
@@ -548,13 +568,29 @@ async function linuxDefaultInterface(): Promise<string> {
  * entry in systemd-networkd configuration is the only reliable signal; without
  * it the addresses may come from DHCP and the link must be reverted, not frozen.
  */
-async function linuxHasStaticDns(): Promise<boolean> {
+async function linuxHasStaticDns(iface: string): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync('sh', [
+    // Check for static DNS configuration for the specific interface
+    const { stdout: networkdOutput } = await execFileAsync('sh', [
       '-c',
-      "grep -Rhs '^DNS=' /etc/systemd/network 2>/dev/null | head -n 1"
+      `find /etc/systemd/network -name '*.network' -exec grep -l "Interface=${iface}" {} \\; 2>/dev/null`
     ])
-    return stdout.trim().length > 0
+    
+    if (networkdOutput.trim()) {
+      // Check if there's a static DNS configuration for this interface
+      const networkFiles = networkdOutput.trim().split('\n')
+      for (const file of networkFiles) {
+        const { stdout: dnsConfig } = await execFileAsync('sh', [
+          '-c',
+          `grep -s '^DNS=' "${file}" 2>/dev/null`
+        ])
+        if (dnsConfig.trim()) {
+          return true
+        }
+      }
+    }
+    
+    return false
   } catch {
     return false
   }
@@ -571,13 +607,26 @@ async function readLinuxDns(): Promise<DnsServiceBackup[]> {
     .filter((value) => isIP(value) !== 0)
   const v4 = byFamily(servers, 4)
   const v6 = byFamily(servers, 6)
-  const staticConfig = await linuxHasStaticDns()
+  
+  // Check for static DNS configuration for this specific interface
+  const staticConfig = await linuxHasStaticDns(iface)
+  
+  // Determine DNS method based on configuration
+  let method: DnsMethod
+  if (v4.length === 0 && v6.length === 0) {
+    method = 'auto' // No DNS servers configured, likely DHCP
+  } else if (staticConfig) {
+    method = 'static' // Static DNS configuration found
+  } else {
+    method = 'unknown' // DNS servers configured but origin unknown
+  }
+  
   return [
     {
       name: iface,
       v4,
       v6,
-      method: v4.length === 0 && v6.length === 0 ? 'auto' : staticConfig ? 'static' : 'auto'
+      method
     }
   ]
 }
