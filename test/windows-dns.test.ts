@@ -107,7 +107,7 @@ describe('Windows DNS Classification', () => {
     expect(classifyWindowsMethod(adapter)).toBe('static')
   })
 
-  it('should handle empty DHCP strings', () => {
+  it('returns unknown when the DHCP state is missing but resolvers exist', () => {
     const adapter: WindowsAdapter = {
       index: 12,
       name: 'Ethernet',
@@ -117,7 +117,7 @@ describe('Windows DNS Classification', () => {
       dhcp6: ''
     }
     
-    expect(classifyWindowsMethod(adapter)).toBe('static')
+    expect(classifyWindowsMethod(adapter)).toBe('unknown')
   })
 
   it('should handle case-insensitive DHCP status', () => {
@@ -128,6 +128,45 @@ describe('Windows DNS Classification', () => {
       v6: [],
       dhcp4: 'enabled', // lowercase
       dhcp6: 'ENABLED' // uppercase
+    }
+    
+    expect(classifyWindowsMethod(adapter)).toBe('auto')
+  })
+
+  it('should handle IPv6 DHCP with manual IPv4', () => {
+    const adapter: WindowsAdapter = {
+      index: 12,
+      name: 'Ethernet',
+      v4: ['1.1.1.1'], // Manual IPv4
+      v6: [], // No IPv6 (DHCP-provided)
+      dhcp4: 'Disabled',
+      dhcp6: 'Enabled'
+    }
+    
+    expect(classifyWindowsMethod(adapter)).toBe('static')
+  })
+
+  it('should handle IPv4 DHCP with manual IPv6', () => {
+    const adapter: WindowsAdapter = {
+      index: 12,
+      name: 'Ethernet',
+      v4: [], // No IPv4 (DHCP-provided)
+      v6: ['2001:4860:4860::8888'], // Manual IPv6
+      dhcp4: 'Enabled',
+      dhcp6: 'Disabled'
+    }
+    
+    expect(classifyWindowsMethod(adapter)).toBe('static')
+  })
+
+  it('treats resolvers on DHCP-managed families as automatic', () => {
+    const adapter: WindowsAdapter = {
+      index: 12,
+      name: 'Ethernet',
+      v4: ['1.1.1.1'], // DHCP-managed family
+      v6: ['2001:4860:4860::8888'], // DHCP-managed family
+      dhcp4: 'Enabled',
+      dhcp6: 'Enabled'
     }
     
     expect(classifyWindowsMethod(adapter)).toBe('auto')

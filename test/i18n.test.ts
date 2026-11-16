@@ -26,12 +26,14 @@ function sourceKeys(): string[] {
   return [...keys].sort()
 }
 
-/** Find user-facing strings that might need translation */
+/**
+ * Finds strings that look user-facing but are not wrapped in `t(...)`: JSX
+ * attributes, dialogs and document titles. Technical literals, already
+ * translated text and code fragments are filtered out.
+ */
 function findUserFacingStrings(): string[] {
   const strings = new Set<string>()
   const patterns = [
-    // Regular t() calls
-    /\bt\(\s*['"]([^'"]+)['"][^)]*\)/g,
     // Direct user-facing strings (not technical identifiers)
     /(?:title|placeholder|label|text|message|error|warning|notification)\s*[:=]\s*['"]([^'"]+)['"]/gi,
     // Alert/confirm dialogs
@@ -41,41 +43,39 @@ function findUserFacingStrings(): string[] {
     // aria-labels
     /aria-label\s*=\s*['"]([^'"]+)['"]/g
   ]
-  
-  // Exclude technical strings, IPs, file paths, protocol names
-  const excludePatterns = [
-    /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/, // IP addresses
-    /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i, // UUIDs
-    /^https?:\/\/.+$/, // URLs
-    /^\/.*\.json$/i, // file paths
-    /^[a-f0-9]{64}$/i, // hashes
-    /^(TCP|UDP|HTTP|HTTPS|VLESS|VMess|Trojan|Shadowsocks|Hysteria2|TUIC|SOCKS|IPv4|IPv6|DNS|DoH|TUN|sing-box|Xray-core|Mihomo)$/i, // protocols/tech terms
-    /^[A-Z]{2,4}$/ // country codes
-  ]
-  
+
   for (const file of walk(join(process.cwd(), 'src'))) {
     const source = readFileSync(file, 'utf-8')
-    
-    // Find all t() calls
-    for (const match of source.matchAll(/\bt\(\s*['"]([^'"]+)['"][^)]*\)/g)) {
-      const key = match[1]
-      if (!excludePatterns.some(pattern => pattern.test(key))) {
-        strings.add(key)
-      }
-    }
-    
-    // Find other user-facing strings
     for (const pattern of patterns) {
       for (const match of source.matchAll(pattern)) {
         const str = match[1] || match[2]
-        if (str.length > 2 && !excludePatterns.some(pattern => pattern.test(str))) {
-          strings.add(str)
-        }
+        if (str && isTranslatable(str)) strings.add(str)
       }
     }
   }
-  
+
   return [...strings].sort()
+}
+
+/** Language labels are shown in their own language, never translated. */
+const NATIVE_LABELS = new Set(['English', 'Русский'])
+
+function isTranslatable(value: string): boolean {
+  const str = value.trim()
+  if (str.length <= 3) return false
+  if (NATIVE_LABELS.has(str)) return false
+  // Already translated, all caps, template variables, numbers and code.
+  if (/[\u0400-\u04FF]/.test(str)) return false
+  if (/^[A-Z\s]+$/.test(str)) return false
+  if (str.includes('{') || str.includes('$_') || str.includes('}')) return false
+  if (/^https?:/.test(str)) return false
+  if (!/[A-Za-z]{2}/.test(str)) return false
+  // IPs, UUIDs, hashes, file paths, protocol identifiers.
+  if (/^[0-9.]+$/.test(str)) return false
+  if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(str)) return false
+  if (/^[a-f0-9]{64}$/i.test(str)) return false
+  if (/^\/.*\.json$/i.test(str)) return false
+  return true
 }
 
 describe('interface language', () => {

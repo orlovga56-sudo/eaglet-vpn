@@ -1,178 +1,125 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { linuxHasStaticDns } from '../src/main/vpn/dns-guard'
+import { describe, expect, it } from 'vitest'
+import {
+  hasStaticDnsInNetworkd,
+  staticDnsInNetworkFile,
+  type NetworkdReader
+} from '../src/main/vpn/dns-guard'
 
-describe('Linux DNS Classification', () => {
-  let testDir: string
+/** Builds a reader over an in-memory set of `.network` files. */
+function reader(files: Record<string, string>): NetworkdReader {
+  return {
+    list: () => Object.keys(files),
+    read: (path) => files[path] ?? ''
+  }
+}
 
-  beforeEach(() => {
-    testDir = join(process.cwd(), 'test-systemd-network')
-    if (!existsSync(testDir)) {
-      require('fs').mkdirSync(testDir, { recursive: true })
-    }
-  })
-
-  afterEach(() => {
-    if (existsSync(testDir)) {
-      require('fs').rmSync(testDir, { recursive: true, force: true })
-    }
-  })
-
-  it('should detect static DNS configuration', async () => {
-    // Create a network file with static DNS
-    const networkFile = join(testDir, 'static-dns.network')
-    writeFileSync(networkFile, `[Match]
+describe('staticDnsInNetworkFile', () => {
+  it('reports static DNS for a matching interface', () => {
+    const content = `[Match]
 Name=eth0
 
 [Network]
 DNS=8.8.8.8
 Gateway=192.168.1.1
-`)
-
-    // Mock execFile to return our test directory
-    const originalExecFile = global.execFile
-    global.execFile = async (command: string, args: string[], options: any) => {
-      if (command === 'sh' && args[0] === '-c') {
-        const cmd = args[1]
-        if (cmd.includes('find /etc/systemd/network')) {
-          return { stdout: networkFile, stderr: '', status: 0 }
-        }
-        if (cmd.includes('grep -s')) {
-          return { stdout: 'DNS=8.8.8.8', stderr: '', status: 0 }
-        }
-      }
-      return originalExecFile(command, args, options)
-    }
-
-    try {
-      const result = await linuxHasStaticDns('eth0')
-      expect(result).toBe(true)
-    } finally {
-      global.execFile = originalExecFile
-    }
+`
+    expect(staticDnsInNetworkFile(content, 'eth0')).toBe(true)
   })
 
-  it('should not detect static DNS when no DNS is configured', async () => {
-    // Create a network file without DNS
-    const networkFile = join(testDir, 'no-dns.network')
-    writeFileSync(networkFile, `[Match]
-Name=eth0
-
-[Network]
-Gateway=192.168.1.1
-`)
-
-    // Mock execFile to return our test directory
-    const originalExecFile = global.execFile
-    global.execFile = async (command: string, args: string[], options: any) => {
-      if (command === 'sh' && args[0] === '-c') {
-        const cmd = args[1]
-        if (cmd.includes('find /etc/systemd/network')) {
-          return { stdout: networkFile, stderr: '', status: 0 }
-        }
-        if (cmd.includes('grep -s')) {
-          return { stdout: '', stderr: '', status: 0 }
-        }
-      }
-      return originalExecFile(command, args, options)
-    }
-
-    try {
-      const result = await linuxHasStaticDns('eth0')
-      expect(result).toBe(false)
-    } finally {
-      global.execFile = originalExecFile
-    }
-  })
-
-  it('should handle missing network files', async () => {
-    // Mock execFile to simulate no network files found
-    const originalExecFile = global.execFile
-    global.execFile = async (command: string, args: string[], options: any) => {
-      if (command === 'sh' && args[0] === '-c') {
-        const cmd = args[1]
-        if (cmd.includes('find /etc/systemd/network')) {
-          return { stdout: '', stderr: '', status: 0 }
-        }
-      }
-      return originalExecFile(command, args, options)
-    }
-
-    try {
-      const result = await linuxHasStaticDns('eth0')
-      expect(result).toBe(false)
-    } finally {
-      global.execFile = originalExecFile
-    }
-  })
-
-  it('should handle file system errors gracefully', async () => {
-    // Mock execFile to simulate an error
-    const originalExecFile = global.execFile
-    global.execFile = async (command: string, args: string[], options: any) => {
-      if (command === 'sh' && args[0] === '-c') {
-        const cmd = args[1]
-        if (cmd.includes('find /etc/systemd/network')) {
-          throw new Error('File system error')
-        }
-      }
-      return originalExecFile(command, args, options)
-    }
-
-    try {
-      const result = await linuxHasStaticDns('eth0')
-      expect(result).toBe(false)
-    } finally {
-      global.execFile = originalExecFile
-    }
-  })
-
-  it('should detect static DNS in multiple network files', async () => {
-    // Create multiple network files
-    const file1 = join(testDir, 'eth0.network')
-    writeFileSync(file1, `[Match]
-Name=eth0
-
-[Network]
-Gateway=192.168.1.1
-`)
-
-    const file2 = join(testDir, 'static.network')
-    writeFileSync(file2, `[Match]
+  it('ignores a file that matches another interface', () => {
+    const content = `[Match]
 Name=eth1
 
 [Network]
 DNS=8.8.8.8
-Gateway=192.168.1.2
-`)
+`
+    expect(staticDnsInNetworkFile(content, 'eth0')).toBe(false)
+  })
 
-    // Mock execFile to return our test directory
-    const originalExecFile = global.execFile
-    global.execFile = async (command: string, args: string[], options: any) => {
-      if (command === 'sh' && args[0] === '-c') {
-        const cmd = args[1]
-        if (cmd.includes('find /etc/systemd/network')) {
-          return { stdout: `${file1}\n${file2}`, stderr: '', status: 0 }
-        }
-        if (cmd.includes('grep -s')) {
-          const grepCmd = args[1]
-          if (grepCmd.includes(file1)) {
-            return { stdout: '', stderr: '', status: 0 }
-          }
-          if (grepCmd.includes(file2)) {
-            return { stdout: 'DNS=8.8.8.8', stderr: '', status: 0 }
-          }
-        }
-      }
-      return originalExecFile(command, args, options)
-    }
+  it('treats DHCP-only configuration as not static', () => {
+    const content = `[Match]
+Name=eth0
 
-    try {
-      const result = await linuxHasStaticDns('eth0')
-      expect(result).toBe(false) // eth0 doesn't have static DNS
-    } finally {
-      global.execFile = originalExecFile
+[Network]
+DHCP=yes
+`
+    expect(staticDnsInNetworkFile(content, 'eth0')).toBe(false)
+  })
+
+  it('treats DHCP with an explicit DNS= as static', () => {
+    const content = `[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+DNS=1.1.1.1
+`
+    expect(staticDnsInNetworkFile(content, 'eth0')).toBe(true)
+  })
+
+  it('does not treat an empty DNS= entry as static', () => {
+    const content = `[Match]
+Name=eth0
+
+[Network]
+DNS=
+`
+    expect(staticDnsInNetworkFile(content, 'eth0')).toBe(false)
+  })
+
+  it('requires the interface to be declared in the Match section', () => {
+    const content = `[Match]
+Name=eth0
+
+[Network]
+Gateway=192.168.1.1
+
+[DHCPv4]
+UseDNS=true
+`
+    expect(staticDnsInNetworkFile(content, 'eth0')).toBe(false)
+  })
+
+  it('supports glob patterns in Name=', () => {
+    const content = `[Match]
+Name=en*
+
+[Network]
+DNS=9.9.9.9
+`
+    expect(staticDnsInNetworkFile(content, 'enp3s0')).toBe(true)
+    expect(staticDnsInNetworkFile(content, 'wl0')).toBe(false)
+  })
+})
+
+describe('hasStaticDnsInNetworkd', () => {
+  it('finds the interface across several files', () => {
+    const files = {
+      '/etc/systemd/network/10-eth0.network': `[Match]
+Name=eth0
+
+[Network]
+Gateway=192.168.1.1
+`,
+      '/etc/systemd/network/20-static.network': `[Match]
+Name=eth1
+
+[Network]
+DNS=8.8.8.8
+`
     }
+    expect(hasStaticDnsInNetworkd('eth0', reader(files))).toBe(false)
+    expect(hasStaticDnsInNetworkd('eth1', reader(files))).toBe(true)
+  })
+
+  it('returns false when no network files are present', () => {
+    expect(hasStaticDnsInNetworkd('eth0', reader({}))).toBe(false)
+  })
+
+  it('returns false when a file cannot be read', () => {
+    const unreadable: NetworkdReader = {
+      list: () => ['/etc/systemd/network/broken.network'],
+      read: () => ''
+    }
+    expect(hasStaticDnsInNetworkd('eth0', unreadable)).toBe(false)
   })
 })

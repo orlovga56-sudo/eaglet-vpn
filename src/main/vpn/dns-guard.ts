@@ -62,7 +62,7 @@ let state: DnsGuardState | null = null
 /** Last restore failure, surfaced by diagnostics and the UI. */
 let restoreFailure: string | null = null
 
-function backupPath(): string {
+export function backupPath(): string {
   return join(app.getPath('userData'), 'dns-backup.json')
 }
 
@@ -456,7 +456,7 @@ foreach ($adapter in @(Get-NetAdapter -Physical)) {
 $items | ConvertTo-Json -Depth 4 -Compress
 `
 
-interface WindowsAdapter {
+export interface WindowsAdapter {
   index: number
   name: string
   v4: string[]
@@ -465,32 +465,46 @@ interface WindowsAdapter {
   dhcp6: string
 }
 
-function classifyWindowsMethod(adapter: WindowsAdapter): DnsMethod {
+type DhcpState = 'enabled' | 'disabled' | 'unknown'
+
+/** `Get-NetIPInterface` reports DHCP as Enabled/Disabled strings. */
+function dhcpState(value: string): DhcpState {
+  const text = String(value ?? '').trim()
+  if (/^(enabled|true|yes|1)$/i.test(text)) return 'enabled'
+  if (/^(disabled|false|no|0)$/i.test(text)) return 'disabled'
+  return 'unknown'
+}
+
+/**
+ * Classifies how Windows obtained its resolvers.
+ *
+ * `Get-DnsClientServerAddress` returns addresses without their origin, so the
+ * per-family DHCP flag is the only signal. A family with a resolver but DHCP
+ * disabled was configured by hand; a family with DHCP enabled may have received
+ * its resolver from the lease, and only a completely missing flag forces
+ * `unknown`.
+ */
+export function classifyWindowsMethod(adapter: WindowsAdapter): DnsMethod {
   const v4 = byFamily(adapter.v4, 4)
   const v6 = byFamily(adapter.v6, 6)
-  
-  // If no DNS servers are configured, it's likely DHCP/auto
+
   if (v4.length === 0 && v6.length === 0) {
-    return /enabled/i.test(adapter.dhcp4) || /enabled/i.test(adapter.dhcp6) ? 'auto' : 'unknown'
+    return dhcpState(adapter.dhcp4) === 'enabled' || dhcpState(adapter.dhcp6) === 'enabled'
+      ? 'auto'
+      : 'unknown'
   }
-  
-  // Check if DHCP is enabled for IPv4 or IPv6
-  const dhcp4Enabled = /enabled/i.test(adapter.dhcp4)
-  const dhcp6Enabled = /enabled/i.test(adapter.dhcp6)
-  
-  // If DHCP is enabled for the corresponding family and no manual DNS is set,
-  // it's likely auto-obtained DNS
-  if ((dhcp4Enabled && v4.length === 0) || (dhcp6Enabled && v6.length === 0)) {
-    return 'auto'
-  }
-  
-  // If DNS servers are manually configured, it's static
-  if (v4.length > 0 || v6.length > 0) {
-    return 'static'
-  }
-  
-  // Fallback to unknown
-  return 'unknown'
+
+  const families = [
+    { dhcp: dhcpState(adapter.dhcp4), hasServers: v4.length > 0 },
+    { dhcp: dhcpState(adapter.dhcp6), hasServers: v6.length > 0 }
+  ].filter((family) => family.hasServers)
+
+  // An explicit resolver on a manually configured family is static DNS.
+  if (families.some((family) => family.dhcp === 'disabled')) return 'static'
+  // Without a DHCP flag the origin cannot be trusted either way.
+  if (families.some((family) => family.dhcp === 'unknown')) return 'unknown'
+  // Every resolver belongs to a DHCP-managed family: most likely leased.
+  return 'auto'
 }
 
 async function readWindowsDns(): Promise<DnsServiceBackup[]> {
@@ -563,37 +577,121 @@ async function linuxDefaultInterface(): Promise<string> {
   return iface
 }
 
+function linuxDefaultInterfaceSync(): string {
+  const stdout = execFileSync('sh', ['-c', "ip route show default | awk '{print $5; exit}'"], { encoding: 'utf8' })
+  const iface = stdout.trim()
+  if (!iface) throw new Error(t('Could not determine the default network interface'))
+  return iface
+}
+
+/**
+ * Parses a single systemd-networkd `.network` file and reports whether it
+ * applies to `iface` and pins an explicit `DNS=` server. A file that only sets
+ * `DHCP=yes` leaves resolvers under DHCP control and must not be treated as
+ * static configuration.
+ */
+export function staticDnsInNetworkFile(content: string, iface: string): boolean {
+  let section = ''
+  let matchesInterface = false
+  let hasExplicitDns = false
+
+  for (const raw of content.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+
+    const header = line.match(/^\[(.+)\]$/)
+    if (header) {
+      section = header[1].trim().toLowerCase()
+      continue
+    }
+
+    if (section === 'match') {
+      const match = line.match(/^Name\s*=\s*(.+)$/i)
+      if (match) {
+        for (const pattern of match[1].trim().split(/\s+/)) {
+          if (networkdPatternMatches(pattern, iface)) matchesInterface = true
+        }
+      }
+      continue
+    }
+
+    if (section === 'network' && /^DNS\s*=/i.test(line)) {
+      const value = line.slice(line.indexOf('=') + 1).trim()
+      if (value) hasExplicitDns = true
+    }
+  }
+
+  return matchesInterface && hasExplicitDns
+}
+
+/** systemd-networkd accepts shell-style globs in `[Match] Name=`. */
+function networkdPatternMatches(pattern: string, iface: string): boolean {
+  if (pattern === iface) return true
+  if (!pattern.includes('*') && !pattern.includes('?') && !pattern.includes('[')) return false
+  const escaped = pattern.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')
+  try {
+    return new RegExp(`^${escaped}$`).test(iface)
+  } catch {
+    return false
+  }
+}
+
+export interface NetworkdReader {
+  /** Returns the paths of the `.network` files systemd-networkd would load. */
+  list(): string[]
+  /** Returns the file contents, or an empty string when it cannot be read. */
+  read(path: string): string
+}
+
+/**
+ * Decides whether `iface` has an explicitly configured resolver.
+ * The reader is injected so the classification can be tested without root.
+ */
+export function hasStaticDnsInNetworkd(iface: string, reader: NetworkdReader): boolean {
+  for (const file of reader.list()) {
+    if (staticDnsInNetworkFile(reader.read(file), iface)) return true
+  }
+  return false
+}
+
+function systemNetworkdReader(): NetworkdReader {
+  return {
+    list: () => {
+      try {
+        const stdout = execFileSync(
+          'find',
+          ['/etc/systemd/network', '-maxdepth', '1', '-type', 'f', '-name', '*.network'],
+          { encoding: 'utf8' }
+        )
+        return stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+      } catch {
+        return []
+      }
+    },
+    read: (path) => {
+      try {
+        return readFileSync(path, 'utf8')
+      } catch {
+        return ''
+      }
+    }
+  }
+}
+
 /**
  * systemd-resolved does not expose where a resolver came from. A static DNS=
  * entry in systemd-networkd configuration is the only reliable signal; without
  * it the addresses may come from DHCP and the link must be reverted, not frozen.
  */
-async function linuxHasStaticDns(iface: string): Promise<boolean> {
-  try {
-    // Check for static DNS configuration for the specific interface
-    const { stdout: networkdOutput } = await execFileAsync('sh', [
-      '-c',
-      `find /etc/systemd/network -name '*.network' -exec grep -l "Interface=${iface}" {} \\; 2>/dev/null`
-    ])
-    
-    if (networkdOutput.trim()) {
-      // Check if there's a static DNS configuration for this interface
-      const networkFiles = networkdOutput.trim().split('\n')
-      for (const file of networkFiles) {
-        const { stdout: dnsConfig } = await execFileAsync('sh', [
-          '-c',
-          `grep -s '^DNS=' "${file}" 2>/dev/null`
-        ])
-        if (dnsConfig.trim()) {
-          return true
-        }
-      }
-    }
-    
-    return false
-  } catch {
-    return false
-  }
+export async function linuxHasStaticDns(iface: string): Promise<boolean> {
+  return hasStaticDnsInNetworkd(iface, systemNetworkdReader())
+}
+
+export function linuxHasStaticDnsSync(iface: string): boolean {
+  return hasStaticDnsInNetworkd(iface, systemNetworkdReader())
 }
 
 async function readLinuxDns(): Promise<DnsServiceBackup[]> {
@@ -631,6 +729,114 @@ async function readLinuxDns(): Promise<DnsServiceBackup[]> {
   ]
 }
 
+function readLinuxDnsSync(): DnsServiceBackup[] {
+  const iface = linuxDefaultInterfaceSync()
+  let current: string
+  try {
+    current = execFileSync('resolvectl', ['dns', iface], { encoding: 'utf8' })
+  } catch {
+    current = ''
+  }
+  
+  const servers = current
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.includes(':') || line.includes('.'))
+    .flatMap((line) => line.split(/\s+/).slice(1))
+    .filter((value) => isIP(value) !== 0)
+  const v4 = byFamily(servers, 4)
+  const v6 = byFamily(servers, 6)
+  
+  // Check for static DNS configuration for this specific interface
+  const staticConfig = linuxHasStaticDnsSync(iface)
+  
+  // Determine DNS method based on configuration
+  let method: DnsMethod
+  if (v4.length === 0 && v6.length === 0) {
+    method = 'auto' // No DNS servers configured, likely DHCP
+  } else if (staticConfig) {
+    method = 'static' // Static DNS configuration found
+  } else {
+    method = 'unknown' // DNS servers configured but origin unknown
+  }
+  
+  return [
+    {
+      name: iface,
+      v4,
+      v6,
+      method
+    }
+  ]
+}
+
+function readWindowsDnsSync(): DnsServiceBackup[] {
+  const stdout = execFileSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', WINDOWS_READ],
+    { encoding: 'utf8', windowsHide: true }
+  ).trim()
+  if (!stdout) throw new Error(t('PowerShell returned no adapter information'))
+  const parsed = JSON.parse(stdout) as WindowsAdapter | WindowsAdapter[]
+  const adapters = Array.isArray(parsed) ? parsed : [parsed]
+  const services = adapters
+    .filter((adapter) => adapter && Number.isFinite(Number(adapter.index)))
+    .map<DnsServiceBackup>((adapter) => ({
+      name: String(adapter.name ?? adapter.index),
+      index: Number(adapter.index),
+      v4: byFamily(Array.isArray(adapter.v4) ? adapter.v4 : [], 4),
+      v6: byFamily(Array.isArray(adapter.v6) ? adapter.v6 : [], 6),
+      method: classifyWindowsMethod(adapter)
+    }))
+  if (services.length === 0) throw new Error(t('No active network adapter was found'))
+  return services
+}
+
+function readMacDnsSync(): DnsServiceBackup[] {
+  const stdout = execFileSync('networksetup', ['-listallnetworkservices'], { encoding: 'utf8' })
+  const services = stdout
+    .split(/\r?\n/)
+    .map((line: string) => line.trim())
+    .filter((line: string) => line && !line.startsWith('*') && !line.includes('An asterisk'))
+  
+  const result: DnsServiceBackup[] = []
+  
+  for (const name of services) {
+    const current = execFileSync(
+      'networksetup',
+      ['-getdnsservers', name],
+      { encoding: 'utf8' }
+    ).trim()
+    
+    if (current.includes('There aren')) {
+      continue // No DNS servers configured
+    }
+    
+    const servers = current
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => isIP(line) !== 0)
+    
+    if (servers.length === 0) continue
+    
+    const v4 = byFamily(servers, 4)
+    const v6 = byFamily(servers, 6)
+    
+    // Check if DNS is manually configured or automatic
+    const method = v4.length > 0 || v6.length > 0 ? 'static' : 'auto'
+    
+    result.push({
+      name,
+      v4,
+      v6,
+      method
+    })
+  }
+  
+  if (result.length === 0) throw new Error(t('No active network service was found'))
+  return result
+}
+
 async function applyLinuxDns(services: DnsServiceBackup[], ipv6: boolean): Promise<void> {
   for (const service of services) {
     const addresses = ipv6 && byFamily(service.v6, 6).length > 0 ? ['127.0.0.1', '::1'] : ['127.0.0.1']
@@ -643,6 +849,13 @@ async function readCurrentDns(): Promise<DnsServiceBackup[]> {
   if (process.platform === 'win32') return readWindowsDns()
   if (process.platform === 'darwin') return readMacDns()
   if (process.platform === 'linux') return readLinuxDns()
+  throw new Error(t('DNS protection is not implemented on this platform'))
+}
+
+function readCurrentDnsSync(): DnsServiceBackup[] {
+  if (process.platform === 'win32') return readWindowsDnsSync()
+  if (process.platform === 'darwin') return readMacDnsSync()
+  if (process.platform === 'linux') return readLinuxDnsSync()
   throw new Error(t('DNS protection is not implemented on this platform'))
 }
 
@@ -738,7 +951,7 @@ export async function restoreSystemDns(): Promise<DnsRestoreReport> {
   return { restored: targets.map((service) => service.name), skipped, mismatches }
 }
 
-function restoreSystemDnsSync(): void {
+export function restoreSystemDnsSync(): void {
   if (!existsSync(backupPath())) return
   const backup = readBackup()
   if (backup.platform !== process.platform) {
@@ -747,7 +960,7 @@ function restoreSystemDnsSync(): void {
   }
   
   let restoreSuccess = false
-  let currentDnsAfterRestore: DnsServiceBackup[] | null = null
+  const _currentDnsAfterRestore: DnsServiceBackup[] | null = null
   
   try {
     if (backup.platform === 'win32') {
@@ -774,12 +987,12 @@ function restoreSystemDnsSync(): void {
     }
     
     // Read actual DNS settings after restoration
-    currentDnsAfterRestore = readCurrentDns()
+    const restoredDns = readCurrentDnsSync()
     
     // Verify restoration
     let allRestored = true
     for (const service of backup.services) {
-      const live = currentDnsAfterRestore.find((item) =>
+      const live = restoredDns.find((item) =>
         item.index !== undefined && service.index !== undefined ? item.index === service.index : item.name === service.name
       )
       if (!live || userChangedDns(service, live)) {

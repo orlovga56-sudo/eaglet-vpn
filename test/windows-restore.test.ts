@@ -233,7 +233,7 @@ describe('windows firewall backup/restore', () => {
     store.files.set(path, JSON.stringify(backup({ Public: 'Allow' })))
     runner.stuck.add('Public')
 
-    backend(runner, store).disableSync()
+    expect(() => backend(runner, store).disableSync()).toThrow()
     expect(store.exists(path)).toBe(true)
   })
 
@@ -259,7 +259,7 @@ describe('windows firewall backup/restore', () => {
     runner.rules = 1
     runner.stuckRules = true
 
-    backend(runner, store).disableSync()
+    expect(() => backend(runner, store).disableSync()).toThrow()
     expect(store.exists(path)).toBe(true)
   })
 })
