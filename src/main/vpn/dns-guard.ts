@@ -1,7 +1,7 @@
 ﻿import { app } from 'electron'
 import { execFile, execFileSync } from 'node:child_process'
 import { createSocket, type Socket as UdpSocket } from 'node:dgram'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { request as httpsRequest } from 'node:https'
 import { createServer, isIP, type Server as TcpServer } from 'node:net'
 import { lookup } from 'node:dns/promises'
@@ -447,11 +447,31 @@ $items = @()
 foreach ($adapter in @(Get-NetAdapter -Physical)) {
   if ($adapter.Status -ne 'Up') { continue }
   $idx = $adapter.ifIndex
+  $guid = $adapter.InterfaceGuid
   $v4 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
   $v6 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
   $ip4 = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop
   $ip6 = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction Stop
-  $items += [pscustomobject]@{ index = $idx; name = $adapter.Name; v4 = $v4; v6 = $v6; dhcp4 = [string]$ip4.Dhcp; dhcp6 = [string]$ip6.Dhcp }
+  # The registry keeps the manual (NameServer) and lease-provided (DhcpNameServer)
+  # resolvers apart, which the cmdlets do not expose.
+  $tcpip = Get-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$guid" -ErrorAction SilentlyContinue
+  $tcpip6 = Get-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\Interfaces\\$guid" -ErrorAction SilentlyContinue
+  $manual4 = @(([string]$tcpip.NameServer) -split '[,;\\s]+' | Where-Object { $_ })
+  $leased4 = @(([string]$tcpip.DhcpNameServer) -split '[,;\\s]+' | Where-Object { $_ })
+  $manual6 = @(([string]$tcpip6.NameServer) -split '[,;\\s]+' | Where-Object { $_ })
+  $leased6 = @(([string]$tcpip6.DhcpNameServer) -split '[,;\\s]+' | Where-Object { $_ })
+  $items += [pscustomobject]@{
+    index = $idx
+    name = $adapter.Name
+    v4 = $v4
+    v6 = $v6
+    dhcp4 = [string]$ip4.Dhcp
+    dhcp6 = [string]$ip6.Dhcp
+    manual4 = $manual4
+    manual6 = $manual6
+    leased4 = $leased4
+    leased6 = $leased6
+  }
 }
 $items | ConvertTo-Json -Depth 4 -Compress
 `
@@ -463,9 +483,16 @@ export interface WindowsAdapter {
   v6: string[]
   dhcp4: string
   dhcp6: string
+  /** Manually configured resolvers (`NameServer`), empty when unset. */
+  manual4?: string[]
+  manual6?: string[]
+  /** Resolvers from the last DHCP lease (`DhcpNameServer`). */
+  leased4?: string[]
+  leased6?: string[]
 }
 
 type DhcpState = 'enabled' | 'disabled' | 'unknown'
+type FamilyDns = 'static' | 'auto' | 'unknown'
 
 /** `Get-NetIPInterface` reports DHCP as Enabled/Disabled strings. */
 function dhcpState(value: string): DhcpState {
@@ -476,17 +503,36 @@ function dhcpState(value: string): DhcpState {
 }
 
 /**
- * Classifies how Windows obtained its resolvers.
+ * Classifies one address family. DHCP being enabled for IP says nothing about
+ * DNS: Windows keeps the manual resolvers (`NameServer`) and the lease-provided
+ * ones (`DhcpNameServer`) in separate registry values, and only an exact match
+ * with the lease proves the resolver came from DHCP.
+ */
+function classifyWindowsFamily(
+  servers: string[],
+  manual: string[] | undefined,
+  leased: string[] | undefined,
+  dhcp: DhcpState
+): FamilyDns {
+  if (servers.length === 0) {
+    // No resolver for this family: DHCP provides none, or nothing is set.
+    return dhcp === 'enabled' ? 'auto' : 'unknown'
+  }
+  if (manual && manual.length > 0) return 'static'
+  if (leased && leased.length > 0 && sameSet(servers, leased)) return 'auto'
+  return 'unknown'
+}
+
+/**
+ * Classifies how Windows obtained its resolvers, per family.
  *
- * `Get-DnsClientServerAddress` returns addresses without their origin, so the
- * per-family DHCP flag is the only signal. A family with a resolver but DHCP
- * disabled was configured by hand; a family with DHCP enabled may have received
- * its resolver from the lease, and only a completely missing flag forces
- * `unknown`.
+ * `static` requires every family with resolvers to be manually configured and
+ * `auto` requires every one of them to match the DHCP lease. A mixed or
+ * unprovable origin stays `unknown` so the restore path never guesses.
  */
 export function classifyWindowsMethod(adapter: WindowsAdapter): DnsMethod {
-  const v4 = byFamily(adapter.v4, 4)
-  const v6 = byFamily(adapter.v6, 6)
+  const v4 = byFamily(adapter.v4 ?? [], 4)
+  const v6 = byFamily(adapter.v6 ?? [], 6)
 
   if (v4.length === 0 && v6.length === 0) {
     return dhcpState(adapter.dhcp4) === 'enabled' || dhcpState(adapter.dhcp6) === 'enabled'
@@ -494,17 +540,60 @@ export function classifyWindowsMethod(adapter: WindowsAdapter): DnsMethod {
       : 'unknown'
   }
 
-  const families = [
-    { dhcp: dhcpState(adapter.dhcp4), hasServers: v4.length > 0 },
-    { dhcp: dhcpState(adapter.dhcp6), hasServers: v6.length > 0 }
-  ].filter((family) => family.hasServers)
+  const families: FamilyDns[] = []
+  if (v4.length > 0) {
+    families.push(
+      classifyWindowsFamily(
+        v4,
+        byFamily(adapter.manual4 ?? [], 4),
+        byFamily(adapter.leased4 ?? [], 4),
+        dhcpState(adapter.dhcp4)
+      )
+    )
+  }
+  if (v6.length > 0) {
+    families.push(
+      classifyWindowsFamily(
+        v6,
+        byFamily(adapter.manual6 ?? [], 6),
+        byFamily(adapter.leased6 ?? [], 6),
+        dhcpState(adapter.dhcp6)
+      )
+    )
+  }
 
-  // An explicit resolver on a manually configured family is static DNS.
-  if (families.some((family) => family.dhcp === 'disabled')) return 'static'
-  // Without a DHCP flag the origin cannot be trusted either way.
-  if (families.some((family) => family.dhcp === 'unknown')) return 'unknown'
-  // Every resolver belongs to a DHCP-managed family: most likely leased.
-  return 'auto'
+  if (families.every((family) => family === 'static')) return 'static'
+  if (families.every((family) => family === 'auto')) return 'auto'
+  return 'unknown'
+}
+
+/** Resolver lists can arrive as arrays or as a single PowerShell string. */
+function resolverList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean)
+  if (typeof value === 'string') return value.split(/[,;\s]+/).filter(Boolean)
+  return []
+}
+
+function adapterToService(adapter: WindowsAdapter): DnsServiceBackup {
+  const normalized: WindowsAdapter = {
+    index: Number(adapter.index),
+    name: String(adapter.name ?? adapter.index),
+    v4: byFamily(resolverList(adapter.v4), 4),
+    v6: byFamily(resolverList(adapter.v6), 6),
+    dhcp4: String(adapter.dhcp4 ?? ''),
+    dhcp6: String(adapter.dhcp6 ?? ''),
+    manual4: byFamily(resolverList(adapter.manual4), 4),
+    manual6: byFamily(resolverList(adapter.manual6), 6),
+    leased4: byFamily(resolverList(adapter.leased4), 4),
+    leased6: byFamily(resolverList(adapter.leased6), 6)
+  }
+  return {
+    name: normalized.name,
+    index: normalized.index,
+    v4: normalized.v4,
+    v6: normalized.v6,
+    method: classifyWindowsMethod(normalized)
+  }
 }
 
 async function readWindowsDns(): Promise<DnsServiceBackup[]> {
@@ -514,13 +603,7 @@ async function readWindowsDns(): Promise<DnsServiceBackup[]> {
   const adapters = Array.isArray(parsed) ? parsed : [parsed]
   const services = adapters
     .filter((adapter) => adapter && Number.isFinite(Number(adapter.index)))
-    .map<DnsServiceBackup>((adapter) => ({
-      name: String(adapter.name ?? adapter.index),
-      index: Number(adapter.index),
-      v4: byFamily(Array.isArray(adapter.v4) ? adapter.v4 : [], 4),
-      v6: byFamily(Array.isArray(adapter.v6) ? adapter.v6 : [], 6),
-      method: classifyWindowsMethod(adapter)
-    }))
+    .map(adapterToService)
   if (services.length === 0) throw new Error(t('No active network adapter was found'))
   return services
 }
@@ -584,16 +667,54 @@ function linuxDefaultInterfaceSync(): string {
   return iface
 }
 
+/** Directories systemd-networkd reads, highest priority first. */
+export const NETWORKD_DIRECTORIES = ['/etc/systemd/network', '/run/systemd/network', '/usr/lib/systemd/network']
+
+function baseName(value: string): string {
+  const normalized = value.replace(/\\/g, '/')
+  return normalized.slice(normalized.lastIndexOf('/') + 1)
+}
+
 /**
- * Parses a single systemd-networkd `.network` file and reports whether it
- * applies to `iface` and pins an explicit `DNS=` server. A file that only sets
- * `DHCP=yes` leaves resolvers under DHCP control and must not be treated as
- * static configuration.
+ * Applies the systemd-networkd precedence rules: a file in /etc replaces a file
+ * with the same name in /run, which replaces the one in /usr/lib. The remaining
+ * files are sorted by name, which is the order networkd evaluates them in.
  */
-export function staticDnsInNetworkFile(content: string, iface: string): boolean {
+export function effectiveNetworkdFiles(
+  paths: string[],
+  directories: string[] = NETWORKD_DIRECTORIES
+): string[] {
+  const priority = new Map(directories.map((dir, index) => [dir, index]))
+  const chosen = new Map<string, { path: string; priority: number }>()
+
+  for (const value of paths) {
+    const path = value.replace(/\\/g, '/')
+    const directory = directories.find((candidate) => path.startsWith(`${candidate}/`))
+    if (!directory) continue
+    const name = baseName(path)
+    if (!name.endsWith('.network')) continue
+    const rank = priority.get(directory) ?? Number.MAX_SAFE_INTEGER
+    const current = chosen.get(name)
+    if (!current || rank < current.priority) chosen.set(name, { path, priority: rank })
+  }
+
+  return [...chosen.entries()]
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([, entry]) => entry.path)
+}
+
+interface NetworkFileFacts {
+  matches: boolean
+  hasDns: boolean
+  dhcp: boolean
+}
+
+/** Parses the facts of one `.network` file that matter for DNS origin. */
+function networkFileFacts(content: string, iface: string): NetworkFileFacts {
   let section = ''
-  let matchesInterface = false
-  let hasExplicitDns = false
+  let matches = false
+  let hasDns = false
+  let dhcp = false
 
   for (const raw of content.split(/\r?\n/)) {
     const line = raw.trim()
@@ -609,19 +730,36 @@ export function staticDnsInNetworkFile(content: string, iface: string): boolean 
       const match = line.match(/^Name\s*=\s*(.+)$/i)
       if (match) {
         for (const pattern of match[1].trim().split(/\s+/)) {
-          if (networkdPatternMatches(pattern, iface)) matchesInterface = true
+          if (networkdPatternMatches(pattern, iface)) matches = true
         }
       }
       continue
     }
 
-    if (section === 'network' && /^DNS\s*=/i.test(line)) {
-      const value = line.slice(line.indexOf('=') + 1).trim()
-      if (value) hasExplicitDns = true
+    if (section !== 'network') continue
+
+    if (/^DNS\s*=/i.test(line)) {
+      if (line.slice(line.indexOf('=') + 1).trim()) hasDns = true
+      continue
+    }
+    if (/^DHCP\s*=/i.test(line)) {
+      const value = line.slice(line.indexOf('=') + 1).trim().toLowerCase()
+      if (/^(yes|true|ipv4|ipv6|on)$/.test(value)) dhcp = true
     }
   }
 
-  return matchesInterface && hasExplicitDns
+  return { matches, hasDns, dhcp }
+}
+
+/**
+ * Parses a single systemd-networkd `.network` file and reports whether it
+ * applies to `iface` and pins an explicit `DNS=` server. A file that only sets
+ * `DHCP=yes` leaves resolvers under DHCP control and must not be treated as
+ * static configuration.
+ */
+export function staticDnsInNetworkFile(content: string, iface: string): boolean {
+  const facts = networkFileFacts(content, iface)
+  return facts.matches && facts.hasDns
 }
 
 /** systemd-networkd accepts shell-style globs in `[Match] Name=`. */
@@ -639,135 +777,141 @@ function networkdPatternMatches(pattern: string, iface: string): boolean {
 export interface NetworkdReader {
   /** Returns the paths of the `.network` files systemd-networkd would load. */
   list(): string[]
-  /** Returns the file contents, or an empty string when it cannot be read. */
-  read(path: string): string
+  /** Returns the file contents, or `null` when the file cannot be read. */
+  read(path: string): string | null
 }
 
 /**
- * Decides whether `iface` has an explicitly configured resolver.
- * The reader is injected so the classification can be tested without root.
+ * Decides where networkd gets the resolvers for `iface`. The reader is
+ * injected so the classification can be tested without root.
+ *
+ * Only the first matching file applies. An unreadable file in front of a match
+ * makes the answer `unknown`: it may be the file that actually applies, so its
+ * contents cannot be guessed from the others.
  */
-export function hasStaticDnsInNetworkd(iface: string, reader: NetworkdReader): boolean {
-  for (const file of reader.list()) {
-    if (staticDnsInNetworkFile(reader.read(file), iface)) return true
+export function classifyNetworkdDns(iface: string, reader: NetworkdReader): DnsMethod {
+  let paths: string[]
+  try {
+    paths = reader.list()
+  } catch {
+    return 'unknown'
   }
-  return false
+
+  for (const file of effectiveNetworkdFiles(paths)) {
+    const content = reader.read(file)
+    if (content === null) return 'unknown'
+    const facts = networkFileFacts(content, iface)
+    if (!facts.matches) continue
+    if (facts.hasDns) return 'static'
+    return facts.dhcp ? 'auto' : 'unknown'
+  }
+
+  // No .network file applies: networkd is not the source, so the origin of the
+  // resolvers cannot be confirmed.
+  return 'unknown'
+}
+
+export function hasStaticDnsInNetworkd(iface: string, reader: NetworkdReader): boolean {
+  return classifyNetworkdDns(iface, reader) === 'static'
 }
 
 function systemNetworkdReader(): NetworkdReader {
   return {
     list: () => {
-      try {
-        const stdout = execFileSync(
-          'find',
-          ['/etc/systemd/network', '-maxdepth', '1', '-type', 'f', '-name', '*.network'],
-          { encoding: 'utf8' }
-        )
-        return stdout
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter(Boolean)
-      } catch {
-        return []
+      const files: string[] = []
+      for (const directory of NETWORKD_DIRECTORIES) {
+        let entries
+        try {
+          entries = readdirSync(directory, { withFileTypes: true })
+        } catch {
+          // A missing directory simply has no configuration.
+          continue
+        }
+        for (const entry of entries) {
+          if (entry.isFile() && entry.name.endsWith('.network')) {
+            files.push(`${directory}/${entry.name}`)
+          }
+        }
       }
+      return files
     },
     read: (path) => {
       try {
         return readFileSync(path, 'utf8')
       } catch {
-        return ''
+        return null
       }
     }
   }
 }
 
 /**
- * systemd-resolved does not expose where a resolver came from. A static DNS=
- * entry in systemd-networkd configuration is the only reliable signal; without
- * it the addresses may come from DHCP and the link must be reverted, not frozen.
+ * Combines resolvectl output with the networkd configuration. A failed
+ * resolvectl call (missing binary, non-zero exit) and an empty answer are not
+ * evidence of automatic resolvers, so they stay `unknown` unless networkd
+ * explicitly uses DHCP.
  */
-export async function linuxHasStaticDns(iface: string): Promise<boolean> {
-  return hasStaticDnsInNetworkd(iface, systemNetworkdReader())
+export function classifyLinuxDns(
+  servers: string[],
+  networkd: DnsMethod,
+  resolvectlFailed: boolean
+): DnsMethod {
+  if (resolvectlFailed) return 'unknown'
+  if (servers.length === 0) return networkd === 'auto' ? 'auto' : 'unknown'
+  return networkd
+}
+
+function parseResolvectlServers(stdout: string): string[] {
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.includes(':') || line.includes('.'))
+    .flatMap((line) => line.split(/\s+/).slice(1))
+    .filter((value) => isIP(value) !== 0)
+}
+
+export function linuxHasStaticDns(iface: string): boolean {
+  return classifyNetworkdDns(iface, systemNetworkdReader()) === 'static'
 }
 
 export function linuxHasStaticDnsSync(iface: string): boolean {
-  return hasStaticDnsInNetworkd(iface, systemNetworkdReader())
+  return classifyNetworkdDns(iface, systemNetworkdReader()) === 'static'
 }
 
 async function readLinuxDns(): Promise<DnsServiceBackup[]> {
   const iface = await linuxDefaultInterface()
-  const current = await execFileAsync('resolvectl', ['dns', iface]).catch(() => ({ stdout: '' }))
-  const servers = current.stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.includes(':') || line.includes('.'))
-    .flatMap((line) => line.split(/\s+/).slice(1))
-    .filter((value) => isIP(value) !== 0)
+  let stdout = ''
+  let resolvectlFailed = false
+  try {
+    stdout = (await execFileAsync('resolvectl', ['dns', iface])).stdout
+  } catch {
+    resolvectlFailed = true
+  }
+
+  const servers = parseResolvectlServers(stdout)
   const v4 = byFamily(servers, 4)
   const v6 = byFamily(servers, 6)
-  
-  // Check for static DNS configuration for this specific interface
-  const staticConfig = await linuxHasStaticDns(iface)
-  
-  // Determine DNS method based on configuration
-  let method: DnsMethod
-  if (v4.length === 0 && v6.length === 0) {
-    method = 'auto' // No DNS servers configured, likely DHCP
-  } else if (staticConfig) {
-    method = 'static' // Static DNS configuration found
-  } else {
-    method = 'unknown' // DNS servers configured but origin unknown
-  }
-  
-  return [
-    {
-      name: iface,
-      v4,
-      v6,
-      method
-    }
-  ]
+  const networkd = classifyNetworkdDns(iface, systemNetworkdReader())
+
+  return [{ name: iface, v4, v6, method: classifyLinuxDns(servers, networkd, resolvectlFailed) }]
 }
 
 function readLinuxDnsSync(): DnsServiceBackup[] {
   const iface = linuxDefaultInterfaceSync()
-  let current: string
+  let stdout = ''
+  let resolvectlFailed = false
   try {
-    current = execFileSync('resolvectl', ['dns', iface], { encoding: 'utf8' })
+    stdout = execFileSync('resolvectl', ['dns', iface], { encoding: 'utf8' })
   } catch {
-    current = ''
+    resolvectlFailed = true
   }
-  
-  const servers = current
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.includes(':') || line.includes('.'))
-    .flatMap((line) => line.split(/\s+/).slice(1))
-    .filter((value) => isIP(value) !== 0)
+
+  const servers = parseResolvectlServers(stdout)
   const v4 = byFamily(servers, 4)
   const v6 = byFamily(servers, 6)
-  
-  // Check for static DNS configuration for this specific interface
-  const staticConfig = linuxHasStaticDnsSync(iface)
-  
-  // Determine DNS method based on configuration
-  let method: DnsMethod
-  if (v4.length === 0 && v6.length === 0) {
-    method = 'auto' // No DNS servers configured, likely DHCP
-  } else if (staticConfig) {
-    method = 'static' // Static DNS configuration found
-  } else {
-    method = 'unknown' // DNS servers configured but origin unknown
-  }
-  
-  return [
-    {
-      name: iface,
-      v4,
-      v6,
-      method
-    }
-  ]
+  const networkd = classifyNetworkdDns(iface, systemNetworkdReader())
+
+  return [{ name: iface, v4, v6, method: classifyLinuxDns(servers, networkd, resolvectlFailed) }]
 }
 
 function readWindowsDnsSync(): DnsServiceBackup[] {
@@ -781,13 +925,7 @@ function readWindowsDnsSync(): DnsServiceBackup[] {
   const adapters = Array.isArray(parsed) ? parsed : [parsed]
   const services = adapters
     .filter((adapter) => adapter && Number.isFinite(Number(adapter.index)))
-    .map<DnsServiceBackup>((adapter) => ({
-      name: String(adapter.name ?? adapter.index),
-      index: Number(adapter.index),
-      v4: byFamily(Array.isArray(adapter.v4) ? adapter.v4 : [], 4),
-      v6: byFamily(Array.isArray(adapter.v6) ? adapter.v6 : [], 6),
-      method: classifyWindowsMethod(adapter)
-    }))
+    .map(adapterToService)
   if (services.length === 0) throw new Error(t('No active network adapter was found'))
   return services
 }

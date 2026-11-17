@@ -36,24 +36,32 @@ function markerExists(path = markerPathDefault()): boolean {
   return existsSync(path)
 }
 
-/**
- * iptables reports a missing chain or rule as a plain error, just like a real
- * failure. Cleanup must not warn about state that is already correct, so the
- * two cases are told apart by their message.
- */
-function isMissingIptablesTarget(message: string): boolean {
-  const text = message.toLowerCase()
-  return (
-    text.includes('no such rule') ||
-    text.includes('no chain/target/match') ||
-    text.includes('does a matching rule exist') ||
-    text.includes('bad rule')
-  )
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message
+  return String(error ?? 'unknown error')
 }
 
-function isPermissionError(message: string): boolean {
+/**
+ * Messages that *prove* the probed rule or chain is not present. Anything else
+ * — a missing binary (`spawnSync iptables ENOENT`), a missing table, a
+ * permission problem or an unknown backend error — says nothing about the
+ * actual state and must stay `unknown` instead of being read as "already
+ * clean". Both iptables and ip6tables share the classic messages; the nft
+ * backend additionally names the object (`Chain 'X' does not exist`).
+ */
+const MISSING_TARGET_MESSAGES = [
+  'no chain/target/match by that name',
+  'does a matching rule exist in that chain',
+  'bad rule',
+  'no such rule'
+]
+
+function isMissingChainOrRuleError(message: string): boolean {
   const text = message.toLowerCase()
-  return text.includes('permission denied') || text.includes('operation not permitted')
+  if (MISSING_TARGET_MESSAGES.some((pattern) => text.includes(pattern))) return true
+  // nft backend wording. A `Table ... does not exist` error deliberately does
+  // not match: the table is missing, not the chain.
+  return /\b(?:chain|rule)\s+['"`][^'"`]+['"`]\s+does not exist\b/.test(text)
 }
 
 function family(values: string[], version: 4 | 6): string[] {
@@ -171,20 +179,83 @@ async function installChain(
 
 
 
-async function removeChain(
+export type ChainStatus = 'exists' | 'absent' | 'unknown'
+
+interface ChainState {
+  status: ChainStatus
+  /** Failure that prevented a reliable answer, or a real removal error. */
+  error: string | null
+}
+
+interface ProbeResult {
+  /** `true`/`false` when the probe answered, `null` when it failed unexpectedly. */
+  present: boolean | null
+  error: string | null
+}
+
+/** Probes one rule/chain and only records "absent" for trusted messages. */
+async function probeAsync(
   run: AsyncRunner,
   command: string,
-  chain: string
-): Promise<{ success: boolean; error: string | null }> {
+  args: string[],
+  label: string
+): Promise<ProbeResult> {
+  try {
+    await run(args, command)
+    return { present: true, error: null }
+  } catch (error) {
+    const message = errorMessage(error)
+    if (isMissingChainOrRuleError(message)) return { present: false, error: null }
+    return { present: null, error: `${label}: ${message}` }
+  }
+}
+
+function probeSync(run: SyncRunner, command: string, args: string[], label: string): ProbeResult {
+  try {
+    run(args, command)
+    return { present: true, error: null }
+  } catch (error) {
+    const message = errorMessage(error)
+    if (isMissingChainOrRuleError(message)) return { present: false, error: null }
+    return { present: null, error: `${label}: ${message}` }
+  }
+}
+
+/**
+ * A chain is only "gone" when both its OUTPUT jump and the chain itself are
+ * provably missing. Removing the jump while leaving the chain behind (or a
+ * probe that cannot run) is not success.
+ */
+function combineProbes(jump: ProbeResult, chain: ProbeResult): ChainState {
+  const error = [jump.error, chain.error].filter(Boolean).join('; ') || null
+  // Positive evidence wins: one present object means the chain is still armed.
+  if (jump.present === true || chain.present === true) return { status: 'exists', error }
+  if (jump.present === null || chain.present === null) return { status: 'unknown', error }
+  return { status: 'absent', error }
+}
+
+async function probeChainAsync(run: AsyncRunner, command: string, chain: string): Promise<ChainState> {
+  const jump = await probeAsync(run, command, ['-C', 'OUTPUT', '-j', chain], `could not verify the OUTPUT jump for ${chain}`)
+  const target = await probeAsync(run, command, ['-L', chain], `could not verify ${chain}`)
+  return combineProbes(jump, target)
+}
+
+type RemovalResult = ChainState & {
+  success: boolean
+  ruleRemoved: boolean
+  chainRemoved: boolean
+}
+
+async function removeChain(run: AsyncRunner, command: string, chain: string): Promise<RemovalResult> {
   const errors: string[] = []
 
   const attempt = async (args: string[], action: string): Promise<void> => {
     try {
       await run(args, command)
-    } catch (err) {
-      const message = (err as Error).message
+    } catch (error) {
+      const message = errorMessage(error)
       // An absent rule or chain is the state cleanup wants to reach.
-      if (isMissingIptablesTarget(message)) return
+      if (isMissingChainOrRuleError(message)) return
       errors.push(`${action}: ${message}`)
     }
   }
@@ -193,25 +264,28 @@ async function removeChain(
   await attempt(['-F', chain], `could not flush ${chain}`)
   await attempt(['-X', chain], `could not delete ${chain}`)
 
+  const state = await probeChainAsync(run, command, chain)
+  const error = [...errors, state.error].filter(Boolean).join('; ') || null
   return {
-    success: errors.length === 0,
-    error: errors.length > 0 ? errors.join('; ') : null
+    status: state.status,
+    // Unknown errors are never a successful removal, even if the chain happens
+    // to be gone; only a verified-absent chain with no errors counts.
+    success: state.status === 'absent' && error === null,
+    error,
+    ruleRemoved: state.status === 'absent',
+    chainRemoved: state.status === 'absent'
   }
 }
 
-function removeChainSync(
-  run: SyncRunner,
-  command: string,
-  chain: string
-): { success: boolean; error: string | null; ruleRemoved: boolean; chainRemoved: boolean } {
+function removeChainSync(run: SyncRunner, command: string, chain: string): RemovalResult {
   const errors: string[] = []
 
   const attempt = (args: string[], action: string): void => {
     try {
       run(args, command)
-    } catch (err) {
-      const message = (err as Error).message
-      if (isMissingIptablesTarget(message)) return
+    } catch (error) {
+      const message = errorMessage(error)
+      if (isMissingChainOrRuleError(message)) return
       console.error(`[firewall] ${action}: ${message}`)
       errors.push(`${action}: ${message}`)
     }
@@ -222,72 +296,20 @@ function removeChainSync(
   attempt(['-X', chain], `could not delete ${chain}`)
 
   // Trust the table itself, not the exit codes: `-C` verifies the jump and `-L`
-  // verifies the chain. A permission error leaves the state unknown, which the
-  // caller treats as a failure instead of silently dropping the marker.
-  let ruleRemoved = true
-  let chainRemoved = true
-
-  try {
-    run(['-C', 'OUTPUT', '-j', chain], command)
-    ruleRemoved = false
-  } catch (err) {
-    const message = (err as Error).message
-    if (isPermissionError(message)) {
-      errors.push(`could not verify the OUTPUT jump for ${chain}: ${message}`)
-      ruleRemoved = false
-    }
-  }
-
-  try {
-    run(['-L', chain], command)
-    chainRemoved = false
-  } catch (err) {
-    const message = (err as Error).message
-    if (isPermissionError(message)) {
-      errors.push(`could not verify ${chain}: ${message}`)
-      chainRemoved = false
-    }
-  }
+  // verifies the chain. Unknown errors leave the state unknown, so the caller
+  // keeps the marker instead of silently dropping it.
+  const jump = probeSync(run, command, ['-C', 'OUTPUT', '-j', chain], `could not verify the OUTPUT jump for ${chain}`)
+  const target = probeSync(run, command, ['-L', chain], `could not verify ${chain}`)
+  const state = combineProbes(jump, target)
+  const error = [...errors, state.error].filter(Boolean).join('; ') || null
 
   return {
-    success: ruleRemoved && chainRemoved && errors.length === 0,
-    error: errors.length > 0 ? errors.join('; ') : null,
-    ruleRemoved,
-    chainRemoved
+    status: state.status,
+    success: state.status === 'absent' && error === null,
+    error,
+    ruleRemoved: jump.present === false,
+    chainRemoved: target.present === false
   }
-}
-
-export type ChainStatus = 'exists' | 'absent' | 'unknown'
-
-function statusFromError(message: string): ChainStatus {
-  // "No such rule" proves the chain is gone; a permission error proves nothing.
-  return isPermissionError(message) ? 'unknown' : 'absent'
-}
-
-async function checkChains(run: AsyncRunner): Promise<{ ipv4: ChainStatus; ipv6: ChainStatus }> {
-  const status = async (command: string, chain: string): Promise<ChainStatus> => {
-    try {
-      await run(['-C', 'OUTPUT', '-j', chain], command)
-      return 'exists'
-    } catch (error) {
-      return statusFromError((error as Error).message)
-    }
-  }
-
-  return { ipv4: await status('iptables', CHAIN), ipv6: await status('ip6tables', CHAIN6) }
-}
-
-function checkChainsSync(run: SyncRunner): { ipv4: ChainStatus; ipv6: ChainStatus } {
-  const status = (command: string, chain: string): ChainStatus => {
-    try {
-      run(['-C', 'OUTPUT', '-j', chain], command)
-      return 'exists'
-    } catch (error) {
-      return statusFromError((error as Error).message)
-    }
-  }
-
-  return { ipv4: status('iptables', CHAIN), ipv6: status('ip6tables', CHAIN6) }
 }
 
 /**
@@ -316,10 +338,6 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
   }
 
   const markerFileExists = (): boolean => markerExists(markerPath)
-
-  async function checkEagletChains(): Promise<{ ipv4: ChainStatus; ipv6: ChainStatus }> {
-    return checkChains(run)
-  }
 
   return {
     backupFile: () => markerPath,
@@ -366,132 +384,147 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
     },
 
     async disable(): Promise<void> {
-      let ipv4Result = { success: false, error: null as string | null }
-      let ipv6Result = { success: false, error: null as string | null }
-      let chainsExist = { ipv4: 'unknown' as 'exists' | 'absent' | 'unknown', ipv6: 'unknown' as 'exists' | 'absent' | 'unknown' }
-      
+      const unknownRemoval = (message: string): RemovalResult => ({
+        status: 'unknown',
+        success: false,
+        error: message,
+        ruleRemoved: false,
+        chainRemoved: false
+      })
+
+      let ipv4Result: RemovalResult
+      let ipv6Result: RemovalResult
+
       try {
         ipv4Result = await removeChain(run, 'iptables', CHAIN)
       } catch (error) {
-        ipv4Result.error = `Failed to remove IPv4 chain: ${(error as Error).message}`
+        ipv4Result = unknownRemoval(`Failed to remove the IPv4 chain: ${errorMessage(error)}`)
       }
-      
+
       try {
         ipv6Result = await removeChain(run, 'ip6tables', CHAIN6)
       } catch (error) {
-        ipv6Result.error = `Failed to remove IPv6 chain: ${(error as Error).message}`
+        ipv6Result = unknownRemoval(`Failed to remove the IPv6 chain: ${errorMessage(error)}`)
       }
-      
-      // Check if chains were actually removed
-      try {
-        chainsExist = await checkEagletChains()
-      } catch (error) {
-        console.error(`[firewall] Failed to check chain status: ${(error as Error).message}`)
-      }
-      
-      // Only remove marker if both chains were successfully removed and no longer exist
-      const chainsStillExist = chainsExist.ipv4 === 'exists' || chainsExist.ipv6 === 'exists'
-      const hasErrors = chainsExist.ipv4 === 'unknown' || chainsExist.ipv6 === 'unknown'
-      
-      if (!chainsStillExist && !hasErrors) {
+
+      // Only a provably absent pair may drop the marker. `exists` means part of
+      // the policy is still armed; `unknown` means the answer could not be
+      // obtained, so the next launch must retry instead of trusting it.
+      const chainsStillExist = ipv4Result.status === 'exists' || ipv6Result.status === 'exists'
+      const stateUnknown = ipv4Result.status === 'unknown' || ipv6Result.status === 'unknown'
+
+      if (!chainsStillExist && !stateUnknown) {
+        if (ipv4Result.error || ipv6Result.error) {
+          // The end state is verified, but a command still complained. Keep the
+          // failure visible without blocking a disconnect that already happened.
+          console.warn(
+            `[firewall] Kill switch is off, but cleanup reported: ${[ipv4Result.error, ipv6Result.error].filter(Boolean).join('; ')}`
+          )
+        }
         rmSync(markerPath, { force: true })
       } else {
-        // Save marker for recovery if chains still exist or there were errors
+        // Save marker for recovery if chains still exist or the state is unknown.
         const marker = markerFileExists() ? JSON.parse(readFileSync(markerPath, 'utf-8')) : null
         if (marker) {
           writeFileSync(
             markerPath,
-            JSON.stringify({ 
-              ...marker, 
-              ipv4: chainsExist.ipv4 === 'absent', 
-              ipv6: chainsExist.ipv6 === 'absent', 
+            JSON.stringify({
+              ...marker,
+              ipv4: ipv4Result.status === 'absent',
+              ipv6: ipv6Result.status === 'absent',
               cleanupFailed: true,
               chainsStillExist,
+              stateUnknown,
               ipv4Error: ipv4Result.error,
               ipv6Error: ipv6Result.error,
-              ipv4Status: chainsExist.ipv4,
-              ipv6Status: chainsExist.ipv6
+              ipv4Status: ipv4Result.status,
+              ipv6Status: ipv6Result.status
             }, null, 2),
             'utf-8'
           )
         }
-        
+
         const errors = [
           ipv4Result.error,
           ipv6Result.error,
-          chainsExist.ipv4 === 'exists' ? 'IPv4 chain still exists' : null,
-          chainsExist.ipv6 === 'exists' ? 'IPv6 chain still exists' : null,
-          hasErrors ? 'the chain state could not be verified (permission denied)' : null
+          ipv4Result.status === 'exists' ? 'the IPv4 chain is still present' : null,
+          ipv6Result.status === 'exists' ? 'the IPv6 chain is still present' : null,
+          stateUnknown ? 'the chain state could not be verified' : null
         ].filter(Boolean).join('; ')
-        
+
         throw new Error(t('Kill switch could not be fully disabled: {errors}', { errors }))
       }
     },
 
     disableSync(): void {
-      let ipv4Result: { success: boolean; error: string | null; ruleRemoved: boolean; chainRemoved: boolean }
-      let ipv6Result: { success: boolean; error: string | null; ruleRemoved: boolean; chainRemoved: boolean }
-      
-      // Try to remove chains
+      const unknownRemoval = (message: string): RemovalResult => ({
+        status: 'unknown',
+        success: false,
+        error: message,
+        ruleRemoved: false,
+        chainRemoved: false
+      })
+
+      let ipv4Result: RemovalResult
+      let ipv6Result: RemovalResult
+
       try {
         ipv4Result = removeChainSync(runSync, 'iptables', CHAIN)
       } catch (error) {
-        ipv4Result = { success: false, error: `Failed to remove IPv4 chain: ${(error as Error).message}`, ruleRemoved: false, chainRemoved: false }
+        ipv4Result = unknownRemoval(`Failed to remove the IPv4 chain: ${errorMessage(error)}`)
       }
-      
+
       try {
         ipv6Result = removeChainSync(runSync, 'ip6tables', CHAIN6)
       } catch (error) {
-        ipv6Result = { success: false, error: `Failed to remove IPv6 chain: ${(error as Error).message}`, ruleRemoved: false, chainRemoved: false }
+        ipv6Result = unknownRemoval(`Failed to remove the IPv6 chain: ${errorMessage(error)}`)
       }
-      
-      // Check actual chain status after removal through the same injected runner.
-      const { ipv4: ipv4Status, ipv6: ipv6Status } = checkChainsSync(runSync)
-      const ipv4CheckError =
-        ipv4Status === 'unknown' ? `Permission denied when checking IPv4 chain` : null
-      const ipv6CheckError =
-        ipv6Status === 'unknown' ? `Permission denied when checking IPv6 chain` : null
-      
-      // Only remove marker if both chains were successfully removed and no longer exist
-      const chainsStillExist = ipv4Status === 'exists' || ipv6Status === 'exists'
-      const hasErrors = ipv4Status === 'unknown' || ipv6Status === 'unknown'
-      
-      if (!chainsStillExist && !hasErrors) {
+
+      const chainsStillExist = ipv4Result.status === 'exists' || ipv6Result.status === 'exists'
+      const stateUnknown = ipv4Result.status === 'unknown' || ipv6Result.status === 'unknown'
+
+      if (!chainsStillExist && !stateUnknown) {
+        if (ipv4Result.error || ipv6Result.error) {
+          console.warn(
+            `[firewall] Kill switch is off, but cleanup reported: ${[ipv4Result.error, ipv6Result.error].filter(Boolean).join('; ')}`
+          )
+        }
         rmSync(markerPath, { force: true })
       } else {
-        // Save marker for recovery if chains still exist or there were errors
+        // Keep the marker whenever something is still armed or the state could
+        // not be verified; recover() retries on the next launch.
         const marker = markerFileExists() ? JSON.parse(readFileSync(markerPath, 'utf-8')) : null
         if (marker) {
           writeFileSync(
             markerPath,
-            JSON.stringify({ 
-              ...marker, 
-              ipv4: ipv4Status === 'absent', 
-              ipv6: ipv6Status === 'absent', 
+            JSON.stringify({
+              ...marker,
+              ipv4: ipv4Result.status === 'absent',
+              ipv6: ipv6Result.status === 'absent',
               cleanupFailed: true,
               chainsStillExist,
-              ipv4CheckError,
-              ipv6CheckError,
+              stateUnknown,
+              ipv4Error: ipv4Result.error,
+              ipv6Error: ipv6Result.error,
               ipv4RuleRemoved: ipv4Result.ruleRemoved,
               ipv6RuleRemoved: ipv6Result.ruleRemoved,
               ipv4ChainRemoved: ipv4Result.chainRemoved,
               ipv6ChainRemoved: ipv6Result.chainRemoved,
-              ipv4Status,
-              ipv6Status
+              ipv4Status: ipv4Result.status,
+              ipv6Status: ipv6Result.status
             }, null, 2),
             'utf-8'
           )
         }
-        
+
         const errors = [
           ipv4Result.error,
           ipv6Result.error,
-          ipv4CheckError,
-          ipv6CheckError,
-          chainsStillExist ? 'the chains are still present' : null,
-          hasErrors ? 'the chain state could not be verified' : null
+          ipv4Result.status === 'exists' ? 'the IPv4 chain is still present' : null,
+          ipv6Result.status === 'exists' ? 'the IPv6 chain is still present' : null,
+          stateUnknown ? 'the chain state could not be verified' : null
         ].filter(Boolean).join('; ')
-        
+
         throw new Error(t('Kill switch could not be fully disabled: {errors}', { errors }))
       }
     },

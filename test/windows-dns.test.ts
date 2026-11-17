@@ -2,173 +2,198 @@ import { describe, expect, it } from 'vitest'
 import { classifyWindowsMethod } from '../src/main/vpn/dns-guard'
 import type { WindowsAdapter } from '../src/main/vpn/dns-guard'
 
+/** Adapter with every field explicit, so each test reads as a real scenario. */
+function adapter(overrides: Partial<WindowsAdapter>): WindowsAdapter {
+  return {
+    index: 12,
+    name: 'Ethernet',
+    v4: [],
+    v6: [],
+    dhcp4: 'Enabled',
+    dhcp6: 'Disabled',
+    manual4: [],
+    manual6: [],
+    leased4: [],
+    leased6: [],
+    ...overrides
+  }
+}
+
 describe('Windows DNS Classification', () => {
-  it('should classify DHCP with no DNS as auto', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: [],
-      v6: [],
-      dhcp4: 'Enabled',
-      dhcp6: 'Disabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('auto')
+  describe('no resolvers', () => {
+    it('classifies a DHCP interface without DNS as auto', () => {
+      expect(classifyWindowsMethod(adapter({ dhcp4: 'Enabled' }))).toBe('auto')
+    })
+
+    it('classifies a static interface without DNS as unknown', () => {
+      expect(classifyWindowsMethod(adapter({ dhcp4: 'Disabled', dhcp6: 'Disabled' }))).toBe('unknown')
+    })
+
+    it('classifies an unknown DHCP state without DNS as unknown', () => {
+      expect(classifyWindowsMethod(adapter({ dhcp4: 'Unknown', dhcp6: 'Unknown' }))).toBe('unknown')
+    })
+
+    it('accepts case-insensitive DHCP status', () => {
+      expect(classifyWindowsMethod(adapter({ dhcp4: 'enabled', dhcp6: 'ENABLED' }))).toBe('auto')
+    })
   })
 
-  it('should classify DHCP with obtained DNS as auto', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: ['8.8.8.8'], // DHCP-obtained DNS
-      v6: [],
-      dhcp4: 'Enabled',
-      dhcp6: 'Disabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('auto')
+  describe('DHCP with lease-provided DNS', () => {
+    it('classifies DNS that matches the DHCP lease as auto', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({ v4: ['8.8.8.8'], dhcp4: 'Enabled', leased4: ['8.8.8.8'] })
+        )
+      ).toBe('auto')
+    })
+
+    it('classifies both families as auto when both match their leases', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({
+            v4: ['8.8.8.8'],
+            v6: ['2001:4860:4860::8888'],
+            dhcp4: 'Enabled',
+            dhcp6: 'Enabled',
+            leased4: ['8.8.8.8'],
+            leased6: ['2001:4860:4860::8888']
+          })
+        )
+      ).toBe('auto')
+    })
+
+    it('ignores lease order and duplicates when comparing', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({
+            v4: ['8.8.8.8', '1.1.1.1'],
+            dhcp4: 'Enabled',
+            leased4: ['1.1.1.1', '8.8.8.8', '8.8.8.8']
+          })
+        )
+      ).toBe('auto')
+    })
+
+    it('returns unknown when the resolvers do not match the DHCP lease', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({ v4: ['9.9.9.9'], dhcp4: 'Enabled', leased4: ['8.8.8.8'] })
+        )
+      ).toBe('unknown')
+    })
   })
 
-  it('should classify manual DNS as static', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: ['1.1.1.1'], // Manual DNS
-      v6: [],
-      dhcp4: 'Disabled',
-      dhcp6: 'Disabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('static')
+  describe('DHCP with manually configured DNS', () => {
+    it('classifies manual DNS on a DHCP-managed family as static', () => {
+      // DHCP for IP does not prove DNS came from DHCP.
+      expect(
+        classifyWindowsMethod(
+          adapter({ v4: ['1.1.1.1'], dhcp4: 'Enabled', manual4: ['1.1.1.1'] })
+        )
+      ).toBe('static')
+    })
+
+    it('prefers the manual registry value when a lease is also present', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({
+            v4: ['1.1.1.1'],
+            dhcp4: 'Enabled',
+            manual4: ['1.1.1.1'],
+            leased4: ['8.8.8.8']
+          })
+        )
+      ).toBe('static')
+    })
   })
 
-  it('should classify mixed DHCP and manual DNS correctly', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: ['1.1.1.1'], // Manual IPv4 DNS
-      v6: [], // No IPv6 DNS
-      dhcp4: 'Disabled', // IPv4 DHCP disabled
-      dhcp6: 'Enabled' // IPv6 DHCP enabled
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('static')
+  describe('static IP configuration', () => {
+    it('classifies manually configured DNS with DHCP disabled as static', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({ v4: ['1.1.1.1'], dhcp4: 'Disabled', manual4: ['1.1.1.1'] })
+        )
+      ).toBe('static')
+    })
+
+    it('classifies static IPv4 and IPv6 DNS as static', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({
+            v4: ['1.1.1.1'],
+            v6: ['2001:4860:4860::8888'],
+            dhcp4: 'Disabled',
+            dhcp6: 'Disabled',
+            manual4: ['1.1.1.1'],
+            manual6: ['2001:4860:4860::8888']
+          })
+        )
+      ).toBe('static')
+    })
+
+    it('returns unknown when DHCP is disabled and no manual value is recorded', () => {
+      expect(
+        classifyWindowsMethod(adapter({ v4: ['1.1.1.1'], dhcp4: 'Disabled' }))
+      ).toBe('unknown')
+    })
   })
 
-  it('should classify both families with manual DNS as static', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: ['1.1.1.1'],
-      v6: ['2001:4860:4860::8888'],
-      dhcp4: 'Disabled',
-      dhcp6: 'Disabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('static')
+  describe('unknown origin', () => {
+    it('returns unknown when the DHCP state is missing but resolvers exist', () => {
+      expect(
+        classifyWindowsMethod(adapter({ v4: ['1.1.1.1'], dhcp4: '', dhcp6: '' }))
+      ).toBe('unknown')
+    })
+
+    it('returns unknown when resolvers exist without manual or lease data', () => {
+      expect(
+        classifyWindowsMethod(adapter({ v4: ['1.1.1.1'], dhcp4: 'Enabled' }))
+      ).toBe('unknown')
+    })
   })
 
-  it('should classify DHCP-only configuration as auto', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: [],
-      v6: [],
-      dhcp4: 'Enabled',
-      dhcp6: 'Enabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('auto')
-  })
+  describe('independent address families', () => {
+    it('classifies an IPv6-only lease as auto', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({
+            v6: ['2001:4860:4860::8888'],
+            dhcp4: 'Disabled',
+            dhcp6: 'Enabled',
+            leased6: ['2001:4860:4860::8888']
+          })
+        )
+      ).toBe('auto')
+    })
 
-  it('should classify unknown DHCP state as unknown', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: [],
-      v6: [],
-      dhcp4: 'Unknown',
-      dhcp6: 'Unknown'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('unknown')
-  })
+    it('returns unknown when IPv4 is static and IPv6 came from DHCP', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({
+            v4: ['1.1.1.1'],
+            v6: ['2001:4860:4860::8888'],
+            dhcp4: 'Disabled',
+            dhcp6: 'Enabled',
+            manual4: ['1.1.1.1'],
+            leased6: ['2001:4860:4860::8888']
+          })
+        )
+      ).toBe('unknown')
+    })
 
-  it('should classify partial DHCP state correctly', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: ['8.8.8.8'], // DHCP-obtained IPv4
-      v6: ['2001:4860:4860::8888'], // Manual IPv6
-      dhcp4: 'Enabled',
-      dhcp6: 'Disabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('static')
-  })
-
-  it('returns unknown when the DHCP state is missing but resolvers exist', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: ['1.1.1.1'],
-      v6: [],
-      dhcp4: '', // Empty string
-      dhcp6: ''
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('unknown')
-  })
-
-  it('should handle case-insensitive DHCP status', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: [],
-      v6: [],
-      dhcp4: 'enabled', // lowercase
-      dhcp6: 'ENABLED' // uppercase
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('auto')
-  })
-
-  it('should handle IPv6 DHCP with manual IPv4', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: ['1.1.1.1'], // Manual IPv4
-      v6: [], // No IPv6 (DHCP-provided)
-      dhcp4: 'Disabled',
-      dhcp6: 'Enabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('static')
-  })
-
-  it('should handle IPv4 DHCP with manual IPv6', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: [], // No IPv4 (DHCP-provided)
-      v6: ['2001:4860:4860::8888'], // Manual IPv6
-      dhcp4: 'Enabled',
-      dhcp6: 'Disabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('static')
-  })
-
-  it('treats resolvers on DHCP-managed families as automatic', () => {
-    const adapter: WindowsAdapter = {
-      index: 12,
-      name: 'Ethernet',
-      v4: ['1.1.1.1'], // DHCP-managed family
-      v6: ['2001:4860:4860::8888'], // DHCP-managed family
-      dhcp4: 'Enabled',
-      dhcp6: 'Enabled'
-    }
-    
-    expect(classifyWindowsMethod(adapter)).toBe('auto')
+    it('returns unknown when IPv4 is leased and IPv6 is manual', () => {
+      expect(
+        classifyWindowsMethod(
+          adapter({
+            v4: ['8.8.8.8'],
+            v6: ['2001:4860:4860::8888'],
+            dhcp4: 'Enabled',
+            dhcp6: 'Disabled',
+            leased4: ['8.8.8.8'],
+            manual6: ['2001:4860:4860::8888']
+          })
+        )
+      ).toBe('unknown')
+    })
   })
 })
