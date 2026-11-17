@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { classifyWindowsMethod } from '../src/main/vpn/dns-guard'
+import {
+  classifyWindowsFamilyMethod,
+  classifyWindowsMethod,
+  planWindowsRestore,
+  userChangedDns,
+  verifyRestored,
+  type DnsServiceBackup
+} from '../src/main/vpn/dns-guard'
 import type { WindowsAdapter } from '../src/main/vpn/dns-guard'
 
 /** Adapter with every field explicit, so each test reads as a real scenario. */
@@ -152,8 +159,7 @@ describe('Windows DNS Classification', () => {
     })
   })
 
-  describe('independent address families', () => {
-    it('classifies an IPv6-only lease as auto', () => {
+  describe('independent address families', () => {    it('classifies an IPv6-only lease as auto', () => {
       expect(
         classifyWindowsMethod(
           adapter({
@@ -194,6 +200,85 @@ describe('Windows DNS Classification', () => {
           })
         )
       ).toBe('unknown')
+    })
+  })
+
+  describe('per-family methods and restore', () => {
+    const mixed = adapter({
+      v4: ['1.1.1.1'],
+      v6: ['2001:4860:4860::8888'],
+      dhcp4: 'Disabled',
+      dhcp6: 'Enabled',
+      manual4: ['1.1.1.1'],
+      leased6: ['2001:4860:4860::8888']
+    })
+
+    it('classifies each family independently even when the combined view is unknown', () => {
+      expect(classifyWindowsMethod(mixed)).toBe('unknown')
+      expect(classifyWindowsFamilyMethod(mixed, 4)).toBe('static')
+      expect(classifyWindowsFamilyMethod(mixed, 6)).toBe('auto')
+    })
+
+    it('resets but only re-applies the static family', () => {
+      const service: DnsServiceBackup = {
+        name: 'Ethernet',
+        index: 12,
+        v4: ['1.1.1.1'],
+        v6: ['2001:4860:4860::8888'],
+        method: 'unknown',
+        method4: 'static',
+        method6: 'auto'
+      }
+      expect(planWindowsRestore(service)).toEqual({ reset: true, addresses: ['1.1.1.1'] })
+    })
+
+    it('does not overwrite an automatic family or report it as a user change', () => {
+      const saved: DnsServiceBackup = {
+        name: 'Ethernet',
+        index: 12,
+        v4: ['1.1.1.1'],
+        v6: ['2001:4860:4860::8888'],
+        method: 'unknown',
+        method4: 'static',
+        method6: 'auto'
+      }
+      const current: DnsServiceBackup = {
+        name: 'Ethernet',
+        index: 12,
+        v4: ['1.1.1.1'],
+        v6: ['2001:4860:4860::9999'],
+        method: 'unknown',
+        method4: 'static',
+        method6: 'auto'
+      }
+      // While the automatic family still points at the relay it is untouched.
+      expect(userChangedDns(saved, { ...current, v6: ['::1'] })).toBe(false)
+      // After the restore the automatic family may hold any DHCP address; only
+      // the static family is compared exactly.
+      expect(verifyRestored(saved, current)).toBeNull()
+    })
+
+    it('detects a change to the static family only', () => {
+      const saved: DnsServiceBackup = {
+        name: 'Ethernet',
+        index: 12,
+        v4: ['1.1.1.1'],
+        v6: [],
+        method: 'static',
+        method4: 'static',
+        method6: 'auto'
+      }
+      const current: DnsServiceBackup = {
+        name: 'Ethernet',
+        index: 12,
+        v4: ['9.9.9.9'],
+        v6: ['2001:4860:4860::8888'],
+        method: 'unknown',
+        method4: 'static',
+        method6: 'auto'
+      }
+      expect(userChangedDns(saved, current)).toBe(true)
+      expect(verifyRestored(saved, current)).toContain('IPv4')
     })
   })
 })

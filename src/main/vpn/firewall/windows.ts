@@ -268,6 +268,28 @@ export function createWindowsKillSwitch(
     return Number.isFinite(value) ? value : 0
   }
 
+  /**
+   * Load the saved policy. A truncated or hand-edited backup is reported
+   * separately instead of throwing, because cleanup must still remove our
+   * firewall rules even when the previous profile state is unreadable.
+   */
+  const loadBackup = (): { backup: PolicyBackup | null; corrupt: string | null } => {
+    if (!store.exists(path)) return { backup: null, corrupt: null }
+    try {
+      return { backup: parseBackup(store.read(path)), corrupt: null }
+    } catch (error) {
+      return { backup: null, corrupt: (error as Error).message }
+    }
+  }
+
+  const unreadableBackupError = (detail: string): Error =>
+    new Error(
+      t('The existing firewall backup is unreadable: {error}. Delete {path} after checking the firewall policy manually.', {
+        error: detail,
+        path
+      })
+    )
+
   const restoreVerified = async (backup: PolicyBackup): Promise<string | null> => {
     try {
       const output = await runner.run(restoreProfilesScript(backup.profiles))
@@ -360,7 +382,7 @@ export function createWindowsKillSwitch(
     },
 
     async disable(): Promise<void> {
-      const backup = store.exists(path) ? parseBackup(store.read(path)) : null
+      const { backup, corrupt } = loadBackup()
 
       // Remove the allow rules first: while the default action is still Block
       // the machine stays closed even if the policy restore fails.
@@ -373,6 +395,16 @@ export function createWindowsKillSwitch(
         leftoverRules = await countRules()
       } catch (error) {
         failure = (error as Error).message
+      }
+
+      if (corrupt) {
+        // The rules are gone, but the pre-arm profile state cannot be read.
+        // Never guess: keep the backup for manual recovery and make the reason
+        // explicit instead of crashing on JSON.parse.
+        const leftovers = leftoverRules > 0
+          ? ` ${t('{count} kill-switch firewall rules are still present', { count: leftoverRules })}`
+          : ''
+        throw unreadableBackupError(`${corrupt}${leftovers}`)
       }
 
       if (!backup) {
@@ -406,7 +438,17 @@ export function createWindowsKillSwitch(
     },
 
     disableSync(): void {
-      const backup = store.exists(path) ? parseBackup(store.read(path)) : null
+      const { backup, corrupt } = loadBackup()
+      if (corrupt) {
+        // Still remove the allow rules; the profile restore is impossible
+        // without a readable backup, so keep it and report the reason.
+        try {
+          runner.runSync(`${REMOVE_RULES}\n${COUNT_RULES}`)
+        } catch (error) {
+          console.error('[firewall] synchronous rule removal failed:', (error as Error).message)
+        }
+        throw unreadableBackupError(corrupt)
+      }
       const script = backup
         ? `${REMOVE_RULES}\n${restoreProfilesScript(backup.profiles)}\n${COUNT_RULES}`
         : `${REMOVE_RULES}\n${READ_PROFILES}`
@@ -447,7 +489,12 @@ export function createWindowsKillSwitch(
     },
 
     recover(): void {
-      if (store.exists(path)) this.disableSync()
+      if (!store.exists(path)) return
+      try {
+        this.disableSync()
+      } catch (error) {
+        console.error('[firewall] Windows recovery failed; backup kept:', (error as Error).message)
+      }
     }
   }
 }

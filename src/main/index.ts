@@ -20,6 +20,9 @@ import {
   requireId,
   requireString,
   requireStringArray,
+  sanitizeImportedProfiles,
+  sanitizeImportedScenarios,
+  sanitizeImportedSubscriptions,
   sanitizeScenarioInput,
   sanitizeSettingsPatch
 } from '@shared/validation'
@@ -1042,17 +1045,33 @@ function registerIpc(): void {
     if (raw.format !== 'eaglet-backup' || !raw.settings || !Array.isArray(raw.profiles)) {
       throw new Error(t('That file is not an Eaglet backup'))
     }
+    const importedProfiles = sanitizeImportedProfiles(raw.profiles)
+    const importedSubscriptions = sanitizeImportedSubscriptions(raw.subscriptions)
+    const importedScenarios = sanitizeImportedScenarios(raw.scenarios).map((scenario) =>
+      normalizeScenario(scenario)
+    )
+    const rejectedRows =
+      raw.profiles.length -
+      importedProfiles.length +
+      (Array.isArray(raw.subscriptions) ? raw.subscriptions.length - importedSubscriptions.length : 0) +
+      (Array.isArray(raw.scenarios) ? raw.scenarios.length - importedScenarios.length : 0)
     store.replaceAll({
       settings: { ...store.getSettings(), ...sanitizeSettingsPatch(raw.settings) },
-      profiles: raw.profiles,
-      subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : [],
-      scenarios: Array.isArray(raw.scenarios) ? raw.scenarios : []
+      profiles: importedProfiles,
+      subscriptions: importedSubscriptions,
+      scenarios: importedScenarios
     })
     engine.reconcileProfiles()
     scheduleSubscriptionUpdates()
+    if (rejectedRows > 0) {
+      engine.pushExternalLog(
+        'warn',
+        t('Backup import skipped {count} invalid or duplicate rows', { count: rejectedRows })
+      )
+    }
     engine.pushExternalLog(
       'success',
-      t('Backup imported · {count} profiles', { count: raw.profiles.length })
+      t('Backup imported · {count} profiles', { count: importedProfiles.length })
     )
     if (raw.includesSecrets) {
       const security = store.getSecretStatus()

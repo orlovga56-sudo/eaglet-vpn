@@ -4,6 +4,9 @@ import {
   classifyNetworkdDns,
   effectiveNetworkdFiles,
   hasStaticDnsInNetworkd,
+  networkdDhcpEnabled,
+  networkdDropInFiles,
+  parseResolvectlServers,
   staticDnsInNetworkFile,
   type NetworkdReader
 } from '../src/main/vpn/dns-guard'
@@ -252,5 +255,119 @@ describe('classifyLinuxDns', () => {
     expect(classifyLinuxDns(['8.8.8.8'], 'static', false)).toBe('static')
     expect(classifyLinuxDns(['8.8.8.8'], 'auto', false)).toBe('auto')
     expect(classifyLinuxDns(['8.8.8.8'], 'unknown', false)).toBe('unknown')
+  })
+})
+
+describe('networkd DHCP values', () => {
+  it('accepts every documented enabled spelling', () => {
+    for (const value of ['yes', 'true', 'on', 'ipv4', 'ipv6', 'both', 'BOTH']) {
+      expect(networkdDhcpEnabled(value)).toBe(true)
+    }
+  })
+
+  it('rejects disabled and unknown values', () => {
+    for (const value of ['no', 'false', 'off', 'none', '', 'maybe']) {
+      expect(networkdDhcpEnabled(value)).toBe(false)
+    }
+  })
+
+  it('classifies DHCP=both as automatic', () => {
+    const content = `[Match]
+Name=eth0
+
+[Network]
+DHCP=both
+`
+    expect(classifyNetworkdDns('eth0', reader({ '/etc/systemd/network/10-eth0.network': content }))).toBe('auto')
+  })
+
+  it('stays unknown when DHCP is explicitly disabled and no DNS= is set', () => {
+    const content = `[Match]
+Name=eth0
+
+[Network]
+DHCP=no
+`
+    expect(classifyNetworkdDns('eth0', reader({ '/etc/systemd/network/10-eth0.network': content }))).toBe('unknown')
+  })
+})
+
+describe('networkd drop-ins', () => {
+  const base = '/etc/systemd/network/10-eth0.network'
+
+  it('selects drop-ins in lexicographic order with /etc precedence', () => {
+    expect(
+      networkdDropInFiles(base, [
+        '/usr/lib/systemd/network/10-eth0.network.d/20-dns.conf',
+        '/etc/systemd/network/10-eth0.network.d/20-dns.conf',
+        '/etc/systemd/network/10-eth0.network.d/10-early.conf',
+        '/etc/systemd/network/10-eth0.network.d/readme.txt'
+      ])
+    ).toEqual([
+      '/etc/systemd/network/10-eth0.network.d/10-early.conf',
+      '/etc/systemd/network/10-eth0.network.d/20-dns.conf'
+    ])
+  })
+
+  it('lets a drop-in add static DNS to a DHCP base file', () => {
+    expect(
+      classifyNetworkdDns(
+        'eth0',
+        reader({
+          [base]: dhcpFile('eth0'),
+          [`${base}.d/10-dns.conf`]: `[Network]\nDNS=1.1.1.1\n`
+        })
+      )
+    ).toBe('static')
+  })
+
+  it('lets a drop-in clear a static DNS entry', () => {
+    const content = `[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+DNS=8.8.8.8
+`
+    expect(
+      classifyNetworkdDns(
+        'eth0',
+        reader({
+          [base]: content,
+          [`${base}.d/10-clear.conf`]: `[Network]\nDNS=\n`
+        })
+      )
+    ).toBe('auto')
+  })
+
+  it('reports unknown when a drop-in cannot be read', () => {
+    expect(
+      classifyNetworkdDns(
+        'eth0',
+        reader({
+          [base]: dhcpFile('eth0'),
+          [`${base}.d/10-dns.conf`]: null
+        })
+      )
+    ).toBe('unknown')
+  })
+})
+
+describe('parseResolvectlServers', () => {
+  it('reads global and per-link lines', () => {
+    const output = `Global: 1.1.1.1 2606:4700::1111
+Link 2 (eth0): 192.168.1.1 fe80::1%eth0
+`
+    expect(parseResolvectlServers(output)).toEqual([
+      '1.1.1.1',
+      '2606:4700::1111',
+      '192.168.1.1',
+      'fe80::1'
+    ])
+  })
+
+  it('ignores interface names, indices and empty answers', () => {
+    expect(parseResolvectlServers('Link 2 (eth0):\nGlobal:\n')).toEqual([])
+    expect(parseResolvectlServers('')).toEqual([])
   })
 })

@@ -1,6 +1,6 @@
 import { app } from 'electron'
 import { execFile, execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { isIP } from 'node:net'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -9,7 +9,7 @@ import type { KillSwitchContext } from './types'
 
 export interface LinuxKillSwitchOptions {
   markerPath?: string
-  execFileSync?: (command: string, args: string[], options?: { timeout?: number; stdio?: 'ignore' }) => string
+  execFileSync?: (command: string, args: string[], options?: { timeout?: number; stdio?: 'ignore' | 'pipe' }) => string | Buffer
   execFile?: (command: string, args: string[], options?: { timeout?: number }) => Promise<unknown>
 }
 
@@ -37,8 +37,68 @@ function markerExists(path = markerPathDefault()): boolean {
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
+  if (error instanceof Error) {
+    // Node's child_process errors carry the useful iptables diagnosis in
+    // `stderr` (and sometimes `stdout`); `message` is only the unhelpful
+    // "Command failed: iptables ..." wrapper. Losing those fields made every
+    // real "chain doesn't exist" answer look like an unknown failure.
+    const withOutput = error as Error & { stderr?: unknown; stdout?: unknown }
+    const detail = [streamText(withOutput.stderr), streamText(withOutput.stdout)]
+      .filter(Boolean)
+      .join(' ')
+      .trim()
+    if (!detail) return error.message
+    if (error.message.includes(detail)) return error.message
+    return `${error.message} ${detail}`.trim()
+  }
   return String(error ?? 'unknown error')
+}
+
+function streamText(value: unknown): string {
+  if (typeof value === 'string') return value.trim()
+  if (value instanceof Uint8Array) return Buffer.from(value).toString('utf-8').trim()
+  return ''
+}
+
+function readMarkerFile(path: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'))
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
+    console.warn('[firewall] Kill switch marker is not a JSON object; ignoring its contents')
+    return null
+  } catch (error) {
+    // A truncated marker (crash during write) must not break recovery. The
+    // caller treats `null` as "state unknown" and still attempts cleanup.
+    console.warn(`[firewall] Kill switch marker is unreadable: ${errorMessage(error)}`)
+    return null
+  }
+}
+
+/**
+ * Write the marker through a temporary file so a crash can never leave a
+ * half-written JSON document behind. `rename` is atomic on the same filesystem.
+ * On Windows the rename can still fail with `EPERM` when another process (for
+ * example an antivirus scanner) briefly holds the target; fall back to an
+ * in-place write because a possibly-unreadable marker is still better than a
+ * stale one, and readers tolerate truncated JSON.
+ */
+function writeMarkerFile(path: string, data: Record<string, unknown>): void {
+  const serialized = JSON.stringify(data)
+  const temporary = `${path}.tmp`
+  writeFileSync(temporary, serialized, 'utf-8')
+  try {
+    renameSync(temporary, path)
+    return
+  } catch {
+    // Fall through to the non-atomic but more forgiving write below.
+  }
+  try {
+    writeFileSync(path, serialized, 'utf-8')
+  } finally {
+    rmSync(temporary, { force: true })
+  }
 }
 
 /**
@@ -234,11 +294,25 @@ function combineProbes(jump: ProbeResult, chain: ProbeResult): ChainState {
   return { status: 'absent', error }
 }
 
-async function probeChainAsync(run: AsyncRunner, command: string, chain: string): Promise<ChainState> {
+async function probeChainAsync(run: AsyncRunner, command: string, chain: string): Promise<ChainProbe> {
   const jump = await probeAsync(run, command, ['-C', 'OUTPUT', '-j', chain], `could not verify the OUTPUT jump for ${chain}`)
   const target = await probeAsync(run, command, ['-L', chain], `could not verify ${chain}`)
-  return combineProbes(jump, target)
+  return { state: combineProbes(jump, target), jump, target }
 }
+
+interface ChainProbe {
+  state: ChainState
+  jump: ProbeResult
+  target: ProbeResult
+}
+
+/**
+ * The OUTPUT chain can hold the same jump more than once if an earlier enable
+ * failed after inserting it. `iptables -D` deletes one occurrence per call, so a
+ * single call leaves the chain armed; keep deleting until the jump is provably
+ * gone. The limit only guards against a backend that reports success forever.
+ */
+const MAX_JUMP_DELETIONS = 32
 
 type RemovalResult = ChainState & {
   success: boolean
@@ -249,49 +323,59 @@ type RemovalResult = ChainState & {
 async function removeChain(run: AsyncRunner, command: string, chain: string): Promise<RemovalResult> {
   const errors: string[] = []
 
-  const attempt = async (args: string[], action: string): Promise<void> => {
+  const attempt = async (args: string[], action: string): Promise<boolean> => {
     try {
       await run(args, command)
+      return true
     } catch (error) {
       const message = errorMessage(error)
       // An absent rule or chain is the state cleanup wants to reach.
-      if (isMissingChainOrRuleError(message)) return
+      if (isMissingChainOrRuleError(message)) return false
       errors.push(`${action}: ${message}`)
+      return false
     }
   }
 
-  await attempt(['-D', 'OUTPUT', '-j', chain], `could not delete the OUTPUT jump for ${chain}`)
+  for (let index = 0; index < MAX_JUMP_DELETIONS; index += 1) {
+    const removed = await attempt(['-D', 'OUTPUT', '-j', chain], `could not delete the OUTPUT jump for ${chain}`)
+    if (!removed) break
+  }
   await attempt(['-F', chain], `could not flush ${chain}`)
   await attempt(['-X', chain], `could not delete ${chain}`)
 
-  const state = await probeChainAsync(run, command, chain)
-  const error = [...errors, state.error].filter(Boolean).join('; ') || null
+  const probe = await probeChainAsync(run, command, chain)
+  const error = [...errors, probe.state.error].filter(Boolean).join('; ') || null
   return {
-    status: state.status,
+    status: probe.state.status,
     // Unknown errors are never a successful removal, even if the chain happens
     // to be gone; only a verified-absent chain with no errors counts.
-    success: state.status === 'absent' && error === null,
+    success: probe.state.status === 'absent' && error === null,
     error,
-    ruleRemoved: state.status === 'absent',
-    chainRemoved: state.status === 'absent'
+    ruleRemoved: probe.jump.present === false,
+    chainRemoved: probe.target.present === false
   }
 }
 
 function removeChainSync(run: SyncRunner, command: string, chain: string): RemovalResult {
   const errors: string[] = []
 
-  const attempt = (args: string[], action: string): void => {
+  const attempt = (args: string[], action: string): boolean => {
     try {
       run(args, command)
+      return true
     } catch (error) {
       const message = errorMessage(error)
-      if (isMissingChainOrRuleError(message)) return
+      if (isMissingChainOrRuleError(message)) return false
       console.error(`[firewall] ${action}: ${message}`)
       errors.push(`${action}: ${message}`)
+      return false
     }
   }
 
-  attempt(['-D', 'OUTPUT', '-j', chain], `could not delete the OUTPUT jump for ${chain}`)
+  for (let index = 0; index < MAX_JUMP_DELETIONS; index += 1) {
+    const removed = attempt(['-D', 'OUTPUT', '-j', chain], `could not delete the OUTPUT jump for ${chain}`)
+    if (!removed) break
+  }
   attempt(['-F', chain], `could not flush ${chain}`)
   attempt(['-X', chain], `could not delete ${chain}`)
 
@@ -334,7 +418,9 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
   }
 
   const runSync: SyncRunner = (args, command = 'iptables') => {
-    execFileSyncImpl(command, args, { timeout: 5000, stdio: 'ignore' })
+    // No `stdio: 'ignore'`: iptables writes its diagnosis to stderr, and that
+    // text is the only way to tell "chain already gone" from "probe failed".
+    execFileSyncImpl(command, args, { timeout: 5000 })
   }
 
   const markerFileExists = (): boolean => markerExists(markerPath)
@@ -349,7 +435,7 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
         // Write the marker before touching either table. If the process crashes
         // halfway through, the next launch still knows that Eaglet may have left
         // a partial chain behind and can clean both tables.
-        writeFileSync(markerPath, JSON.stringify({ at: Date.now(), installing: true }), 'utf-8')
+        writeMarkerFile(markerPath, { at: Date.now(), installing: true })
 
         await installChain(run, 'iptables', CHAIN, linuxRules(context))
         ipv4 = true
@@ -370,11 +456,7 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
           }
         }
 
-        writeFileSync(
-          markerPath,
-          JSON.stringify({ at: Date.now(), serverIps: context.serverIps, ipv4, ipv6 }),
-          'utf-8'
-        )
+        writeMarkerFile(markerPath, { at: Date.now(), serverIps: context.serverIps, ipv4, ipv6 })
       } catch (error) {
         await this.disable().catch(() => undefined)
         throw new Error(
@@ -424,24 +506,31 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
         rmSync(markerPath, { force: true })
       } else {
         // Save marker for recovery if chains still exist or the state is unknown.
-        const marker = markerFileExists() ? JSON.parse(readFileSync(markerPath, 'utf-8')) : null
-        if (marker) {
-          writeFileSync(
-            markerPath,
-            JSON.stringify({
-              ...marker,
-              ipv4: ipv4Result.status === 'absent',
-              ipv6: ipv6Result.status === 'absent',
-              cleanupFailed: true,
-              chainsStillExist,
-              stateUnknown,
-              ipv4Error: ipv4Result.error,
-              ipv6Error: ipv6Result.error,
-              ipv4Status: ipv4Result.status,
-              ipv6Status: ipv6Result.status
-            }, null, 2),
-            'utf-8'
-          )
+        // A corrupted marker falls back to a minimal document instead of
+        // crashing the disconnect path.
+        const marker = (markerFileExists() ? readMarkerFile(markerPath) : null) ?? { at: Date.now() }
+        let markerError: string | null = null
+        try {
+          writeMarkerFile(markerPath, {
+            ...marker,
+            ipv4: ipv4Result.status === 'absent',
+            ipv6: ipv6Result.status === 'absent',
+            cleanupFailed: true,
+            chainsStillExist,
+            stateUnknown,
+            ipv4Error: ipv4Result.error,
+            ipv6Error: ipv6Result.error,
+            ipv4RuleRemoved: ipv4Result.ruleRemoved,
+            ipv6RuleRemoved: ipv6Result.ruleRemoved,
+            ipv4ChainRemoved: ipv4Result.chainRemoved,
+            ipv6ChainRemoved: ipv6Result.chainRemoved,
+            ipv4Status: ipv4Result.status,
+            ipv6Status: ipv6Result.status
+          })
+        } catch (error) {
+          // The chain state is still reported below; a failed marker write must
+          // not replace the actionable cleanup error with a raw POSIX/Windows one.
+          markerError = errorMessage(error)
         }
 
         const errors = [
@@ -449,7 +538,8 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
           ipv6Result.error,
           ipv4Result.status === 'exists' ? 'the IPv4 chain is still present' : null,
           ipv6Result.status === 'exists' ? 'the IPv6 chain is still present' : null,
-          stateUnknown ? 'the chain state could not be verified' : null
+          stateUnknown ? 'the chain state could not be verified' : null,
+          markerError ? `the recovery marker could not be written: ${markerError}` : null
         ].filter(Boolean).join('; ')
 
         throw new Error(t('Kill switch could not be fully disabled: {errors}', { errors }))
@@ -493,28 +583,29 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
       } else {
         // Keep the marker whenever something is still armed or the state could
         // not be verified; recover() retries on the next launch.
-        const marker = markerFileExists() ? JSON.parse(readFileSync(markerPath, 'utf-8')) : null
-        if (marker) {
-          writeFileSync(
-            markerPath,
-            JSON.stringify({
-              ...marker,
-              ipv4: ipv4Result.status === 'absent',
-              ipv6: ipv6Result.status === 'absent',
-              cleanupFailed: true,
-              chainsStillExist,
-              stateUnknown,
-              ipv4Error: ipv4Result.error,
-              ipv6Error: ipv6Result.error,
-              ipv4RuleRemoved: ipv4Result.ruleRemoved,
-              ipv6RuleRemoved: ipv6Result.ruleRemoved,
-              ipv4ChainRemoved: ipv4Result.chainRemoved,
-              ipv6ChainRemoved: ipv6Result.chainRemoved,
-              ipv4Status: ipv4Result.status,
-              ipv6Status: ipv6Result.status
-            }, null, 2),
-            'utf-8'
-          )
+        const marker = (markerFileExists() ? readMarkerFile(markerPath) : null) ?? { at: Date.now() }
+        let markerError: string | null = null
+        try {
+          writeMarkerFile(markerPath, {
+            ...marker,
+            ipv4: ipv4Result.status === 'absent',
+            ipv6: ipv6Result.status === 'absent',
+            cleanupFailed: true,
+            chainsStillExist,
+            stateUnknown,
+            ipv4Error: ipv4Result.error,
+            ipv6Error: ipv6Result.error,
+            ipv4RuleRemoved: ipv4Result.ruleRemoved,
+            ipv6RuleRemoved: ipv6Result.ruleRemoved,
+            ipv4ChainRemoved: ipv4Result.chainRemoved,
+            ipv6ChainRemoved: ipv6Result.chainRemoved,
+            ipv4Status: ipv4Result.status,
+            ipv6Status: ipv6Result.status
+          })
+        } catch (error) {
+          // The chain state is still reported below; a failed marker write must
+          // not replace the actionable cleanup error with a raw POSIX/Windows one.
+          markerError = errorMessage(error)
         }
 
         const errors = [
@@ -522,7 +613,8 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
           ipv6Result.error,
           ipv4Result.status === 'exists' ? 'the IPv4 chain is still present' : null,
           ipv6Result.status === 'exists' ? 'the IPv6 chain is still present' : null,
-          stateUnknown ? 'the chain state could not be verified' : null
+          stateUnknown ? 'the chain state could not be verified' : null,
+          markerError ? `the recovery marker could not be written: ${markerError}` : null
         ].filter(Boolean).join('; ')
 
         throw new Error(t('Kill switch could not be fully disabled: {errors}', { errors }))
@@ -531,24 +623,24 @@ export function createLinuxKillSwitch(options: LinuxKillSwitchOptions = {}): Kil
 
     recover(): void {
       if (!existsSync(markerPath)) return
-      
-      const marker = JSON.parse(readFileSync(markerPath, 'utf-8'))
-      
-      // If cleanup previously failed, try to remove remaining chains
-      if (marker.cleanupFailed) {
+
+      const marker = readMarkerFile(markerPath)
+      if (marker?.cleanupFailed) {
         console.log('[firewall] Previous cleanup failed, attempting to remove remaining chains')
-        try {
-          this.disableSync()
-        } catch (error) {
-          console.error(`[firewall] Recovery failed: ${(error as Error).message}`)
-        }
-        return
+      } else if (!marker) {
+        console.warn('[firewall] Kill switch marker is unreadable; attempting cleanup anyway')
       }
-      
+
       // The marker can only have been written by Eaglet after our chains were
       // installed. Remove both tables regardless of age: leaving a stale DROP
       // chain behind after a crash is exactly the outage this recovery prevents.
-      this.disableSync()
+      // Recovery runs during startup and must never crash the application; a
+      // failed cleanup keeps the marker for the next launch.
+      try {
+        this.disableSync()
+      } catch (error) {
+        console.error(`[firewall] Recovery failed: ${errorMessage(error)}`)
+      }
     }
   }
 }

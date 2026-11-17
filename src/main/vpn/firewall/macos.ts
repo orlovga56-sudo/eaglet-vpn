@@ -329,6 +329,20 @@ export function createMacKillSwitch(
     return null
   }
 
+  /**
+   * A corrupt backup must not abort cleanup: load it as "unknown" and still
+   * remove our anchor rules. The file stays on disk for manual inspection.
+   */
+  const loadBackup = (): { backup: PfBackup | null; corrupt: string | null } => {
+    if (!files.exists(path)) return { backup: null, corrupt: null }
+    try {
+      return { backup: parseBackup(files.read(path)), corrupt: null }
+    } catch (error) {
+      console.error('[firewall] pf backup is unreadable; treating the previous state as unknown:', (error as Error).message)
+      return { backup: null, corrupt: (error as Error).message }
+    }
+  }
+
   const verifyDisabled = (backup: PfBackup | null): string | null => {
     if (backup) {
       const live = readAnchorRules()
@@ -418,7 +432,7 @@ export function createMacKillSwitch(
     },
 
     async disable(): Promise<void> {
-      const backup = files.exists(path) ? parseBackup(files.read(path)) : null
+      const { backup, corrupt } = loadBackup()
       let failure: string | null = null
 
       try {
@@ -444,11 +458,19 @@ export function createMacKillSwitch(
           )
         )
       }
+      if (corrupt) {
+        throw new Error(
+          t('The existing pf backup is unreadable: {error}. Delete {path} after checking pf manually.', {
+            error: corrupt,
+            path
+          })
+        )
+      }
       if (backup) files.remove(path)
     },
 
     disableSync(): void {
-      const backup = files.exists(path) ? parseBackup(files.read(path)) : null
+      const { backup, corrupt } = loadBackup()
       try {
         if (backup) {
           writeAnchor(backup.anchorRules, true)
@@ -461,6 +483,14 @@ export function createMacKillSwitch(
         }
         const verification = verifyDisabled(backup)
         if (verification) throw new Error(verification)
+        if (corrupt) {
+          throw new Error(
+            t('The existing pf backup is unreadable: {error}. Delete {path} after checking pf manually.', {
+              error: corrupt,
+              path
+            })
+          )
+        }
         if (backup) files.remove(path)
       } catch (error) {
         // The backup stays on disk so the next launch can retry.
@@ -469,8 +499,13 @@ export function createMacKillSwitch(
     },
 
     recover(): void {
-      if (files.exists(path)) this.disableSync()
-      else {
+      if (files.exists(path)) {
+        try {
+          this.disableSync()
+        } catch (error) {
+          console.error('[firewall] pf recovery failed; backup kept:', (error as Error).message)
+        }
+      } else {
         try {
           writeAnchor('')
         } catch {

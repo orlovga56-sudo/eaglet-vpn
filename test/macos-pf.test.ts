@@ -254,8 +254,7 @@ describe('macOS kill-switch lifecycle', () => {
     expect(sameRules('pass out quick on lo0 all', pf.anchors.get(ANCHOR) ?? '')).toBe(true)
   })
 
-  it('fails the enable when the anchor is not actually registered', async () => {
-    const pf = new FakePf()
+  it('fails the enable when the anchor is not actually registered', async () => {    const pf = new FakePf()
     pf.mainRules = ''
     const files = new MemoryFiles()
     files.files.set('/etc/pf.conf', 'pass all\n')
@@ -268,5 +267,33 @@ describe('macOS kill-switch lifecycle', () => {
       })(pf.run)
 
     await expect(backend(pf, files).enable(context)).rejects.toThrow(/not referenced|pf rejected/i)
+  })
+
+  it('clears its anchor but keeps an unreadable backup on disable', async () => {
+    const pf = new FakePf()
+    pf.enabled = true
+    pf.anchors.set(ANCHOR, 'block drop out quick all\n')
+    const files = new MemoryFiles()
+    files.files.set('/etc/pf.conf', APPLE_PF_CONF)
+    files.files.set('/tmp/pf-backup.json', 'not json')
+
+    const killSwitch = backend(pf, files)
+    await expect(killSwitch.disable()).rejects.toThrow(/unreadable/i)
+
+    expect(pf.anchors.get(ANCHOR) ?? '').toBe('')
+    expect(files.exists('/tmp/pf-backup.json')).toBe(true)
+  })
+
+  it('does not throw from recover when the backup is unreadable', () => {
+    const pf = new FakePf()
+    pf.enabled = true
+    pf.anchors.set(ANCHOR, 'block drop out quick all\n')
+    const files = new MemoryFiles()
+    files.files.set('/etc/pf.conf', APPLE_PF_CONF)
+    files.files.set('/tmp/pf-backup.json', '{broken')
+
+    const killSwitch = backend(pf, files)
+    expect(() => killSwitch.recover()).not.toThrow()
+    expect(files.exists('/tmp/pf-backup.json')).toBe(true)
   })
 })

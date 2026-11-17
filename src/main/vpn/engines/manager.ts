@@ -22,6 +22,7 @@ import { mihomoAdapter } from './mihomo-adapter'
 import { singboxAdapter } from './singbox-adapter'
 import { xrayAdapter } from './xray-adapter'
 import type { EngineAdapter, EngineBuildInput } from './types'
+import { cleanupOrphanCores } from './orphans'
 
 const execFileAsync = promisify(execFile)
 
@@ -155,6 +156,8 @@ function walk(dir: string): string[] {
 export class EngineManager {
   private entries = new Map<EngineId, EngineEntry>()
   private latestCache = new Map<EngineId, { at: number } & LatestRelease>()
+  /** Orphan cleanup runs once per process, not on every refreshEngines(). */
+  private cleanupAttempted = false
 
   constructor() {
     for (const adapter of [singboxAdapter, xrayAdapter, mihomoAdapter]) {
@@ -164,6 +167,12 @@ export class EngineManager {
 
   /** Cheap local discovery; never touches the network. */
   async init(): Promise<void> {
+    if (!this.cleanupAttempted) {
+      this.cleanupAttempted = true
+      await cleanupOrphanCores(join(app.getPath('userData'), 'bin'), (message) =>
+        console.warn(`[engine] ${message}`)
+      )
+    }
     for (const entry of this.entries.values()) {
       entry.binary = resourceBinary(entry.adapter)
       entry.version = entry.binary ? await this.readVersion(entry.adapter, entry.binary) : null

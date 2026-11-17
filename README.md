@@ -260,6 +260,19 @@ Kill switch, system DNS override and actual TUN adapter capture require
 administrator rights. Without elevation the harness records
 `protection.skipped` instead of pretending they ran.
 
+### Audit status (2026-11-17)
+
+- `npm run typecheck` and the Vitest suite (18 files, 255 tests) pass on
+  Windows 11 x64.
+- Windows kill switch, DNS backup/restore and recovery paths are exercised by
+  the unit suite; the last full live-tunnel matrix above remains the runtime
+  reference.
+- Linux `iptables`/`ip6tables` handling, DNS resolution parsing and marker
+  recovery are covered only by static review and mocked unit tests. They have
+  **not** been executed on a real Linux host; treat them as experimental.
+- macOS `pf` and system DNS paths were reviewed and unit-tested with stubs, not
+  run on a real Mac.
+
 ## Project structure
 
 ```

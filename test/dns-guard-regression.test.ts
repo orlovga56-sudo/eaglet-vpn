@@ -62,6 +62,28 @@ describe('DNS backup parsing', () => {
   it('rejects malformed JSON', () => {
     expect(() => parseDnsBackup('kill-switch-backup.json is malformed')).toThrow()
   })
+
+  it('preserves per-family Windows origins', () => {
+    const backup = parseDnsBackup(
+      JSON.stringify({
+        version: 2,
+        platform: 'win32',
+        at: 5,
+        services: [
+          {
+            name: 'Ethernet',
+            index: 12,
+            v4: ['1.1.1.1'],
+            v6: ['2001:4860:4860::8888'],
+            method: 'unknown',
+            method4: 'static',
+            method6: 'auto'
+          }
+        ]
+      })
+    )
+    expect(backup.services[0]).toMatchObject({ method: 'unknown', method4: 'static', method6: 'auto' })
+  })
 })
 
 describe('restore plans', () => {

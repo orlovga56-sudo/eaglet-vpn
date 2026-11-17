@@ -47,6 +47,7 @@ export const FREE_SOURCES: Array<{ name: string; url: string }> = [
 ]
 
 const FETCH_TIMEOUT_MS = 20000
+const MAX_CATALOG_BYTES = 8 * 1024 * 1024
 const PING_TIMEOUT_MS = 2200
 const CANDIDATES = 140
 const PING_CONCURRENCY = 24
@@ -64,6 +65,40 @@ export interface FreeDiscoveryOptions {
   onProgress?: (message: string) => void
 }
 
+/**
+ * Reads a catalog body while enforcing a hard byte budget. A malicious or
+ * broken mirror must not be able to exhaust the main process memory with an
+ * unbounded response, so the stream is drained chunk by chunk and aborted as
+ * soon as the limit is crossed.
+ */
+export async function readLimitedText(
+  response: Response,
+  maxBytes = MAX_CATALOG_BYTES
+): Promise<string> {
+  if (!response.body) return response.text()
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        throw new Error(
+          t('Catalog is larger than {size} MB', { size: Math.round(maxBytes / (1024 * 1024)) })
+        )
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return text + decoder.decode()
+}
+
 async function fetchCatalog(url: string): Promise<string> {
   const response = await fetch(url, {
     headers: {
@@ -73,7 +108,7 @@ async function fetchCatalog(url: string): Promise<string> {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   })
   if (!response.ok) throw new Error(t('HTTP {status}', { status: response.status }))
-  return response.text()
+  return readLimitedText(response)
 }
 
 function shuffle<T>(items: T[]): T[] {

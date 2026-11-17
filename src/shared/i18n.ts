@@ -222,6 +222,8 @@ const ru: Record<string, string> = {
     'Глобальный туннель, зашифрованный DNS, блокировка утечек IPv6, Kill Switch и строгое переподключение.',
   'Google · 8.8.8.8': 'Google · 8.8.8.8',
   'HTTP {status}': 'HTTP {status}',
+  'Catalog is larger than {size} MB':
+    'Каталог больше {size} МБ',
   'HUD / Scifi': 'HUD / Sci-fi',
   'Happ, v2rayN and Shadowrocket base64 subscriptions work. Use Update on a subscription to refresh its nodes.':
     'Поддерживаются base64-подписки Happ, v2rayN и Shadowrocket. Нажмите «Обновить» у подписки, чтобы обновить её узлы.',
@@ -707,6 +709,12 @@ const ru: Record<string, string> = {
     'Отключено · прямое соединение восстановлено',
   'Could not restore the system proxy: {error}':
     'Не удалось восстановить системный прокси: {error}',
+  'Could not restore the stale system proxy: {error}':
+    'Не удалось восстановить оставшийся системный прокси: {error}',
+  'Could not recover the previous kill switch: {error}':
+    'Не удалось восстановить предыдущий Kill Switch: {error}',
+  'Could not recover the previous DNS settings: {error}':
+    'Не удалось восстановить предыдущие настройки DNS: {error}',
   'Kill switch active · system proxy kept to block traffic':
     'Kill Switch активен · системный прокси сохранён для блокировки трафика',
   'Kill switch stays armed until the tunnel is restored':
@@ -843,6 +851,8 @@ const ru: Record<string, string> = {
     'Внимание: системное хранилище ключей не защищает секреты в этом профиле; они уже хранятся в config.json без шифрования.',
   'Backup imported · {count} profiles':
     'Резервная копия импортирована · профилей: {count}',
+  'Backup import skipped {count} invalid or duplicate rows':
+    'При импорте резервной копии пропущено строк (некорректных или дубликатов): {count}',
   'Backup contained plaintext secrets; they were moved into the encrypted vault':
     'Резервная копия содержала секреты в открытом виде; они перенесены в зашифрованное хранилище',
   'Backup contained plaintext secrets and the OS keyring is unavailable; they remain in config.json without encryption':
@@ -898,6 +908,8 @@ const ru: Record<string, string> = {
     'Не удалось определить адрес DoH-эндпоинта {host}',
   'PowerShell returned no adapter information':
     'PowerShell не вернул сведения об адаптерах',
+  'DNS settings could not be read for {names}; refusing to change DNS with incomplete information':
+    'Не удалось прочитать настройки DNS для {names}; изменение DNS с неполными данными отменено',
   'No active network adapter was found': 'Активный сетевой адаптер не найден',
   'No network services were found': 'Сетевые службы не найдены',
   'Could not determine the default network interface':

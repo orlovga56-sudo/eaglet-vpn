@@ -185,9 +185,23 @@ export class VpnEngine extends EventEmitter {
   /* ------------------------------------------------------------------ */
 
   async init(): Promise<void> {
-    recoverStaleProxy()
-    recoverKillSwitch()
-    recoverStaleDns()
+    try {
+      recoverStaleProxy()
+    } catch (error) {
+      this.pushLog('warn', t('Could not restore the stale system proxy: {error}', { error: (error as Error).message }))
+    }
+    try {
+      recoverKillSwitch()
+    } catch (error) {
+      // A leftover firewall policy must not prevent the app from starting; the
+      // marker is kept and recovery is retried on the next launch.
+      this.pushLog('warn', t('Could not recover the previous kill switch: {error}', { error: (error as Error).message }))
+    }
+    try {
+      recoverStaleDns()
+    } catch (error) {
+      this.pushLog('warn', t('Could not recover the previous DNS settings: {error}', { error: (error as Error).message }))
+    }
     await this.manager.init()
     const settings = this.store.getSettings()
     this.profileId = this.profileId ?? this.store.getProfiles()[0]?.id ?? null
@@ -656,7 +670,8 @@ export class VpnEngine extends EventEmitter {
         })
       )
     }
-    await this.clearStaleProtection(preserveProtection)
+    // Claim the transition before the first await: two overlapping connect()
+    // calls would otherwise both pass the guard at the top of this method.
     this.runtime.transition = true
     this.status = 'connecting'
     this.error = null
@@ -675,6 +690,8 @@ export class VpnEngine extends EventEmitter {
     this.setStage(t('Preparing profile'), 0.06)
 
     try {
+      await this.clearStaleProtection(preserveProtection)
+
       // 1. Make sure the IP probe runs before the system proxy is switched on.
       if (!this.ip.direct) await this.refreshDirectIp()
 
@@ -870,6 +887,34 @@ export class VpnEngine extends EventEmitter {
     this.killSwitchError = null
     this.dnsError = null
 
+    // Start DNS protection before the kill switch. Preparing the relay may need
+    // to resolve a custom DoH hostname through the system resolver; once the
+    // kill switch is armed that lookup is blocked by design.
+    if (settings.dnsProtection || settings.networkProtection) {
+      try {
+        await startDnsGuard(settings)
+        this.runtime.dnsGuardApplied = true
+        this.dnsProtectionActive = true
+        const stats = dnsGuardStats()
+        this.pushLog(
+          'success',
+          t('DNS protection active · DoH relay {endpoint}', {
+            endpoint: stats.endpoint ?? t('configured')
+          })
+        )
+      } catch (error) {
+        const stats = dnsGuardStats()
+        // A relay that is still listening (and still owns the system resolver)
+        // is an active DNS layer with a pending restore, not a disabled one.
+        this.runtime.dnsGuardApplied = Boolean(stats.endpoint)
+        this.dnsProtectionActive = Boolean(stats.endpoint)
+        this.dnsError = (error as Error).message
+        this.protectionError = t('DNS protection could not start: {error}', { error: this.dnsError })
+        this.pushLog('error', this.protectionError)
+        throw new Error(this.protectionError)
+      }
+    }
+
     if (settings.killSwitch || settings.networkProtection) {
       if (profile.protocol === 'direct') {
         this.killSwitchError = t(
@@ -914,31 +959,6 @@ export class VpnEngine extends EventEmitter {
           this.pushLog('error', this.protectionError)
           throw new Error(this.protectionError)
         }
-      }
-    }
-
-    if (settings.dnsProtection || settings.networkProtection) {
-      try {
-        await startDnsGuard(settings)
-        this.runtime.dnsGuardApplied = true
-        this.dnsProtectionActive = true
-        const stats = dnsGuardStats()
-        this.pushLog(
-          'success',
-          t('DNS protection active · DoH relay {endpoint}', {
-            endpoint: stats.endpoint ?? t('configured')
-          })
-        )
-      } catch (error) {
-        const stats = dnsGuardStats()
-        // A relay that is still listening (and still owns the system resolver)
-        // is an active DNS layer with a pending restore, not a disabled one.
-        this.runtime.dnsGuardApplied = Boolean(stats.endpoint)
-        this.dnsProtectionActive = Boolean(stats.endpoint)
-        this.dnsError = (error as Error).message
-        this.protectionError = t('DNS protection could not start: {error}', { error: this.dnsError })
-        this.pushLog('error', this.protectionError)
-        throw new Error(this.protectionError)
       }
     }
   }
@@ -1923,18 +1943,31 @@ export class VpnEngine extends EventEmitter {
       }
     }
     if (this.runtime.proxyApplied || this.status === 'connected') {
-      disableSystemProxySync()
-      this.runtime.proxyApplied = false
+      try {
+        disableSystemProxySync()
+        this.runtime.proxyApplied = false
+      } catch (error) {
+        console.error('[engine] synchronous proxy restore failed:', (error as Error).message)
+      }
     }
     if (this.runtime.killSwitchApplied) {
-      disableKillSwitchSync()
-      this.runtime.killSwitchApplied = false
-      this.killSwitchActive = false
+      try {
+        disableKillSwitchSync()
+        this.runtime.killSwitchApplied = false
+        this.killSwitchActive = false
+      } catch (error) {
+        // Leave the flag set and the marker on disk; the next launch retries.
+        console.error('[engine] synchronous kill-switch removal failed:', (error as Error).message)
+      }
     }
     if (this.runtime.dnsGuardApplied) {
-      stopDnsGuardSync()
-      this.runtime.dnsGuardApplied = false
-      this.dnsProtectionActive = false
+      try {
+        stopDnsGuardSync()
+        this.runtime.dnsGuardApplied = false
+        this.dnsProtectionActive = false
+      } catch (error) {
+        console.error('[engine] synchronous DNS restore failed:', (error as Error).message)
+      }
     }
     this.core = { ...this.core, running: false }
     if (this.status !== 'disconnected') {

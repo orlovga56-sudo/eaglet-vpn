@@ -279,6 +279,22 @@ describe('Windows kill switch disable', () => {
       t('Could not remove the kill-switch firewall rules: {error}', { error: 'Access denied' })
     )
   })
+
+  it('still removes the rules when the backup is unreadable', async () => {
+    const store = memoryStore({ [BACKUP]: 'not json' })
+    const runner = fakeRunner({ rules: 1 })
+    const killSwitch = createWindowsKillSwitch({ backupPath: BACKUP, runner, store })
+    const message = t(
+      'The existing firewall backup is unreadable: {error}. Delete {path} after checking the firewall policy manually.',
+      { error: '\u0000', path: BACKUP }
+    )
+    const prefix = message.slice(0, message.indexOf('\u0000'))
+
+    await expect(killSwitch.disable()).rejects.toThrow(prefix)
+    // The rules are gone, the unreadable backup is kept for manual recovery.
+    expect(store.files.get(BACKUP)).toBe('not json')
+    expect(runner.profiles).toEqual(ORIGINAL_PROFILES)
+  })
 })
 
 describe('Windows kill switch synchronous paths', () => {
@@ -312,5 +328,14 @@ describe('Windows kill switch synchronous paths', () => {
 
     expect(() => killSwitch.recover()).not.toThrow()
     expect(store.files.has(BACKUP)).toBe(false)
+  })
+
+  it('does not throw from recover when the backup is unreadable', () => {
+    const store = memoryStore({ [BACKUP]: 'not json' })
+    const runner = fakeRunner({ rules: 0 })
+    const killSwitch = createWindowsKillSwitch({ backupPath: BACKUP, runner, store })
+
+    expect(() => killSwitch.recover()).not.toThrow()
+    expect(store.files.get(BACKUP)).toBe('not json')
   })
 })

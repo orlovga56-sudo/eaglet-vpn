@@ -348,4 +348,129 @@ describe('Linux Firewall', () => {
       expect(marker().ipv4Status).toBe('unknown')
     })
   })
+
+  describe('real child_process error shapes', () => {
+    const processError = (message: string, stderr: string): Error => {
+      const error = new Error(message) as Error & { stderr: string }
+      error.stderr = stderr
+      return error
+    }
+
+    const missing = 'iptables: No chain/target/match by that name.'
+
+    it('classifies a missing chain from stderr, not the wrapper message (sync)', () => {
+      const ks = createLinuxKillSwitch({
+        markerPath: testMarkerPath,
+        execFileSync: (command, args) => {
+          if (args.includes('-D') || args.includes('-C') || args.includes('-L')) {
+            throw processError(`Command failed: ${command} ${args.join(' ')}`, missing)
+          }
+          return ''
+        }
+      })
+      writeMarker()
+
+      expect(() => ks.disableSync()).not.toThrow()
+      expect(existsSync(testMarkerPath)).toBe(false)
+    })
+
+    it('classifies a missing chain from stderr, not the wrapper message (async)', async () => {
+      const ks = createLinuxKillSwitch({
+        markerPath: testMarkerPath,
+        execFile: async (command, args) => {
+          if (args.includes('-D') || args.includes('-C') || args.includes('-L')) {
+            throw processError(`Command failed: ${command} ${args.join(' ')}`, missing)
+          }
+          return ''
+        }
+      })
+      writeMarker()
+
+      await expect(ks.disable()).resolves.toBeUndefined()
+      expect(existsSync(testMarkerPath)).toBe(false)
+    })
+
+    it('removes duplicate OUTPUT jumps one by one', () => {
+      let deletes = 0
+      const ks = createLinuxKillSwitch({
+        markerPath: testMarkerPath,
+        execFileSync: (command, args) => {
+          if (command === 'iptables' && args.includes('-D')) {
+            if (deletes < 2) {
+              deletes += 1
+              return ''
+            }
+          }
+          if (args.includes('-D') || args.includes('-C') || args.includes('-L')) {
+            throw processError(`Command failed: ${command}`, missing)
+          }
+          return ''
+        }
+      })
+      writeMarker()
+
+      expect(() => ks.disableSync()).not.toThrow()
+      expect(deletes).toBe(2)
+      expect(existsSync(testMarkerPath)).toBe(false)
+    })
+
+    it('keeps a valid marker when cleanup fails with a corrupted backup', () => {
+      writeFileSync(testMarkerPath, '{not json')
+      const ks = syncKillSwitch((command, args) => {
+        if (command === 'iptables' && args.includes('-D') && args.includes('OUTPUT')) return 'Permission denied'
+        if (command === 'iptables' && args.includes('-C')) return undefined
+        return chainsGone(command, args)
+      })
+
+      expect(() => ks.disableSync()).toThrow(disabledPrefix())
+      const saved = marker()
+      expect(saved.cleanupFailed).toBe(true)
+      expect(saved.ipv4Status).toBe('exists')
+    })
+
+    it('recovers from a corrupted marker without throwing', () => {
+      writeFileSync(testMarkerPath, 'null')
+      const ks = syncKillSwitch()
+
+      expect(() => ks.recover()).not.toThrow()
+      expect(existsSync(testMarkerPath)).toBe(false)
+    })
+
+    it('keeps the IPv6 half armed when only IPv4 is gone', () => {
+      const ks = syncKillSwitch((command, args) => {
+        if (command === 'ip6tables') return undefined // both probes succeed
+        return chainsGone(command, args)
+      })
+      writeMarker()
+
+      expect(() => ks.disableSync()).toThrow(disabledPrefix())
+      const saved = marker()
+      expect(saved.ipv4Status).toBe('absent')
+      expect(saved.ipv6Status).toBe('exists')
+      expect(saved.chainsStillExist).toBe(true)
+    })
+
+    it('records the same per-object removal flags sync and async', async () => {
+      const fail: Fail = (_command, args) => {
+        if (args.includes('-C')) return missing
+        if (args.includes('-L')) return undefined
+        return undefined
+      }
+
+      writeMarker()
+      const sync = syncKillSwitch(fail)
+      expect(() => sync.disableSync()).toThrow(disabledPrefix())
+      const syncMarker = marker()
+
+      writeMarker()
+      const async = asyncKillSwitch(fail)
+      await expect(async.disable()).rejects.toThrow(disabledPrefix())
+      const asyncMarker = marker()
+
+      expect(asyncMarker.ipv4RuleRemoved).toBe(syncMarker.ipv4RuleRemoved)
+      expect(asyncMarker.ipv4ChainRemoved).toBe(syncMarker.ipv4ChainRemoved)
+      expect(syncMarker.ipv4RuleRemoved).toBe(true)
+      expect(syncMarker.ipv4ChainRemoved).toBe(false)
+    })
+  })
 })

@@ -42,6 +42,9 @@ export interface DnsServiceBackup {
   v4: string[]
   v6: string[]
   method: DnsMethod
+  /** Windows-only per-family origin; `method` is the combined verdict. */
+  method4?: DnsMethod
+  method6?: DnsMethod
 }
 
 export interface DnsBackup {
@@ -307,6 +310,8 @@ export function parseDnsBackup(raw: string): DnsBackup {
         v4?: string[]
         v6?: string[]
         method?: DnsMethod
+        method4?: DnsMethod
+        method6?: DnsMethod
       }
       const legacy = Array.isArray(entry.servers) ? entry.servers : null
       const v4 = legacy ? byFamily(legacy, 4) : byFamily(entry.v4 ?? [], 4)
@@ -319,13 +324,20 @@ export function parseDnsBackup(raw: string): DnsBackup {
               ? 'static'
               : 'auto'
             : 'unknown'
-      return {
+      const result: DnsServiceBackup = {
         name: typeof entry.name === 'string' ? entry.name : '',
         index: typeof entry.index === 'number' ? entry.index : undefined,
         v4,
         v6,
         method
       }
+      if (entry.method4 === 'static' || entry.method4 === 'auto' || entry.method4 === 'unknown') {
+        result.method4 = entry.method4
+      }
+      if (entry.method6 === 'static' || entry.method6 === 'auto' || entry.method6 === 'unknown') {
+        result.method6 = entry.method6
+      }
+      return result
     })
     .filter((service) => service.name)
   return {
@@ -352,15 +364,38 @@ export interface WindowsRestoreStep {
 }
 
 /**
+ * The origin for one address family. Windows classifies IPv4 and IPv6
+ * independently, so a backup may legitimately be static on one family and
+ * DHCP-provided on the other. Older backups only have the combined `method`.
+ */
+export function familyMethod(service: DnsServiceBackup, version: 4 | 6): DnsMethod {
+  return (version === 4 ? service.method4 : service.method6) ?? service.method
+}
+
+function familyAddresses(service: DnsServiceBackup, version: 4 | 6): string[] {
+  return byFamily(version === 4 ? service.v4 : service.v6, version)
+}
+
+/**
  * Windows needs a reset before static addresses because `-ServerAddresses`
  * replaces only the family it is given, leaving the other one on our loopback
- * value. `-ResetServerAddresses` clears both families.
+ * value. `-ResetServerAddresses` clears both families. Restoring each family
+ * according to its own origin keeps the automatic family automatic.
  */
 export function planWindowsRestore(service: DnsServiceBackup): WindowsRestoreStep {
-  const addresses = [...byFamily(service.v4, 4), ...byFamily(service.v6, 6)]
-  if (service.method === 'auto') return { reset: true, addresses: [] }
-  if (service.method === 'static') return { reset: true, addresses }
-  return { reset: addresses.length === 0, addresses }
+  const plans = ([4, 6] as const).map((version) => {
+    const saved = familyAddresses(service, version)
+    const method = familyMethod(service, version)
+    if (method === 'auto') return { reset: true, addresses: [] }
+    if (method === 'static') return { reset: true, addresses: saved }
+    // Unknown origin: re-apply exactly what was observed (never guess a
+    // different resolver), but do not clear the family when we have no data.
+    return { reset: saved.length === 0, addresses: saved }
+  })
+  return {
+    reset: plans.some((plan) => plan.reset),
+    addresses: plans.flatMap((plan) => plan.addresses)
+  }
 }
 
 export function windowsRestoreScript(services: DnsServiceBackup[]): string {
@@ -401,15 +436,25 @@ export function planLinuxRestore(service: DnsServiceBackup): string[] {
   return ['revert', service.name]
 }
 
-/** True when the interface no longer points at the relay — the user changed it. */
+/**
+ * True when the interface no longer matches the saved state — the user changed
+ * it. A family that still points at the relay is considered untouched. Static
+ * and answerable-unknown origins compare the actual addresses; an automatic
+ * family is changed as soon as any non-relay resolver appears.
+ */
 export function userChangedDns(service: DnsServiceBackup, current: DnsServiceBackup): boolean {
-  if (service.method === 'auto') return !hasLoopback([...current.v4, ...current.v6])
-  if (service.method === 'static') {
-    const sameAsOriginal = sameSet(current.v4, service.v4) && sameSet(current.v6, service.v6)
-    const onRelay = hasLoopback([...current.v4, ...current.v6])
-    return !onRelay && !sameAsOriginal
+  for (const version of [4, 6] as const) {
+    const saved = familyAddresses(service, version)
+    const live = familyAddresses(current, version)
+    if (live.some((address) => LOOPBACK.has(address))) continue
+    const method = familyMethod(service, version)
+    if (method === 'static' || method === 'unknown') {
+      if (live.length > 0 && !sameSet(live, saved)) return true
+      continue
+    }
+    if (live.length > 0) return true
   }
-  return !hasLoopback([...current.v4, ...current.v6])
+  return false
 }
 
 /** Mismatch description, or `null` when the interface is back to its saved state. */
@@ -419,11 +464,18 @@ export function verifyRestored(
 ): string | null {
   const addresses = [...current.v4, ...current.v6]
   if (hasLoopback(addresses)) return t('{name}: still points at the local relay', { name: service.name })
-  if (service.method === 'static') {
-    if (!sameSet(current.v4, byFamily(service.v4, 4)))
-      return t('{name}: IPv4 resolvers differ', { name: service.name })
-    if (!sameSet(current.v6, byFamily(service.v6, 6)))
-      return t('{name}: IPv6 resolvers differ', { name: service.name })
+  for (const version of [4, 6] as const) {
+    const method = familyMethod(service, version)
+    if (method === 'auto') continue
+    const saved = familyAddresses(service, version)
+    // An unknown family is verified against the exact observed addresses only
+    // when we had any; with no saved data there is nothing to compare.
+    if (method === 'unknown' && saved.length === 0) continue
+    if (!sameSet(familyAddresses(current, version), saved)) {
+      return t(version === 4 ? '{name}: IPv4 resolvers differ' : '{name}: IPv6 resolvers differ', {
+        name: service.name
+      })
+    }
   }
   return null
 }
@@ -448,29 +500,48 @@ foreach ($adapter in @(Get-NetAdapter -Physical)) {
   if ($adapter.Status -ne 'Up') { continue }
   $idx = $adapter.ifIndex
   $guid = $adapter.InterfaceGuid
-  $v4 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
-  $v6 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
-  $ip4 = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop
-  $ip6 = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction Stop
-  # The registry keeps the manual (NameServer) and lease-provided (DhcpNameServer)
-  # resolvers apart, which the cmdlets do not expose.
-  $tcpip = Get-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$guid" -ErrorAction SilentlyContinue
-  $tcpip6 = Get-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\Interfaces\\$guid" -ErrorAction SilentlyContinue
-  $manual4 = @(([string]$tcpip.NameServer) -split '[,;\\s]+' | Where-Object { $_ })
-  $leased4 = @(([string]$tcpip.DhcpNameServer) -split '[,;\\s]+' | Where-Object { $_ })
-  $manual6 = @(([string]$tcpip6.NameServer) -split '[,;\\s]+' | Where-Object { $_ })
-  $leased6 = @(([string]$tcpip6.DhcpNameServer) -split '[,;\\s]+' | Where-Object { $_ })
-  $items += [pscustomobject]@{
-    index = $idx
-    name = $adapter.Name
-    v4 = $v4
-    v6 = $v6
-    dhcp4 = [string]$ip4.Dhcp
-    dhcp6 = [string]$ip6.Dhcp
-    manual4 = $manual4
-    manual6 = $manual6
-    leased4 = $leased4
-    leased6 = $leased6
+  try {
+    $v4 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
+    $v6 = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
+    $ip4 = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop
+    $ip6 = Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -ErrorAction Stop
+    # The registry keeps the manual (NameServer) and lease-provided (DhcpNameServer)
+    # resolvers apart, which the cmdlets do not expose.
+    $tcpip = Get-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$guid" -ErrorAction SilentlyContinue
+    $tcpip6 = Get-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\Interfaces\\$guid" -ErrorAction SilentlyContinue
+    $manual4 = @(([string]$tcpip.NameServer) -split '[,;\\s]+' | Where-Object { $_ })
+    $leased4 = @(([string]$tcpip.DhcpNameServer) -split '[,;\\s]+' | Where-Object { $_ })
+    $manual6 = @(([string]$tcpip6.NameServer) -split '[,;\\s]+' | Where-Object { $_ })
+    $leased6 = @(([string]$tcpip6.DhcpNameServer) -split '[,;\\s]+' | Where-Object { $_ })
+    $items += [pscustomobject]@{
+      index = $idx
+      name = $adapter.Name
+      v4 = $v4
+      v6 = $v6
+      dhcp4 = [string]$ip4.Dhcp
+      dhcp6 = [string]$ip6.Dhcp
+      manual4 = $manual4
+      manual6 = $manual6
+      leased4 = $leased4
+      leased6 = $leased6
+      failed = $false
+    }
+  } catch {
+    # One broken adapter must not hide the others; the caller refuses to change
+    # DNS while any adapter's state is unknown.
+    $items += [pscustomobject]@{
+      index = $idx
+      name = $adapter.Name
+      v4 = @()
+      v6 = @()
+      dhcp4 = ''
+      dhcp6 = ''
+      manual4 = @()
+      manual6 = @()
+      leased4 = @()
+      leased6 = @()
+      failed = $true
+    }
   }
 }
 $items | ConvertTo-Json -Depth 4 -Compress
@@ -489,6 +560,8 @@ export interface WindowsAdapter {
   /** Resolvers from the last DHCP lease (`DhcpNameServer`). */
   leased4?: string[]
   leased6?: string[]
+  /** The per-adapter PowerShell block raised an error; state is unknown. */
+  failed?: boolean
 }
 
 type DhcpState = 'enabled' | 'disabled' | 'unknown'
@@ -567,6 +640,15 @@ export function classifyWindowsMethod(adapter: WindowsAdapter): DnsMethod {
   return 'unknown'
 }
 
+/** Classifies one address family on its own; `method` is only the combined view. */
+export function classifyWindowsFamilyMethod(adapter: WindowsAdapter, version: 4 | 6): DnsMethod {
+  const servers = byFamily((version === 4 ? adapter.v4 : adapter.v6) ?? [], version)
+  const dhcp = dhcpState(version === 4 ? adapter.dhcp4 : adapter.dhcp6)
+  const manual = byFamily(version === 4 ? adapter.manual4 ?? [] : adapter.manual6 ?? [], version)
+  const leased = byFamily(version === 4 ? adapter.leased4 ?? [] : adapter.leased6 ?? [], version)
+  return classifyWindowsFamily(servers, manual, leased, dhcp)
+}
+
 /** Resolver lists can arrive as arrays or as a single PowerShell string. */
 function resolverList(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean)
@@ -592,18 +674,34 @@ function adapterToService(adapter: WindowsAdapter): DnsServiceBackup {
     index: normalized.index,
     v4: normalized.v4,
     v6: normalized.v6,
-    method: classifyWindowsMethod(normalized)
+    method: classifyWindowsMethod(normalized),
+    method4: classifyWindowsFamilyMethod(normalized, 4),
+    method6: classifyWindowsFamilyMethod(normalized, 6)
   }
 }
 
 async function readWindowsDns(): Promise<DnsServiceBackup[]> {
   const stdout = (await powershell(WINDOWS_READ)).trim()
+  return parseWindowsAdapters(stdout)
+}
+
+function parseWindowsAdapters(stdout: string): DnsServiceBackup[] {
   if (!stdout) throw new Error(t('PowerShell returned no adapter information'))
   const parsed = JSON.parse(stdout) as WindowsAdapter | WindowsAdapter[]
-  const adapters = Array.isArray(parsed) ? parsed : [parsed]
-  const services = adapters
-    .filter((adapter) => adapter && Number.isFinite(Number(adapter.index)))
-    .map(adapterToService)
+  const adapters = (Array.isArray(parsed) ? parsed : [parsed]).filter(
+    (adapter) => adapter && Number.isFinite(Number(adapter.index))
+  )
+  const failed = adapters.filter((adapter) => adapter.failed === true)
+  if (failed.length > 0) {
+    // Fail closed: changing only the adapters we could read would leave the
+    // others resolving around the DoH relay.
+    throw new Error(
+      t('DNS settings could not be read for {names}; refusing to change DNS with incomplete information', {
+        names: failed.map((adapter) => adapter.name || String(adapter.index)).join(', ')
+      })
+    )
+  }
+  const services = adapters.map(adapterToService)
   if (services.length === 0) throw new Error(t('No active network adapter was found'))
   return services
 }
@@ -703,10 +801,50 @@ export function effectiveNetworkdFiles(
     .map(([, entry]) => entry.path)
 }
 
+/**
+ * Drop-ins for one `.network` file: `<file>.d/*.conf`. The same /etc > /run >
+ * /usr/lib precedence applies, and files with the same name are merged once,
+ * in lexicographic order (networkd's documented order).
+ */
+export function networkdDropInFiles(
+  basePath: string,
+  paths: string[],
+  directories: string[] = NETWORKD_DIRECTORIES
+): string[] {
+  const directory = `${basePath.replace(/\\/g, '/')}.d`
+  const priority = new Map(directories.map((dir, index) => [dir, index]))
+  const chosen = new Map<string, { path: string; priority: number }>()
+
+  for (const value of paths) {
+    const path = value.replace(/\\/g, '/')
+    if (!path.startsWith(`${directory}/`)) continue
+    const name = baseName(path)
+    if (!name.endsWith('.conf')) continue
+    const owner = directories.find((candidate) => path.startsWith(`${candidate}/`))
+    if (!owner) continue
+    const rank = priority.get(owner) ?? Number.MAX_SAFE_INTEGER
+    const current = chosen.get(name)
+    if (!current || rank < current.priority) chosen.set(name, { path, priority: rank })
+  }
+
+  return [...chosen.entries()]
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([, entry]) => entry.path)
+}
+
 interface NetworkFileFacts {
   matches: boolean
   hasDns: boolean
   dhcp: boolean
+}
+
+/**
+ * systemd-networkd `DHCP=` values that enable DHCP for at least one family.
+ * `both` is the documented spelling for "IPv4 and IPv6"; omitting it made a
+ * DHCP-only interface look like an unprovable origin.
+ */
+export function networkdDhcpEnabled(value: string): boolean {
+  return /^(yes|true|on|ipv4|ipv6|both)$/i.test(value.trim())
 }
 
 /** Parses the facts of one `.network` file that matter for DNS origin. */
@@ -739,12 +877,13 @@ function networkFileFacts(content: string, iface: string): NetworkFileFacts {
     if (section !== 'network') continue
 
     if (/^DNS\s*=/i.test(line)) {
-      if (line.slice(line.indexOf('=') + 1).trim()) hasDns = true
+      // A later, empty assignment clears the list again (networkd semantics),
+      // which is how a drop-in removes a static resolver from the base file.
+      hasDns = line.slice(line.indexOf('=') + 1).trim() !== ''
       continue
     }
     if (/^DHCP\s*=/i.test(line)) {
-      const value = line.slice(line.indexOf('=') + 1).trim().toLowerCase()
-      if (/^(yes|true|ipv4|ipv6|on)$/.test(value)) dhcp = true
+      dhcp = networkdDhcpEnabled(line.slice(line.indexOf('=') + 1))
     }
   }
 
@@ -798,9 +937,17 @@ export function classifyNetworkdDns(iface: string, reader: NetworkdReader): DnsM
   }
 
   for (const file of effectiveNetworkdFiles(paths)) {
-    const content = reader.read(file)
-    if (content === null) return 'unknown'
-    const facts = networkFileFacts(content, iface)
+    const base = reader.read(file)
+    if (base === null) return 'unknown'
+    // Drop-ins override the base file key by key; appending them preserves that
+    // behaviour because the parser keeps the last value it saw.
+    const parts = [base]
+    for (const dropIn of networkdDropInFiles(file, paths)) {
+      const content = reader.read(dropIn)
+      if (content === null) return 'unknown'
+      parts.push(content)
+    }
+    const facts = networkFileFacts(parts.join('\n'), iface)
     if (!facts.matches) continue
     if (facts.hasDns) return 'static'
     return facts.dhcp ? 'auto' : 'unknown'
@@ -830,6 +977,17 @@ function systemNetworkdReader(): NetworkdReader {
         for (const entry of entries) {
           if (entry.isFile() && entry.name.endsWith('.network')) {
             files.push(`${directory}/${entry.name}`)
+          } else if (entry.isDirectory() && entry.name.endsWith('.network.d')) {
+            try {
+              for (const dropIn of readdirSync(`${directory}/${entry.name}`, { withFileTypes: true })) {
+                if (dropIn.isFile() && dropIn.name.endsWith('.conf')) {
+                  files.push(`${directory}/${entry.name}/${dropIn.name}`)
+                }
+              }
+            } catch {
+              // An unreadable drop-in directory is treated as absent; the base
+              // file is still classified on its own.
+            }
           }
         }
       }
@@ -861,13 +1019,30 @@ export function classifyLinuxDns(
   return networkd
 }
 
-function parseResolvectlServers(stdout: string): string[] {
-  return stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.includes(':') || line.includes('.'))
-    .flatMap((line) => line.split(/\s+/).slice(1))
-    .filter((value) => isIP(value) !== 0)
+/**
+ * Extracts resolvers from `resolvectl dns [link]` output. Both shapes occur:
+ *
+ *   Global: 1.1.1.1 2606:4700::1111
+ *   Link 2 (eth0): 192.168.1.1 fe80::1%eth0
+ *
+ * Only tokens after the label are considered, so interface indices and names
+ * can never be mistaken for addresses, and IPv6 zone suffixes are stripped.
+ */
+export function parseResolvectlServers(stdout: string): string[] {
+  const servers: string[] = []
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line) continue
+    const separator = line.indexOf(':')
+    if (separator === -1) continue
+    const label = line.slice(0, separator).trim()
+    if (!/^(global|link\b.*|current dns server\b.*)$/i.test(label)) continue
+    for (const token of line.slice(separator + 1).trim().split(/\s+/)) {
+      const address = token.split('%')[0]
+      if (address && isIP(address) !== 0) servers.push(address)
+    }
+  }
+  return [...new Set(servers)]
 }
 
 export function linuxHasStaticDns(iface: string): boolean {
@@ -920,14 +1095,7 @@ function readWindowsDnsSync(): DnsServiceBackup[] {
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', WINDOWS_READ],
     { encoding: 'utf8', windowsHide: true }
   ).trim()
-  if (!stdout) throw new Error(t('PowerShell returned no adapter information'))
-  const parsed = JSON.parse(stdout) as WindowsAdapter | WindowsAdapter[]
-  const adapters = Array.isArray(parsed) ? parsed : [parsed]
-  const services = adapters
-    .filter((adapter) => adapter && Number.isFinite(Number(adapter.index)))
-    .map(adapterToService)
-  if (services.length === 0) throw new Error(t('No active network adapter was found'))
-  return services
+  return parseWindowsAdapters(stdout)
 }
 
 function readMacDnsSync(): DnsServiceBackup[] {
@@ -946,28 +1114,23 @@ function readMacDnsSync(): DnsServiceBackup[] {
       { encoding: 'utf8' }
     ).trim()
     
-    if (current.includes('There aren')) {
-      continue // No DNS servers configured
-    }
-    
-    const servers = current
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => isIP(line) !== 0)
-    
-    if (servers.length === 0) continue
+    const servers = current.includes('There aren')
+      ? []
+      : current
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => isIP(line) !== 0)
     
     const v4 = byFamily(servers, 4)
     const v6 = byFamily(servers, 6)
     
-    // Check if DNS is manually configured or automatic
-    const method = v4.length > 0 || v6.length > 0 ? 'static' : 'auto'
-    
+    // Match the asynchronous reader: a service without resolvers receives DNS
+    // from DHCP and must be restored to that state, not dropped from the list.
     result.push({
       name,
       v4,
       v6,
-      method
+      method: servers.length > 0 ? 'static' : 'auto'
     })
   }
   
@@ -1096,11 +1259,22 @@ export function restoreSystemDnsSync(): void {
     rmSync(backupPath(), { force: true })
     return
   }
-  
+
   let restoreSuccess = false
-  const _currentDnsAfterRestore: DnsServiceBackup[] | null = null
-  
+
   try {
+    // Leave interfaces the user changed during the session alone, exactly like
+    // the asynchronous path.
+    const current = readCurrentDnsSync()
+    const targets: DnsServiceBackup[] = []
+    for (const service of backup.services) {
+      const live = current.find((item) =>
+        item.index !== undefined && service.index !== undefined ? item.index === service.index : item.name === service.name
+      )
+      if (live && userChangedDns(service, live)) continue
+      targets.push(service)
+    }
+
     if (backup.platform === 'win32') {
       execFileSync(
         'powershell.exe',
@@ -1110,35 +1284,34 @@ export function restoreSystemDnsSync(): void {
           '-ExecutionPolicy',
           'Bypass',
           '-Command',
-          windowsRestoreScript(backup.services)
+          windowsRestoreScript(targets)
         ],
         { windowsHide: true, timeout: 12000 }
       )
     } else if (backup.platform === 'darwin') {
-      for (const service of backup.services) {
+      for (const service of targets) {
         execFileSync('networksetup', planMacRestore(service), { timeout: 5000, stdio: 'ignore' })
       }
     } else {
-      for (const service of backup.services) {
+      for (const service of targets) {
         execFileSync('resolvectl', planLinuxRestore(service), { timeout: 5000, stdio: 'ignore' })
       }
     }
-    
-    // Read actual DNS settings after restoration
+
+    // Verify with the same rules as the async path: automatic interfaces only
+    // need to be off the relay, static/observed ones must match exactly.
     const restoredDns = readCurrentDnsSync()
-    
-    // Verify restoration
     let allRestored = true
-    for (const service of backup.services) {
+    for (const service of targets) {
       const live = restoredDns.find((item) =>
         item.index !== undefined && service.index !== undefined ? item.index === service.index : item.name === service.name
       )
-      if (!live || userChangedDns(service, live)) {
+      if (!live || verifyRestored(service, live) !== null) {
         allRestored = false
         break
       }
     }
-    
+
     if (allRestored) {
       restoreSuccess = true
       // Only delete backup after successful verification
@@ -1147,7 +1320,7 @@ export function restoreSystemDnsSync(): void {
   } catch (error) {
     console.error(`[dns] Synchronous restore failed: ${(error as Error).message}`)
   }
-  
+
   if (!restoreSuccess) {
     // Keep backup for retry on next launch
     console.error('[dns] Synchronous restore verification failed, backup preserved')
@@ -1306,7 +1479,14 @@ export function stopDnsGuardSync(): void {
 
 /** Retries a restore left behind by a crash or a failed shutdown. */
 export function recoverStaleDns(): void {
-  if (existsSync(backupPath())) stopDnsGuardSync()
+  if (!existsSync(backupPath())) return
+  try {
+    stopDnsGuardSync()
+  } catch (error) {
+    // Startup must not crash because a resolver restore failed; the backup is
+    // kept and the next disconnect/launch retries.
+    console.error(`[dns] Stale DNS recovery failed: ${(error as Error).message}`)
+  }
 }
 
 export function dnsGuardStats(): {
